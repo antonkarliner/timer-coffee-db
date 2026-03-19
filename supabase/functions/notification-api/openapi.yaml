@@ -1,0 +1,1716 @@
+openapi: 3.0.3
+info:
+  title: FCM Notification API
+  description: Complete API for managing FCM notifications, tokens, templates, and analytics
+  version: 1.0.0
+  contact:
+    name: API Support
+    email: support@example.com
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+servers:
+  - url: https://your-project.supabase.co/functions/v1
+    description: Production server
+
+paths:
+  /tokens:
+    post:
+      tags:
+        - Token Management
+      summary: Register new FCM token
+      description: Register a new FCM token for the authenticated user
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TokenRequest'
+      responses:
+        '201':
+          description: Token registered successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Token'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+    get:
+      tags:
+        - Token Management
+      summary: List user tokens
+      description: List all FCM tokens for the authenticated user
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+          description: Maximum number of tokens to return
+        - name: device_type
+          in: query
+          schema:
+            $ref: '#/components/schemas/DeviceType'
+          description: Filter by device type
+      responses:
+        '200':
+          description: List of tokens
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Token'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /tokens/{tokenId}:
+    delete:
+      tags:
+        - Token Management
+      summary: Deactivate token
+      description: Deactivate a specific FCM token
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: tokenId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Token ID to deactivate
+      responses:
+        '200':
+          description: Token deactivated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Token'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /scheduled:
+    post:
+      tags:
+        - Scheduled Notifications
+      summary: Create scheduled notification
+      description: Create a new scheduled notification
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ScheduledNotificationRequest'
+      responses:
+        '201':
+          description: Scheduled notification created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScheduledNotification'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+    get:
+      tags:
+        - Scheduled Notifications
+      summary: List scheduled notifications
+      description: List user's scheduled notifications with pagination
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+          description: Maximum number of notifications to return
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/ScheduledNotificationStatus'
+          description: Filter by status
+      responses:
+        '200':
+          description: List of scheduled notifications
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ScheduledNotification'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /scheduled/{scheduledId}:
+    put:
+      tags:
+        - Scheduled Notifications
+      summary: Update scheduled notification
+      description: Update an existing scheduled notification
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: scheduledId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Scheduled notification ID
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateScheduledNotificationRequest'
+      responses:
+        '200':
+          description: Scheduled notification updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScheduledNotification'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+    delete:
+      tags:
+        - Scheduled Notifications
+      summary: Cancel scheduled notification
+      description: Cancel a scheduled notification
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: scheduledId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Scheduled notification ID
+      responses:
+        '200':
+          description: Scheduled notification cancelled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScheduledNotification'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /templates:
+    post:
+      tags:
+        - Template Management
+      summary: Create template
+      description: Create a new notification template (admin only)
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TemplateRequest'
+      responses:
+        '201':
+          description: Template created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Template'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+    get:
+      tags:
+        - Template Management
+      summary: List templates
+      description: List notification templates
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: include_inactive
+          in: query
+          schema:
+            type: boolean
+            default: false
+          description: Include inactive templates (admin only)
+      responses:
+        '200':
+          description: List of templates
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Template'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /templates/{templateId}:
+    get:
+      tags:
+        - Template Management
+      summary: Get template
+      description: Get a specific template
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: templateId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Template ID
+      responses:
+        '200':
+          description: Template details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Template'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+    put:
+      tags:
+        - Template Management
+      summary: Update template
+      description: Update an existing template (admin only)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: templateId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Template ID
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateTemplateRequest'
+      responses:
+        '200':
+          description: Template updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Template'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+    delete:
+      tags:
+        - Template Management
+      summary: Delete template
+      description: Delete a template (admin only)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: templateId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Template ID
+      responses:
+        '200':
+          description: Template deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Template'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /analytics:
+    get:
+      tags:
+        - Analytics
+      summary: Get analytics
+      description: Get notification analytics with filtering (admin only)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: start_date
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: Start date for analytics
+        - name: end_date
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: End date for analytics
+        - name: template_id
+          in: query
+          schema:
+            type: string
+            format: uuid
+          description: Filter by template ID
+        - name: device_type
+          in: query
+          schema:
+            $ref: '#/components/schemas/DeviceType'
+          description: Filter by device type
+        - name: group_by
+          in: query
+          schema:
+            type: string
+            enum: [date, template, device_type]
+            default: date
+          description: Group results by
+      responses:
+        '200':
+          description: Analytics data
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Analytics'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /analytics/export:
+    get:
+      tags:
+        - Analytics
+      summary: Export analytics
+      description: Export analytics data (admin only)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: start_date
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: Start date for analytics
+        - name: end_date
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: End date for analytics
+        - name: template_id
+          in: query
+          schema:
+            type: string
+            format: uuid
+          description: Filter by template ID
+        - name: device_type
+          in: query
+          schema:
+            $ref: '#/components/schemas/DeviceType'
+          description: Filter by device type
+        - name: export
+          in: query
+          schema:
+            type: string
+            enum: [csv, json]
+            default: json
+          description: Export format
+      responses:
+        '200':
+          description: Analytics data exported
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /admin/users:
+    get:
+      tags:
+        - Admin Management
+      summary: List users
+      description: List users for admin operations (admin only)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+          description: Maximum number of users to return
+        - name: search
+          in: query
+          schema:
+            type: string
+          description: Search users by email
+      responses:
+        '200':
+          description: List of users
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/User'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /admin/users/{userId}/tokens:
+    get:
+      tags:
+        - Admin Management
+      summary: Get user tokens
+      description: View user's tokens (admin only)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: User ID
+      responses:
+        '200':
+          description: User's tokens
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Token'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /admin/notifications/broadcast:
+    post:
+      tags:
+        - Admin Management
+      summary: Broadcast notification
+      description: Send broadcast notification to multiple users (admin only)
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BroadcastRequest'
+      responses:
+        '202':
+          description: Broadcast initiated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BroadcastResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /notifications:
+    get:
+      tags:
+        - Notifications
+      summary: List notifications
+      description: List user notifications with pagination and filtering
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+          description: Maximum number of notifications to return
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+          description: Number of notifications to skip
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/NotificationStatus'
+          description: Filter by status
+        - name: category
+          in: query
+          schema:
+            type: string
+          description: Filter by category
+        - name: priority
+          in: query
+          schema:
+            $ref: '#/components/schemas/Priority'
+          description: Filter by priority
+        - name: start_date
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: Filter by start date
+        - name: end_date
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: Filter by end date
+        - name: sort_by
+          in: query
+          schema:
+            type: string
+            enum: [created_at, sent_at, delivered_at, priority, category]
+            default: created_at
+          description: Sort field
+        - name: sort_order
+          in: query
+          schema:
+            type: string
+            enum: [asc, desc]
+            default: desc
+          description: Sort order
+        - name: userId
+          in: query
+          schema:
+            type: string
+            format: uuid
+          description: User ID (admin only)
+      responses:
+        '200':
+          description: List of notifications with pagination metadata
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotificationListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+    post:
+      tags:
+        - Notifications
+      summary: Create notification
+      description: Create and send a notification
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NotificationRequest'
+      responses:
+        '202':
+          description: Notification created and queued for sending
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Notification'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /preferences:
+    get:
+      tags:
+        - User Preferences
+      summary: Get preferences
+      description: Get user notification preferences
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: User preferences
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserPreferences'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+    put:
+      tags:
+        - User Preferences
+      summary: Update preferences
+      description: Update user notification preferences
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateUserPreferencesRequest'
+      responses:
+        '200':
+          description: Preferences updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserPreferences'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    TokenRequest:
+      type: object
+      required:
+        - token
+        - device_type
+      properties:
+        token:
+          type: string
+          minLength: 1
+          maxLength: 500
+          description: FCM token
+        device_type:
+          $ref: '#/components/schemas/DeviceType'
+          description: Device type
+        device_model:
+          type: string
+          maxLength: 100
+          description: Device model
+        app_version:
+          type: string
+          maxLength: 50
+          description: App version
+        metadata:
+          type: object
+          description: Additional metadata
+
+    Token:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Token ID
+        user_id:
+          type: string
+          format: uuid
+          description: User ID
+        token:
+          type: string
+          description: FCM token (masked in response)
+        device_type:
+          $ref: '#/components/schemas/DeviceType'
+          description: Device type
+        device_model:
+          type: string
+          description: Device model
+        app_version:
+          type: string
+          description: App version
+        is_active:
+          type: boolean
+          description: Whether token is active
+        created_at:
+          type: string
+          format: date-time
+          description: Creation timestamp
+        updated_at:
+          type: string
+          format: date-time
+          description: Last update timestamp
+        last_used_at:
+          type: string
+          format: date-time
+          description: Last used timestamp
+        metadata:
+          type: object
+          description: Additional metadata
+
+    DeviceType:
+      type: string
+      enum:
+        - android
+        - ios
+        - web
+
+    ScheduledNotificationRequest:
+      type: object
+      required:
+        - schedule_at
+      properties:
+        template_id:
+          type: string
+          format: uuid
+          description: Template ID to use
+        template_name:
+          type: string
+          maxLength: 100
+          description: Template name to use
+        template_data:
+          type: object
+          description: Data for template rendering
+        title:
+          type: string
+          maxLength: 200
+          description: Custom notification title
+        body:
+          type: string
+          maxLength: 1000
+          description: Custom notification body
+        data:
+          type: object
+          description: Custom notification data
+        priority:
+          $ref: '#/components/schemas/Priority'
+          default: normal
+        category:
+          type: string
+          maxLength: 50
+          default: general
+          description: Notification category
+        schedule_at:
+          type: string
+          format: date-time
+          description: When to send the notification
+        recurrence:
+          type: string
+          enum:
+            - none
+            - daily
+            - weekly
+            - monthly
+          default: none
+          description: Recurrence pattern
+        recurrence_data:
+          type: object
+          description: Recurrence configuration
+        quiet_hours_override:
+          type: boolean
+          default: false
+          description: Override user quiet hours
+        timezone:
+          type: string
+          maxLength: 50
+          default: UTC
+          description: Timezone for scheduling
+
+    ScheduledNotification:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Scheduled notification ID
+        user_id:
+          type: string
+          format: uuid
+          description: User ID
+        template_id:
+          type: string
+          format: uuid
+          description: Template ID used
+        template_name:
+          type: string
+          description: Template name used
+        template_data:
+          type: object
+          description: Template data used
+        title:
+          type: string
+          description: Notification title
+        body:
+          type: string
+          description: Notification body
+        data:
+          type: object
+          description: Notification data
+        priority:
+          $ref: '#/components/schemas/Priority'
+          description: Notification priority
+        category:
+          type: string
+          description: Notification category
+        schedule_at:
+          type: string
+          format: date-time
+          description: Scheduled send time
+        status:
+          $ref: '#/components/schemas/ScheduledNotificationStatus'
+          description: Current status
+        failure_reason:
+          type: string
+          description: Reason for failure
+        last_attempt_at:
+          type: string
+          format: date-time
+          description: Last attempt timestamp
+        recurrence:
+          type: string
+          enum:
+            - none
+            - daily
+            - weekly
+            - monthly
+          description: Recurrence pattern
+        recurrence_data:
+          type: object
+          description: Recurrence configuration
+        quiet_hours_override:
+          type: boolean
+          description: Override user quiet hours
+        timezone:
+          type: string
+          description: Timezone for scheduling
+        created_at:
+          type: string
+          format: date-time
+          description: Creation timestamp
+        updated_at:
+          type: string
+          format: date-time
+          description: Last update timestamp
+
+    UpdateScheduledNotificationRequest:
+      type: object
+      properties:
+        template_id:
+          type: string
+          format: uuid
+          description: Template ID to use
+        template_name:
+          type: string
+          maxLength: 100
+          description: Template name to use
+        template_data:
+          type: object
+          description: Data for template rendering
+        title:
+          type: string
+          maxLength: 200
+          description: Custom notification title
+        body:
+          type: string
+          maxLength: 1000
+          description: Custom notification body
+        data:
+          type: object
+          description: Custom notification data
+        priority:
+          $ref: '#/components/schemas/Priority'
+          description: Notification priority
+        category:
+          type: string
+          maxLength: 50
+          description: Notification category
+        schedule_at:
+          type: string
+          format: date-time
+          description: When to send the notification
+        recurrence:
+          type: string
+          enum:
+            - none
+            - daily
+            - weekly
+            - monthly
+          description: Recurrence pattern
+        recurrence_data:
+          type: object
+          description: Recurrence configuration
+        quiet_hours_override:
+          type: boolean
+          description: Override user quiet hours
+        timezone:
+          type: string
+          maxLength: 50
+          description: Timezone for scheduling
+
+    ScheduledNotificationStatus:
+      type: string
+      enum:
+        - pending
+        - processing
+        - sent
+        - failed
+        - cancelled
+
+    TemplateRequest:
+      type: object
+      required:
+        - name
+        - title_template
+        - body_template
+      properties:
+        name:
+          type: string
+          minLength: 3
+          maxLength: 100
+          description: Template name
+        title_template:
+          type: string
+          minLength: 1
+          maxLength: 500
+          description: Title template with placeholders
+        body_template:
+          type: string
+          minLength: 1
+          maxLength: 2000
+          description: Body template with placeholders
+        data_schema:
+          type: object
+          description: Schema for template data
+        category:
+          type: string
+          maxLength: 50
+          default: general
+          description: Template category
+        is_active:
+          type: boolean
+          default: true
+          description: Whether template is active
+        metadata:
+          type: object
+          description: Additional metadata
+
+    Template:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Template ID
+        name:
+          type: string
+          description: Template name
+        title_template:
+          type: string
+          description: Title template
+        body_template:
+          type: string
+          description: Body template
+        data_schema:
+          type: object
+          description: Template data schema
+        category:
+          type: string
+          description: Template category
+        is_active:
+          type: boolean
+          description: Whether template is active
+        created_by:
+          type: string
+          format: uuid
+          description: Creator user ID
+        created_at:
+          type: string
+          format: date-time
+          description: Creation timestamp
+        updated_at:
+          type: string
+          format: date-time
+          description: Last update timestamp
+        usage_count:
+          type: integer
+          description: Number of times used
+        success_rate:
+          type: number
+          format: float
+          description: Success rate percentage
+        metadata:
+          type: object
+          description: Additional metadata
+
+    UpdateTemplateRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 3
+          maxLength: 100
+          description: Template name
+        title_template:
+          type: string
+          minLength: 1
+          maxLength: 500
+          description: Title template with placeholders
+        body_template:
+          type: string
+          minLength: 1
+          maxLength: 2000
+          description: Body template with placeholders
+        data_schema:
+          type: object
+          description: Schema for template data
+        category:
+          type: string
+          maxLength: 50
+          description: Template category
+        is_active:
+          type: boolean
+          description: Whether template is active
+        metadata:
+          type: object
+          description: Additional metadata
+
+    Analytics:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Analytics record ID
+        date:
+          type: string
+          format: date
+          description: Analytics date
+        hour:
+          type: integer
+          minimum: 0
+          maximum: 23
+          description: Analytics hour
+        template_id:
+          type: string
+          format: uuid
+          description: Template ID
+        device_type:
+          $ref: '#/components/schemas/DeviceType'
+          description: Device type
+        total_sent:
+          type: integer
+          description: Total notifications sent
+        total_delivered:
+          type: integer
+          description: Total notifications delivered
+        total_failed:
+          type: integer
+          description: Total notifications failed
+        total_pending:
+          type: integer
+          description: Total notifications pending
+        avg_delivery_time_ms:
+          type: integer
+          description: Average delivery time in milliseconds
+        delivery_rate:
+          type: number
+          format: float
+          description: Delivery rate percentage
+        failure_rate:
+          type: number
+          format: float
+          description: Failure rate percentage
+        error_invalid_token:
+          type: integer
+          description: Invalid token errors
+        error_quota_exceeded:
+          type: integer
+          description: Quota exceeded errors
+        error_server_error:
+          type: integer
+          description: Server errors
+        error_timeout:
+          type: integer
+          description: Timeout errors
+        error_unknown:
+          type: integer
+          description: Unknown errors
+        created_at:
+          type: string
+          format: date-time
+          description: Creation timestamp
+        updated_at:
+          type: string
+          format: date-time
+          description: Last update timestamp
+
+    BroadcastRequest:
+      type: object
+      required:
+        - title
+        - body
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+          description: Notification title
+        body:
+          type: string
+          minLength: 1
+          maxLength: 1000
+          description: Notification body
+        data:
+          type: object
+          description: Custom notification data
+        priority:
+          $ref: '#/components/schemas/Priority'
+          default: normal
+          description: Notification priority
+        category:
+          type: string
+          maxLength: 50
+          default: general
+          description: Notification category
+        target_device_types:
+          type: array
+          items:
+            $ref: '#/components/schemas/DeviceType'
+          description: Target specific device types
+        target_user_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: Target specific users
+        dry_run:
+          type: boolean
+          default: false
+          description: Test run without sending
+
+    BroadcastResponse:
+      type: object
+      properties:
+        message:
+          type: string
+          description: Response message
+        notification:
+          $ref: '#/components/schemas/Notification'
+          description: Created notification
+        tokens_targeted:
+          type: integer
+          description: Number of tokens targeted
+
+    User:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: User ID
+        email:
+          type: string
+          format: email
+          description: User email
+        created_at:
+          type: string
+          format: date-time
+          description: Account creation timestamp
+        last_sign_in_at:
+          type: string
+          format: date-time
+          description: Last sign-in timestamp
+
+    NotificationRequest:
+      type: object
+      required:
+        - userId
+      properties:
+        userId:
+          type: string
+          format: uuid
+          description: Target user ID
+        templateId:
+          type: string
+          format: uuid
+          description: Template ID to use
+        templateName:
+          type: string
+          maxLength: 100
+          description: Template name to use
+        title:
+          type: string
+          maxLength: 200
+          description: Custom notification title
+        body:
+          type: string
+          maxLength: 1000
+          description: Custom notification body
+        data:
+          type: object
+          description: Custom notification data
+        priority:
+          $ref: '#/components/schemas/Priority'
+          description: Notification priority
+        category:
+          type: string
+          maxLength: 50
+          description: Notification category
+
+    Notification:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Notification ID
+        user_id:
+          type: string
+          format: uuid
+          description: Target user ID
+        template_id:
+          type: string
+          format: uuid
+          description: Template ID used
+        title:
+          type: string
+          description: Notification title
+        body:
+          type: string
+          description: Notification body
+        data:
+          type: object
+          description: Notification data
+        priority:
+          $ref: '#/components/schemas/Priority'
+          description: Notification priority
+        category:
+          type: string
+          description: Notification category
+        status:
+          $ref: '#/components/schemas/NotificationStatus'
+          description: Current status
+        sent_at:
+          type: string
+          format: date-time
+          description: Send timestamp
+        delivered_at:
+          type: string
+          format: date-time
+          description: Delivery timestamp
+        failed_at:
+          type: string
+          format: date-time
+          description: Failure timestamp
+        failure_reason:
+          type: string
+          description: Reason for failure
+        fcm_message_id:
+          type: string
+          description: FCM message ID
+        tokens_targeted:
+          type: integer
+          description: Number of tokens targeted
+        tokens_successful:
+          type: integer
+          description: Number of successful deliveries
+        tokens_failed:
+          type: integer
+          description: Number of failed deliveries
+        created_at:
+          type: string
+          format: date-time
+          description: Creation timestamp
+        updated_at:
+          type: string
+          format: date-time
+          description: Last update timestamp
+        metadata:
+          type: object
+          description: Additional metadata
+
+    NotificationStatus:
+      type: string
+      enum:
+        - pending
+        - sent
+        - delivered
+        - failed
+        - cancelled
+
+    Priority:
+      type: string
+      enum:
+        - low
+        - normal
+        - high
+
+    NotificationListResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Notification'
+          description: List of notifications
+        pagination:
+          type: object
+          properties:
+            total:
+              type: integer
+              description: Total number of notifications
+            page:
+              type: integer
+              description: Current page number
+            per_page:
+              type: integer
+              description: Items per page
+            total_pages:
+              type: integer
+              description: Total number of pages
+            has_next_page:
+              type: boolean
+              description: Whether there's a next page
+            has_prev_page:
+              type: boolean
+              description: Whether there's a previous page
+            next_offset:
+              type: integer
+              description: Offset for next page
+            prev_offset:
+              type: integer
+              description: Offset for previous page
+
+    UserPreferences:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Preferences ID
+        user_id:
+          type: string
+          format: uuid
+          description: User ID
+        push_enabled:
+          type: boolean
+          description: Whether push notifications are enabled
+        quiet_hours_start:
+          type: string
+          pattern: '^([01]?[0-9]|2[0-3]):[0-5][0-9]$'
+          description: Quiet hours start time
+        quiet_hours_end:
+          type: string
+          pattern: '^([01]?[0-9]|2[0-3]):[0-5][0-9]$'
+          description: Quiet hours end time
+        marketing_enabled:
+          type: boolean
+          description: Whether marketing notifications are enabled
+        transactional_enabled:
+          type: boolean
+          description: Whether transactional notifications are enabled
+        social_enabled:
+          type: boolean
+          description: Whether social notifications are enabled
+        reminder_enabled:
+          type: boolean
+          description: Whether reminder notifications are enabled
+        priority_threshold:
+          $ref: '#/components/schemas/Priority'
+          description: Minimum priority to deliver
+        batch_notifications:
+          type: boolean
+          description: Whether to batch notifications
+        created_at:
+          type: string
+          format: date-time
+          description: Creation timestamp
+        updated_at:
+          type: string
+          format: date-time
+          description: Last update timestamp
+
+    UpdateUserPreferencesRequest:
+      type: object
+      properties:
+        push_enabled:
+          type: boolean
+          description: Whether push notifications are enabled
+        quiet_hours_start:
+          type: string
+          pattern: '^([01]?[0-9]|2[0-3]):[0-5][0-9]$'
+          description: Quiet hours start time
+        quiet_hours_end:
+          type: string
+          pattern: '^([01]?[0-9]|2[0-3]):[0-5][0-9]$'
+          description: Quiet hours end time
+        marketing_enabled:
+          type: boolean
+          description: Whether marketing notifications are enabled
+        transactional_enabled:
+          type: boolean
+          description: Whether transactional notifications are enabled
+        social_enabled:
+          type: boolean
+          description: Whether social notifications are enabled
+        reminder_enabled:
+          type: boolean
+          description: Whether reminder notifications are enabled
+        priority_threshold:
+          $ref: '#/components/schemas/Priority'
+          description: Minimum priority to deliver
+        batch_notifications:
+          type: boolean
+          description: Whether to batch notifications
+
+  responses:
+    BadRequest:
+      description: Bad request
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+                example: Bad Request
+              message:
+                type: string
+                example: Invalid input parameters
+
+    Unauthorized:
+      description: Unauthorized
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+                example: Unauthorized
+
+    Forbidden:
+      description: Forbidden
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+                example: Forbidden
+
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+                example: Not Found
+
+    RateLimited:
+      description: Rate limit exceeded
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+                example: Rate Limited
+              message:
+                type: string
+                example: Too many requests
+
+    InternalServerError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+                example: Internal Server Error
+              message:
+                type: string
+                example: An unexpected error occurred
+
+tags:
+  - name: Token Management
+    description: FCM token registration and management
+  - name: Scheduled Notifications
+    description: Scheduled notification management
+  - name: Template Management
+    description: Notification template management
+  - name: Analytics
+    description: Analytics and reporting
+  - name: Admin Management
+    description: Administrative functions
+  - name: Notifications
+    description: Notification management
+  - name: User Preferences
+    description: User notification preferences
