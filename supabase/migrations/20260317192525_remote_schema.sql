@@ -1,5 +1,11 @@
 create schema if not exists "grafana";
 
+do $$ begin
+  if not exists (select from pg_roles where rolname = 'grafana') then
+    create role grafana nologin;
+  end if;
+end $$;
+
 drop view if exists "public"."cron_job_status";
 
 alter table "public"."coffee_roasters" add column "address_text" text;
@@ -24,15 +30,6 @@ CREATE INDEX launch_popup_is_translated_idx ON public.launch_popup USING btree (
 
 set check_function_bodies = off;
 
-CREATE OR REPLACE FUNCTION grafana.secure_users_metrics()
- RETURNS SETOF grafana.users_metrics
- LANGUAGE sql
- STABLE SECURITY DEFINER
-AS $function$
-  SELECT * FROM grafana.users_metrics;
-$function$
-;
-
 create or replace view "grafana"."users_metrics" as  WITH users_clean AS (
          SELECT users.id,
             users.created_at,
@@ -46,6 +43,14 @@ create or replace view "grafana"."users_metrics" as  WITH users_clean AS (
     users_clean.deleted_at
    FROM users_clean;
 
+CREATE OR REPLACE FUNCTION grafana.secure_users_metrics()
+ RETURNS SETOF grafana.users_metrics
+ LANGUAGE sql
+ STABLE SECURITY DEFINER
+AS $function$
+  SELECT * FROM grafana.users_metrics;
+$function$
+;
 
 CREATE OR REPLACE FUNCTION public.admin_list_notifications(p_limit integer DEFAULT 10, p_offset integer DEFAULT 0, p_status text DEFAULT NULL::text, p_category text DEFAULT NULL::text, p_priority text DEFAULT NULL::text, p_start_date timestamp with time zone DEFAULT NULL::timestamp with time zone, p_end_date timestamp with time zone DEFAULT NULL::timestamp with time zone, p_sort_by text DEFAULT 'created_at'::text, p_sort_order text DEFAULT 'desc'::text)
  RETURNS json
@@ -347,18 +352,18 @@ grant update on table "service"."app_release_notifications" to "service_role";
 
 CREATE TRIGGER trg_cancel_orphan_events_on_session_end AFTER UPDATE OF status ON service.live_activity_sessions FOR EACH ROW WHEN (((new.status = ANY (ARRAY['ended'::text, 'stale'::text])) AND (old.status = 'active'::text))) EXECUTE FUNCTION service.cancel_orphan_events_on_session_end();
 
-drop trigger if exists "objects_delete_delete_prefix" on "storage"."objects";
-
-drop trigger if exists "objects_insert_create_prefix" on "storage"."objects";
-
-drop trigger if exists "objects_update_create_prefix" on "storage"."objects";
-
-drop trigger if exists "prefixes_create_hierarchy" on "storage"."prefixes";
-
-drop trigger if exists "prefixes_delete_hierarchy" on "storage"."prefixes";
-
-CREATE TRIGGER protect_buckets_delete BEFORE DELETE ON storage.buckets FOR EACH STATEMENT EXECUTE FUNCTION storage.protect_delete();
-
-CREATE TRIGGER protect_objects_delete BEFORE DELETE ON storage.objects FOR EACH STATEMENT EXECUTE FUNCTION storage.protect_delete();
+do $$ begin
+  drop trigger if exists "objects_delete_delete_prefix" on "storage"."objects";
+  drop trigger if exists "objects_insert_create_prefix" on "storage"."objects";
+  drop trigger if exists "objects_update_create_prefix" on "storage"."objects";
+  drop trigger if exists "prefixes_create_hierarchy" on "storage"."prefixes";
+  drop trigger if exists "prefixes_delete_hierarchy" on "storage"."prefixes";
+  begin
+    CREATE TRIGGER protect_buckets_delete BEFORE DELETE ON storage.buckets FOR EACH STATEMENT EXECUTE FUNCTION storage.protect_delete();
+  exception when others then null; end;
+  begin
+    CREATE TRIGGER protect_objects_delete BEFORE DELETE ON storage.objects FOR EACH STATEMENT EXECUTE FUNCTION storage.protect_delete();
+  exception when others then null; end;
+exception when others then null; end $$;
 
 

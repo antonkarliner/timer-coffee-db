@@ -5,170 +5,101 @@ import { getCorsHeaders } from "../_shared/cors.ts";
 import { createSecureResponse } from "../_shared/security-headers.ts";
 import { checkUserRateLimit as _checkUserRateLimit, checkDailyNotificationLimit, checkIpRateLimit, getClientIP, createRateLimitResponse } from "../_shared/rate-limiter.ts";
 import { validateAndLogEnvironment, ENVIRONMENT_CONFIG } from "../_shared/env-validation.ts";
-import {
-  monitoring,
-  generateCorrelationId,
-  createPerformanceTracker,
-  completePerformanceTracking,
-  logApiRequest,
-  logApiResponse,
-  logInfo,
-  logWarning,
-  logError,
-  logFatal,
-  ErrorCategory,
-  ErrorSeverity
-} from "../_shared/monitoring.ts";
+import { monitoring, generateCorrelationId, createPerformanceTracker, completePerformanceTracking, logApiRequest, logApiResponse, logInfo, logWarning, logError, logFatal, ErrorCategory, ErrorSeverity } from "../_shared/monitoring.ts";
 import { translateNotificationBatch } from "../_shared/translation-service.ts";
 // Direct FCM HTTP v1 API client (bypassing Firebase Admin SDK)
 import { sendFCMMulticast, isInvalidTokenError } from "../_shared/fcm-http-client.ts";
-
-
-
-
 // Validate environment variables
 validateAndLogEnvironment();
-
 const supabaseUrl = ENVIRONMENT_CONFIG.supabaseUrl;
 const serviceRoleKey = ENVIRONMENT_CONFIG.supabaseServiceRoleKey;
 const firebaseServiceAccount = ENVIRONMENT_CONFIG.firebaseServiceAccount;
-
 if (!supabaseUrl || !serviceRoleKey) {
   throw new Error("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be provided");
 }
-
 if (!firebaseServiceAccount) {
   throw new Error("FIREBASE_SERVICE_ACCOUNT env var is required for send-fcm-notification");
 }
-
 const serviceAccount = JSON.parse(firebaseServiceAccount);
-
 const supabase = createClient(supabaseUrl, serviceRoleKey, {
   auth: {
     persistSession: false,
-    detectSessionInUrl: false,
+    detectSessionInUrl: false
   },
-  db: { schema: "service" },
+  db: {
+    schema: "service"
+  }
 });
-
 const notificationSchema = z.object({
-  userId: z.string().uuid().nullable(),  // NULL for broadcast notifications
+  userId: z.string().uuid().nullable(),
   notificationId: z.string().uuid().optional(),
   templateName: z.string().optional(),
   templateId: z.string().uuid().optional(),
   title: z.string().optional(),
   body: z.string().optional(),
   data: z.record(z.any()).optional(),
-  priority: z.enum(["low", "normal", "high"]).default("normal"),
+  priority: z.enum([
+    "low",
+    "normal",
+    "high"
+  ]).default("normal"),
   category: z.string().optional(),
   requestId: z.string().optional(),
   quietHoursOverride: z.boolean().optional(),
   translate: z.boolean().optional().default(false),
-  locale: z.string().min(2).max(10).default("en").transform(val => val.trim().toLowerCase()),
-  target_device_types: z.array(z.enum(["android", "ios", "web"])).optional(),
-  tokens: z.array(
-    z.union([
-      z.string().min(1),
-      z.object({
-        token: z.string().min(1),
-        device_type: z.enum(["android", "ios", "web"]).optional(),
-        locale: z.string().min(2).max(10).optional(),
-        id: z.string().uuid().optional(),
-      }),
-    ])
-  ).optional(),
-  deep_link: z.string().optional(),
-}).superRefine((value, ctx) => {
+  locale: z.string().min(2).max(10).default("en").transform((val)=>val.trim().toLowerCase()),
+  target_device_types: z.array(z.enum([
+    "android",
+    "ios",
+    "web"
+  ])).optional(),
+  tokens: z.array(z.union([
+    z.string().min(1),
+    z.object({
+      token: z.string().min(1),
+      device_type: z.enum([
+        "android",
+        "ios",
+        "web"
+      ]).optional(),
+      locale: z.string().min(2).max(10).optional(),
+      id: z.string().uuid().optional()
+    })
+  ])).optional(),
+  deep_link: z.string().optional()
+}).superRefine((value, ctx)=>{
   if (!value.templateName && !value.templateId && (!value.title || !value.body)) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       message: "Provide templateName/templateId or explicit title and body",
-      path: ["title"],
+      path: [
+        "title"
+      ]
     });
   }
   if (!value.userId && (!value.tokens || value.tokens.length === 0)) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       message: "Provide tokens array when sending a broadcast (userId = null)",
-      path: ["tokens"],
+      path: [
+        "tokens"
+      ]
     });
   }
 });
-
-type NotificationPayload = z.infer<typeof notificationSchema>;
-
-type NotificationResult = {
-  notificationId: string;
-  tokensTargeted: number;
-  tokensSuccessful: number;
-  tokensFailed: number;
-  success: boolean;
-  error?: string;
-  locale?: string;
-};
-
-type TemplateRow = {
-  id: string;
-  name: string;
-  title_template: string;
-  body_template: string;
-  data_schema: Record<string, unknown> | null;
-  category: string | null;
-};
-
-type IncomingToken = string | {
-  token: string;
-  device_type?: "android" | "ios" | "web";
-  locale?: string | null;
-  id?: string;
-};
-
-type TokenRow = {
-  id?: string | null;
-  token: string;
-  device_type?: string | null;
-  locale?: string | null;
-};
-
-type NotificationRecord = {
-  id: string;
-};
-
-type Preferences = {
-  push_enabled: boolean;
-  quiet_hours_start: string | null;
-  quiet_hours_end: string | null;
-  marketing_enabled: boolean;
-  transactional_enabled: boolean;
-  priority_threshold: "low" | "normal" | "high";
-};
-
-const DEFAULT_PREFERENCES: Preferences = {
+const DEFAULT_PREFERENCES = {
   push_enabled: true,
   quiet_hours_start: null,
   quiet_hours_end: null,
   marketing_enabled: true,
   transactional_enabled: true,
-  priority_threshold: "low",
+  priority_threshold: "low"
 };
-
 const MAX_FCM_BATCH = ENVIRONMENT_CONFIG.fcmBatchSize;
 const DEFAULT_MAX_TOKEN_AGE_DAYS = ENVIRONMENT_CONFIG.tokenMaxAgeDays;
 const MAX_REQUEST_SIZE = ENVIRONMENT_CONFIG.maxRequestSize; // 1MB default
 const MAX_FCM_PAYLOAD_SIZE = 4096; // FCM limit is 4KB
-
-type LinkType =
-  | "none"
-  | "external_url"
-  | "internal_route"
-  | "app_deep_link"
-  | "unknown"
-  | "malformed";
-
-function summarizeLinkFields(
-  rawDeepLink: unknown,
-  dataPayload?: Record<string, unknown> | null,
-) {
+function summarizeLinkFields(rawDeepLink, dataPayload) {
   return {
     rawDeepLink: typeof rawDeepLink === "string" ? rawDeepLink : rawDeepLink ?? null,
     dataDeepLink: dataPayload ? dataPayload["deep_link"] ?? null : null,
@@ -177,45 +108,39 @@ function summarizeLinkFields(
     linkType: dataPayload ? dataPayload["link_type"] ?? null : null,
     urlValidation: dataPayload ? dataPayload["url_validation"] ?? null : null,
     validatedUrl: dataPayload ? dataPayload["validated_url"] ?? null : null,
-    linkKeys: dataPayload ? Object.keys(dataPayload).filter((k) => k.toLowerCase().includes("link")) : [],
+    linkKeys: dataPayload ? Object.keys(dataPayload).filter((k)=>k.toLowerCase().includes("link")) : []
   };
 }
-
-function classifyLinkType(link: string | undefined): {
-  type: LinkType;
-  parsedUrl?: string;
-  shouldOpenInBrowser: boolean;
-} {
+function classifyLinkType(link) {
   if (!link) {
-    return { type: "none", shouldOpenInBrowser: false };
+    return {
+      type: "none",
+      shouldOpenInBrowser: false
+    };
   }
-
   try {
     const url = new URL(link);
-
     // External HTTP/HTTPS URLs - must open in browser
     if (url.protocol === "https:" || url.protocol === "http:") {
       return {
         type: "external_url",
         parsedUrl: link,
-        shouldOpenInBrowser: true,
+        shouldOpenInBrowser: true
       };
     }
-
     // App deep links - open internally
     if (url.protocol === "timercoffee:" || url.protocol === "app:") {
       return {
         type: "app_deep_link",
         parsedUrl: link,
-        shouldOpenInBrowser: false,
+        shouldOpenInBrowser: false
       };
     }
-
     // Unknown protocol - default to external for security
     return {
       type: "unknown",
       parsedUrl: link,
-      shouldOpenInBrowser: true, // Safer to open unknown protocols externally
+      shouldOpenInBrowser: true
     };
   } catch (_error) {
     // Not a valid URL - treat as internal route if starts with /
@@ -225,7 +150,6 @@ function classifyLinkType(link: string | undefined): {
         shouldOpenInBrowser: false
       };
     }
-
     // Malformed URL - treat as external to be safe
     return {
       type: "malformed",
@@ -233,26 +157,21 @@ function classifyLinkType(link: string | undefined): {
     };
   }
 }
-
-function validateAndSanitizeDeepLink(url: unknown): string | null {
+function validateAndSanitizeDeepLink(url) {
   if (typeof url !== "string") return null;
   if (!url) return null;
-
   try {
     const parsedUrl = new URL(url);
-
     // Only allow http and https protocols for external URLs
     if (parsedUrl.protocol === "http:" || parsedUrl.protocol === "https:") {
       // Ensure the URL has a valid host
       if (!parsedUrl.host) return null;
       return url;
     }
-
     // Allow app deep link schemes
     if (parsedUrl.protocol === "timercoffee:" || parsedUrl.protocol === "app:") {
       return url;
     }
-
     // Unknown protocol - reject
     return null;
   } catch (_error) {
@@ -260,37 +179,26 @@ function validateAndSanitizeDeepLink(url: unknown): string | null {
     if (url.startsWith("/")) {
       return url;
     }
-
     console.warn("Invalid deep_link in notification data:", url);
     return null;
   }
 }
-
-function applyDeepLinkMetadata(
-  dataPayload: Record<string, unknown>,
-  deepLink: unknown,
-  context: { userId: string | null; correlationId: string },
-) {
+function applyDeepLinkMetadata(dataPayload, deepLink, context) {
   // Add defensive check for context
   if (!context) {
     console.warn("[SFCM] applyDeepLinkMetadata called without context");
     return;
   }
-  
   if (deepLink === undefined || deepLink === null) return;
   if (typeof deepLink === "string" && deepLink.trim().length === 0) return;
-
   const deepLinkString = typeof deepLink === "string" ? deepLink : undefined;
   const linkTypeInfo = classifyLinkType(deepLinkString);
-  
   // Add explicit link type metadata
   dataPayload.link_type = linkTypeInfo.type;
   dataPayload.open_in_browser = linkTypeInfo.shouldOpenInBrowser ? "true" : "false";
-
   const validatedUrl = validateAndSanitizeDeepLink(deepLink);
   if (validatedUrl) {
     dataPayload.url_validation = "valid";
-
     // Separate external URLs from internal deep links
     if (linkTypeInfo.shouldOpenInBrowser) {
       // External URLs go ONLY to external_url field
@@ -304,7 +212,6 @@ function applyDeepLinkMetadata(
       // Clear external_url field for internal links
       delete dataPayload.external_url;
     }
-
     if (linkTypeInfo.parsedUrl) {
       dataPayload.validated_url = validatedUrl;
     }
@@ -313,25 +220,19 @@ function applyDeepLinkMetadata(
     delete dataPayload.deep_link;
     delete dataPayload.external_url;
   }
-
   // Enhanced logging for link classification and field assignment
-  logInfo(
-    "Notification link classification and field assignment",
-    {
-      originalLink: deepLink,
-      classifiedType: linkTypeInfo.type,
-      shouldOpenInBrowser: linkTypeInfo.shouldOpenInBrowser,
-      targetField: linkTypeInfo.shouldOpenInBrowser ? "external_url" : "deep_link",
-      finalPayload: {
-        external_url: dataPayload.external_url,
-        deep_link: dataPayload.deep_link,
-      },
-      userId: context.userId,
-      correlationId: context.correlationId,
+  logInfo("Notification link classification and field assignment", {
+    originalLink: deepLink,
+    classifiedType: linkTypeInfo.type,
+    shouldOpenInBrowser: linkTypeInfo.shouldOpenInBrowser,
+    targetField: linkTypeInfo.shouldOpenInBrowser ? "external_url" : "deep_link",
+    finalPayload: {
+      external_url: dataPayload.external_url,
+      deep_link: dataPayload.deep_link
     },
-    context.correlationId,
-  );
-  
+    userId: context.userId,
+    correlationId: context.correlationId
+  }, context.correlationId);
   // Console logging for development debugging
   console.log("[SFCM] Link field assignment", {
     correlationId: context.correlationId,
@@ -341,69 +242,59 @@ function applyDeepLinkMetadata(
     targetField: linkTypeInfo.shouldOpenInBrowser ? "external_url" : "deep_link",
     finalPayload: {
       external_url: dataPayload.external_url,
-      deep_link: dataPayload.deep_link,
-    },
+      deep_link: dataPayload.deep_link
+    }
   });
-
   if (!validatedUrl) {
-    logWarning(
-      "Removed invalid URL from notification",
-      {
-        originalUrl: deepLink,
-        reason: "invalid_format",
-        userId: context.userId,
-        correlationId: context.correlationId,
-      },
-      context.correlationId,
-    );
+    logWarning("Removed invalid URL from notification", {
+      originalUrl: deepLink,
+      reason: "invalid_format",
+      userId: context.userId,
+      correlationId: context.correlationId
+    }, context.correlationId);
   } else if (!linkTypeInfo.shouldOpenInBrowser && !linkTypeInfo.parsedUrl) {
-    logWarning(
-      "Invalid internal deep link format",
-      {
-        originalLink: deepLink,
-        reason: "invalid_format",
-        userId: context.userId,
-        correlationId: context.correlationId,
-      },
-      context.correlationId,
-    );
+    logWarning("Invalid internal deep link format", {
+      originalLink: deepLink,
+      reason: "invalid_format",
+      userId: context.userId,
+      correlationId: context.correlationId
+    }, context.correlationId);
   }
 }
-
-serve(async (req) => {
+serve(async (req)=>{
   const requestOrigin = req.headers.get("origin");
   const cors = getCorsHeaders(requestOrigin || undefined);
-  
   // Generate correlation ID for request tracing
   const correlationId = generateCorrelationId();
-  
   // Create performance tracker
   const performanceTracker = createPerformanceTracker('send-fcm-notification', 'main_handler', correlationId);
-  
   // Log API request start
   const requestId = logApiRequest(req, undefined, correlationId);
-  
   if (req.method === "OPTIONS") {
     completePerformanceTracking(performanceTracker, req, 200);
     logApiResponse(requestId, 200, Date.now() - performanceTracker.startTime, undefined, correlationId);
-    return new Response("ok", { headers: cors });
+    return new Response("ok", {
+      headers: cors
+    });
   }
-
   if (req.method !== "POST") {
     completePerformanceTracking(performanceTracker, req, 405);
     logApiResponse(requestId, 405, Date.now() - performanceTracker.startTime, undefined, correlationId);
     logWarning('Method not allowed', {
       method: req.method,
       url: req.url,
-      correlationId,
+      correlationId
     }, correlationId);
-    
-    return createSecureResponse(
-      JSON.stringify({ error: "Method not allowed" }),
-      { status: 405, headers: { ...cors, "Content-Type": "application/json" } }
-    );
+    return createSecureResponse(JSON.stringify({
+      error: "Method not allowed"
+    }), {
+      status: 405,
+      headers: {
+        ...cors,
+        "Content-Type": "application/json"
+      }
+    });
   }
-
   try {
     // Check request size before parsing
     const contentLength = req.headers.get("content-length");
@@ -413,20 +304,20 @@ serve(async (req) => {
       logWarning('Request too large', {
         contentLength,
         maxSize: MAX_REQUEST_SIZE,
-        correlationId,
+        correlationId
       }, correlationId);
-      
-      return createSecureResponse(
-        JSON.stringify({
-          error: "Request too large",
-          message: `Request size ${contentLength} bytes exceeds maximum allowed size of ${MAX_REQUEST_SIZE} bytes`
-        }),
-        { status: 413, headers: { ...cors, "Content-Type": "application/json" } }
-      );
+      return createSecureResponse(JSON.stringify({
+        error: "Request too large",
+        message: `Request size ${contentLength} bytes exceeds maximum allowed size of ${MAX_REQUEST_SIZE} bytes`
+      }), {
+        status: 413,
+        headers: {
+          ...cors,
+          "Content-Type": "application/json"
+        }
+      });
     }
-
     const body = await req.json();
-    
     // Validate request size after parsing (more accurate)
     const requestBodySize = JSON.stringify(body).length;
     if (requestBodySize > MAX_REQUEST_SIZE) {
@@ -435,18 +326,19 @@ serve(async (req) => {
       logWarning('Request body too large', {
         requestBodySize,
         maxSize: MAX_REQUEST_SIZE,
-        correlationId,
+        correlationId
       }, correlationId);
-      
-      return createSecureResponse(
-        JSON.stringify({
-          error: "Request too large",
-          message: `Request body size ${requestBodySize} bytes exceeds maximum allowed size of ${MAX_REQUEST_SIZE} bytes`
-        }),
-        { status: 413, headers: { ...cors, "Content-Type": "application/json" } }
-      );
+      return createSecureResponse(JSON.stringify({
+        error: "Request too large",
+        message: `Request body size ${requestBodySize} bytes exceeds maximum allowed size of ${MAX_REQUEST_SIZE} bytes`
+      }), {
+        status: 413,
+        headers: {
+          ...cors,
+          "Content-Type": "application/json"
+        }
+      });
     }
-    
     let parsed;
     try {
       parsed = notificationSchema.parse(body);
@@ -455,15 +347,19 @@ serve(async (req) => {
       logApiResponse(requestId, 422, Date.now() - performanceTracker.startTime, undefined, correlationId);
       logError('Request validation failed', error instanceof Error ? error : new Error(String(error)), ErrorCategory.VALIDATION, ErrorSeverity.MEDIUM, {
         requestBody: body,
-        correlationId,
+        correlationId
       }, correlationId);
-      
-      return createSecureResponse(
-        JSON.stringify({ error: "Validation failed", details: error instanceof z.ZodError ? error.errors : String(error) }),
-        { status: 422, headers: { ...cors, "Content-Type": "application/json" } }
-      );
+      return createSecureResponse(JSON.stringify({
+        error: "Validation failed",
+        details: error instanceof z.ZodError ? error.errors : String(error)
+      }), {
+        status: 422,
+        headers: {
+          ...cors,
+          "Content-Type": "application/json"
+        }
+      });
     }
-
     logInfo("Parsed send-fcm-notification request", {
       correlationId,
       userId: parsed.userId,
@@ -480,10 +376,10 @@ serve(async (req) => {
       hasData: !!parsed.data,
       linkFields: {
         topLevel: parsed.deep_link ?? null,
-        dataDeepLink: (parsed.data as Record<string, unknown> | undefined)?.["deep_link"] ?? null,
-        external_url: (parsed.data as Record<string, unknown> | undefined)?.["external_url"] ?? null,
-        open_in_browser: (parsed.data as Record<string, unknown> | undefined)?.["open_in_browser"] ?? null,
-      },
+        dataDeepLink: parsed.data?.["deep_link"] ?? null,
+        external_url: parsed.data?.["external_url"] ?? null,
+        open_in_browser: parsed.data?.["open_in_browser"] ?? null
+      }
     }, correlationId);
     console.log("[SFCM] Parsed request", {
       correlationId,
@@ -500,13 +396,12 @@ serve(async (req) => {
       tokensProvided: Array.isArray(parsed.tokens) ? parsed.tokens.length : 0,
       linkFields: {
         topLevel: parsed.deep_link ?? null,
-        dataDeepLink: (parsed.data as Record<string, unknown> | undefined)?.["deep_link"] ?? null,
-        external_url: (parsed.data as Record<string, unknown> | undefined)?.["external_url"] ?? null,
-        open_in_browser: (parsed.data as Record<string, unknown> | undefined)?.["open_in_browser"] ?? null,
-      },
+        dataDeepLink: parsed.data?.["deep_link"] ?? null,
+        external_url: parsed.data?.["external_url"] ?? null,
+        open_in_browser: parsed.data?.["open_in_browser"] ?? null
+      }
     });
-
-    const deepLinkFromData = (parsed.data as Record<string, unknown> | undefined)?.["deep_link"];
+    const deepLinkFromData = parsed.data?.["deep_link"];
     const rawDeepLink = parsed.deep_link ?? deepLinkFromData;
     logInfo("Incoming notification link fields", {
       rawDeepLink,
@@ -518,7 +413,7 @@ serve(async (req) => {
       targetDeviceTypes: parsed.target_device_types,
       userId: parsed.userId,
       hasTokensArray: Array.isArray(parsed.tokens),
-      correlationId,
+      correlationId
     }, correlationId);
     console.log("[SFCM] Incoming link fields", {
       correlationId,
@@ -528,13 +423,12 @@ serve(async (req) => {
       locale: parsed.locale,
       translate: parsed.translate,
       targetDeviceTypes: parsed.target_device_types,
-      hasTokensArray: Array.isArray(parsed.tokens),
+      hasTokensArray: Array.isArray(parsed.tokens)
     });
-	    
-	    // Check FCM payload size
-	    const fcmPayload = {
-	      title: parsed.title || "",
-	      body: parsed.body || "",
+    // Check FCM payload size
+    const fcmPayload = {
+      title: parsed.title || "",
+      body: parsed.body || "",
       data: parsed.data || {}
     };
     const fcmPayloadSize = JSON.stringify(fcmPayload).length;
@@ -544,18 +438,19 @@ serve(async (req) => {
       logError('FCM payload too large', undefined, ErrorCategory.VALIDATION, ErrorSeverity.MEDIUM, {
         fcmPayloadSize,
         maxSize: MAX_FCM_PAYLOAD_SIZE,
-        correlationId,
+        correlationId
       }, correlationId);
-      
-      return createSecureResponse(
-        JSON.stringify({
-          error: "FCM payload too large",
-          message: `FCM payload size ${fcmPayloadSize} bytes exceeds maximum allowed size of ${MAX_FCM_PAYLOAD_SIZE} bytes`
-        }),
-        { status: 413, headers: { ...cors, "Content-Type": "application/json" } }
-      );
+      return createSecureResponse(JSON.stringify({
+        error: "FCM payload too large",
+        message: `FCM payload size ${fcmPayloadSize} bytes exceeds maximum allowed size of ${MAX_FCM_PAYLOAD_SIZE} bytes`
+      }), {
+        status: 413,
+        headers: {
+          ...cors,
+          "Content-Type": "application/json"
+        }
+      });
     }
-    
     // Apply rate limiting for authenticated users
     if (parsed.userId) {
       const userRateLimit = await _checkUserRateLimit(parsed.userId);
@@ -565,12 +460,10 @@ serve(async (req) => {
         logWarning('User rate limit exceeded', {
           userId: parsed.userId,
           remaining: userRateLimit.remaining,
-          correlationId,
+          correlationId
         }, correlationId);
-        
         return createRateLimitResponse(userRateLimit);
       }
-      
       const dailyLimit = await checkDailyNotificationLimit(parsed.userId);
       if (!dailyLimit.allowed) {
         completePerformanceTracking(performanceTracker, req, 429, parsed.userId);
@@ -578,9 +471,8 @@ serve(async (req) => {
         logWarning('Daily notification limit exceeded', {
           userId: parsed.userId,
           remaining: dailyLimit.remaining,
-          correlationId,
+          correlationId
         }, correlationId);
-        
         return createRateLimitResponse(dailyLimit);
       }
     } else {
@@ -593,28 +485,29 @@ serve(async (req) => {
         logWarning('IP rate limit exceeded for broadcast', {
           clientIP,
           remaining: ipRateLimit.remaining,
-          correlationId,
+          correlationId
         }, correlationId);
-        
         return createRateLimitResponse(ipRateLimit);
       }
     }
-
     const preferences = await getUserPreferences(parsed.userId);
     if (!preferences.push_enabled) {
       completePerformanceTracking(performanceTracker, req, 403, parsed.userId || undefined);
       logApiResponse(requestId, 403, Date.now() - performanceTracker.startTime, parsed.userId || undefined, correlationId);
       logInfo('Push notifications disabled for user', {
         userId: parsed.userId,
-        correlationId,
+        correlationId
       }, correlationId);
-      
-      return createSecureResponse(
-        JSON.stringify({ error: "Push notifications disabled for user" }),
-        { status: 403, headers: { ...cors, "Content-Type": "application/json" } }
-      );
+      return createSecureResponse(JSON.stringify({
+        error: "Push notifications disabled for user"
+      }), {
+        status: 403,
+        headers: {
+          ...cors,
+          "Content-Type": "application/json"
+        }
+      });
     }
-
     if (!parsed.quietHoursOverride && isWithinQuietHours(preferences)) {
       completePerformanceTracking(performanceTracker, req, 409, parsed.userId || undefined);
       logApiResponse(requestId, 409, Date.now() - performanceTracker.startTime, parsed.userId || undefined, correlationId);
@@ -622,54 +515,51 @@ serve(async (req) => {
         userId: parsed.userId,
         quietHoursStart: preferences.quiet_hours_start,
         quietHoursEnd: preferences.quiet_hours_end,
-        correlationId,
+        correlationId
       }, correlationId);
-      
-      return createSecureResponse(
-        JSON.stringify({ error: "Notification blocked during quiet hours" }),
-        { status: 409, headers: { ...cors, "Content-Type": "application/json" } }
-      );
+      return createSecureResponse(JSON.stringify({
+        error: "Notification blocked during quiet hours"
+      }), {
+        status: 409,
+        headers: {
+          ...cors,
+          "Content-Type": "application/json"
+        }
+      });
     }
-
-    let tokens: TokenRow[] = [];
-    const derivedPlatform = parsed.target_device_types?.length === 1
-      ? parsed.target_device_types[0]
-      : "all";
-
+    let tokens = [];
+    const derivedPlatform = parsed.target_device_types?.length === 1 ? parsed.target_device_types[0] : "all";
     if (parsed.userId) {
       tokens = await getActiveTokens(parsed.userId, parsed.target_device_types);
     } else if (parsed.tokens?.length) {
       tokens = normalizeTokensFromPayload(parsed.tokens);
       if (parsed.target_device_types?.length) {
-        tokens = tokens.filter((token) =>
-          !token.device_type || parsed.target_device_types!.includes(token.device_type as "android" | "ios" | "web")
-        );
+        tokens = tokens.filter((token)=>!token.device_type || parsed.target_device_types.includes(token.device_type));
       }
     }
-
     const dedupedTokens = dedupeTokens(tokens);
     if (dedupedTokens.length === 0) {
       completePerformanceTracking(performanceTracker, req, 404, parsed.userId || undefined);
       logApiResponse(requestId, 404, Date.now() - performanceTracker.startTime, parsed.userId || undefined, correlationId);
-      const noTokenMessage = parsed.userId
-        ? "No active FCM tokens for user"
-        : "No FCM tokens available for broadcast";
-
+      const noTokenMessage = parsed.userId ? "No active FCM tokens for user" : "No FCM tokens available for broadcast";
       logWarning(noTokenMessage, {
         userId: parsed.userId,
         totalTokens: tokens.length,
         activeTokens: dedupedTokens.length,
         tokensProvided: parsed.tokens?.length ?? 0,
-        correlationId,
+        correlationId
       }, correlationId);
-
-      return createSecureResponse(
-        JSON.stringify({ error: noTokenMessage }),
-        { status: 404, headers: { ...cors, "Content-Type": "application/json" } }
-      );
+      return createSecureResponse(JSON.stringify({
+        error: noTokenMessage
+      }), {
+        status: 404,
+        headers: {
+          ...cors,
+          "Content-Type": "application/json"
+        }
+      });
     }
-
-    const deviceTypeCounts = dedupedTokens.reduce<Record<string, number>>((acc, t) => {
+    const deviceTypeCounts = dedupedTokens.reduce((acc, t)=>{
       const key = (t.device_type ?? "unknown").toString();
       acc[key] = (acc[key] ?? 0) + 1;
       return acc;
@@ -680,26 +570,23 @@ serve(async (req) => {
       totalTokensAfterFilter: dedupedTokens.length,
       targetDeviceTypes: parsed.target_device_types,
       deviceTypeCounts,
-      sampleTokens: dedupedTokens.slice(0, 3).map((t) => ({
-        id: t.id,
-        device_type: t.device_type,
-        locale: t.locale,
-        tokenSuffix: t.token.slice(-6),
-      })),
+      sampleTokens: dedupedTokens.slice(0, 3).map((t)=>({
+          id: t.id,
+          device_type: t.device_type,
+          locale: t.locale,
+          tokenSuffix: t.token.slice(-6)
+        }))
     }, correlationId);
     console.log("[SFCM] Token selection", {
       correlationId,
       totalTokensInitial: tokens.length,
       totalTokensAfterFilter: dedupedTokens.length,
       deviceTypeCounts,
-      targetDeviceTypes: parsed.target_device_types,
+      targetDeviceTypes: parsed.target_device_types
     });
-
     let template;
     try {
-      template = parsed.templateName || parsed.templateId
-        ? await resolveTemplate(parsed)
-        : null;
+      template = parsed.templateName || parsed.templateId ? await resolveTemplate(parsed) : null;
     } catch (error) {
       completePerformanceTracking(performanceTracker, req, 404, parsed.userId || undefined);
       logApiResponse(requestId, 404, Date.now() - performanceTracker.startTime, parsed.userId || undefined, correlationId);
@@ -707,159 +594,141 @@ serve(async (req) => {
         templateId: parsed.templateId,
         templateName: parsed.templateName,
         userId: parsed.userId,
-        correlationId,
+        correlationId
       }, correlationId);
-      
-      return createSecureResponse(
-        JSON.stringify({ error: "Notification template not found or inactive" }),
-        { status: 404, headers: { ...cors, "Content-Type": "application/json" } }
-      );
+      return createSecureResponse(JSON.stringify({
+        error: "Notification template not found or inactive"
+      }), {
+        status: 404,
+        headers: {
+          ...cors,
+          "Content-Type": "application/json"
+        }
+      });
     }
-
-    const title = template
-      ? renderTemplate(template.title_template, parsed.data ?? {})
-      : parsed.title!;
-    const bodyText = template
-      ? renderTemplate(template.body_template, parsed.data ?? {})
-      : parsed.body!;
-
+    const title = template ? renderTemplate(template.title_template, parsed.data ?? {}) : parsed.title;
+    const bodyText = template ? renderTemplate(template.body_template, parsed.data ?? {}) : parsed.body;
     // Handle translation flow if enabled
-    let notificationResults: NotificationResult[] = [];
+    let notificationResults = [];
     let overallSuccess = false;
-    
     // Get distinct target locales from tokens (skip source locale)
-    let targetLocales: string[] = [];
+    let targetLocales = [];
     if (parsed.userId) {
       // For individual user notifications
-      const { data: localesData, error: localesError } = await supabase
-        .rpc("get_user_target_locales", {
-          p_user_id: parsed.userId,
-          p_target_device_types: parsed.target_device_types ?? null,
-        });
-      
+      const { data: localesData, error: localesError } = await supabase.rpc("get_user_target_locales", {
+        p_user_id: parsed.userId,
+        p_target_device_types: parsed.target_device_types ?? null
+      });
       if (localesError) {
         logWarning('Failed to get target locales for user', {
           userId: parsed.userId,
           error: localesError.message,
-          correlationId,
+          correlationId
         }, correlationId);
         targetLocales = [];
       } else {
-        targetLocales = (localesData || [])
-          .map((row: { locale: string }) => row.locale)
-          .filter((locale: string) => locale && locale !== parsed.locale);
+        targetLocales = (localesData || []).map((row)=>row.locale).filter((locale)=>locale && locale !== parsed.locale);
       }
     }
-    
     const shouldTranslate = parsed.translate && targetLocales.length > 0;
     if (parsed.translate && !shouldTranslate) {
       logInfo("Translation skipped (no target locales)", {
         correlationId,
         sourceLocale: parsed.locale,
         userId: parsed.userId,
-        targetDeviceTypes: parsed.target_device_types,
+        targetDeviceTypes: parsed.target_device_types
       }, correlationId);
     }
-
     if (shouldTranslate) {
       logInfo("Translation flow start", {
         correlationId,
         sourceLocale: parsed.locale,
         targetLocales,
         userId: parsed.userId,
-        targetDeviceTypes: parsed.target_device_types,
+        targetDeviceTypes: parsed.target_device_types
       }, correlationId);
       console.log("[SFCM] Translation flow start", {
         correlationId,
         sourceLocale: parsed.locale,
         targetLocales,
-        userId: parsed.userId,
+        userId: parsed.userId
       });
       // Get tokens grouped by locale
       const tokensByLocale = await getTokensGroupedByLocale(parsed.userId, parsed.target_device_types);
       logInfo("Tokens grouped by locale", {
         correlationId,
-        locales: Array.from(tokensByLocale.entries()).map(([loc, list]) => ({ locale: loc, count: list.length })),
+        locales: Array.from(tokensByLocale.entries()).map(([loc, list])=>({
+            locale: loc,
+            count: list.length
+          }))
       }, correlationId);
-      console.log("[SFCM] Tokens by locale", Array.from(tokensByLocale.entries()).map(([loc, list]) => ({ locale: loc, count: list.length })));
-      
+      console.log("[SFCM] Tokens by locale", Array.from(tokensByLocale.entries()).map(([loc, list])=>({
+          locale: loc,
+          count: list.length
+        })));
       if (targetLocales.length === 0) {
         logWarning('No target locales for translation', {
           userId: parsed.userId,
-          correlationId,
+          correlationId
         }, correlationId);
       } else {
         // Translate content for all target locales
-        const translations = await translateNotificationBatch(
-          targetLocales,
-          title,
-          bodyText,
-          parsed.data ?? {},
-          correlationId
-        );
-        
+        const translations = await translateNotificationBatch(targetLocales, title, bodyText, parsed.data ?? {}, correlationId);
         // Send notifications for each locale group
-        for (const [locale, tokens] of tokensByLocale) {
+        for (const [locale, tokens] of tokensByLocale){
           if (!translations.has(locale)) {
             logWarning(`No translation available for locale: ${locale}`, {
               userId: parsed.userId,
-              correlationId,
+              correlationId
             }, correlationId);
             continue;
           }
-          
-          const translation = translations.get(locale)!;
+          const translation = translations.get(locale);
           const localeTokens = dedupeTokens(tokens);
-          
           if (localeTokens.length === 0) continue;
-          
           // Create notification record for this locale
-          const notificationRecord = parsed.notificationId
-            ? { id: parsed.notificationId }
-            : await createNotificationRecord({
-                userId: parsed.userId,  // Can be NULL for broadcast
-                templateId: template?.id ?? null,
-                title: translation.title,
-                body: translation.body,
-                category: parsed.category ?? template?.category ?? "general",
-                priority: parsed.priority,
-                requestPayload: parsed,
-                tokenCount: localeTokens.length,
-                translationLocale: locale,
-                platform: derivedPlatform,
-                locale,
-              });
-          
-          const dataPayload: Record<string, unknown> = {
-            ...(translation.data ?? {}),
+          const notificationRecord = parsed.notificationId ? {
+            id: parsed.notificationId
+          } : await createNotificationRecord({
+            userId: parsed.userId,
+            templateId: template?.id ?? null,
+            title: translation.title,
+            body: translation.body,
+            category: parsed.category ?? template?.category ?? "general",
+            priority: parsed.priority,
+            requestPayload: parsed,
+            tokenCount: localeTokens.length,
+            translationLocale: locale,
+            platform: derivedPlatform,
+            locale
+          });
+          const dataPayload = {
+            ...translation.data ?? {},
             category: parsed.category ?? template?.category ?? "general",
             priority: parsed.priority,
             requestId: parsed.requestId ?? notificationRecord.id,
-            locale,
+            locale
           };
-          
           applyDeepLinkMetadata(dataPayload, rawDeepLink, {
             userId: parsed.userId,
-            correlationId,
+            correlationId
           });
-          
           logInfo("Deep link payload per-locale (translation)", {
             locale,
             rawDeepLink,
             deep_link: dataPayload.deep_link,
-            external_url: (dataPayload as Record<string, unknown>).external_url,
+            external_url: dataPayload.external_url,
             open_in_browser: dataPayload.open_in_browser,
             link_type: dataPayload.link_type,
             requestId: parsed.requestId ?? notificationRecord.id,
-            correlationId,
+            correlationId
           }, correlationId);
           console.log("[SFCM] Locale payload (translation)", {
             correlationId,
             locale,
             linkSummary: summarizeLinkFields(rawDeepLink, dataPayload),
-            tokenCount: localeTokens.length,
+            tokenCount: localeTokens.length
           });
-
           logInfo("Prepared FCM send (translation locale)", {
             correlationId,
             locale,
@@ -868,7 +737,7 @@ serve(async (req) => {
             linkSummary: summarizeLinkFields(rawDeepLink, dataPayload),
             titleLength: translation.title?.length ?? 0,
             bodyLength: translation.body?.length ?? 0,
-            priority: parsed.priority,
+            priority: parsed.priority
           }, correlationId);
           console.log("[SFCM] Send FCM (translation)", {
             correlationId,
@@ -876,52 +745,41 @@ serve(async (req) => {
             tokenCount: localeTokens.length,
             linkSummary: summarizeLinkFields(rawDeepLink, dataPayload),
             titleLength: translation.title?.length ?? 0,
-            bodyLength: translation.body?.length ?? 0,
+            bodyLength: translation.body?.length ?? 0
           });
-          
           try {
-            const sendResult = await sendMulticast(
-              localeTokens,
-              {
-                title: translation.title,
-                body: translation.body,
-                data: toFcmData(dataPayload),
-                priority: parsed.priority,
-              },
-              {
-                correlationId,
-                locale,
-                linkSummary: summarizeLinkFields(rawDeepLink, dataPayload),
-              },
-            );
-            
+            const sendResult = await sendMulticast(localeTokens, {
+              title: translation.title,
+              body: translation.body,
+              data: toFcmData(dataPayload),
+              priority: parsed.priority
+            }, {
+              correlationId,
+              locale,
+              linkSummary: summarizeLinkFields(rawDeepLink, dataPayload)
+            });
             if (sendResult.invalidTokenIds.length) {
               await deactivateTokens(sendResult.invalidTokenIds);
             }
-            
             await logDeliveryResults(notificationRecord.id, parsed.userId, sendResult.logs);
-            
             await finalizeNotification(notificationRecord.id, {
               tokensTargeted: localeTokens.length,
               successCount: sendResult.successCount,
               failureCount: sendResult.failureCount,
               failureReasons: sendResult.failureReasons,
-              messageIds: sendResult.messageIds,
+              messageIds: sendResult.messageIds
             }, parsed);
-            
             notificationResults.push({
               locale,
               notificationId: notificationRecord.id,
               tokensTargeted: localeTokens.length,
               tokensSuccessful: sendResult.successCount,
               tokensFailed: sendResult.failureCount,
-              success: sendResult.successCount > 0,
+              success: sendResult.successCount > 0
             });
-            
             if (sendResult.successCount > 0) {
               overallSuccess = true;
             }
-
             logInfo("FCM send result (translation locale)", {
               correlationId,
               locale,
@@ -929,7 +787,7 @@ serve(async (req) => {
               successCount: sendResult.successCount,
               failureCount: sendResult.failureCount,
               invalidTokenIds: sendResult.invalidTokenIds.length,
-              failureReasons: sendResult.failureReasons,
+              failureReasons: sendResult.failureReasons
             }, correlationId);
             console.log("[SFCM] FCM result (translation)", {
               correlationId,
@@ -938,15 +796,14 @@ serve(async (req) => {
               successCount: sendResult.successCount,
               failureCount: sendResult.failureCount,
               invalidTokenIds: sendResult.invalidTokenIds.length,
-              failureReasons: sendResult.failureReasons,
+              failureReasons: sendResult.failureReasons
             });
           } catch (error) {
             logError(`FCM multicast failed for locale ${locale}`, error instanceof Error ? error : new Error(String(error)), ErrorCategory.EXTERNAL_API, ErrorSeverity.HIGH, {
               tokenCount: localeTokens.length,
               priority: parsed.priority,
-              correlationId,
+              correlationId
             }, correlationId);
-            
             notificationResults.push({
               locale,
               notificationId: notificationRecord.id,
@@ -954,57 +811,53 @@ serve(async (req) => {
               tokensSuccessful: 0,
               tokensFailed: localeTokens.length,
               success: false,
-              error: "Failed to send notification via FCM",
+              error: "Failed to send notification via FCM"
             });
           }
         }
       }
     } else {
       // Original non-translation flow (backward compatibility)
-      const notificationRecord = parsed.notificationId
-        ? { id: parsed.notificationId }
-        : await createNotificationRecord({
-            userId: parsed.userId,  // Can be NULL for broadcast
-            templateId: template?.id ?? null,
-            title,
-            body: bodyText,
-            category: parsed.category ?? template?.category ?? "general",
-            priority: parsed.priority,
-            requestPayload: parsed,
-            tokenCount: dedupedTokens.length,
-            platform: derivedPlatform,
-            locale: parsed.locale,
-          });
-
-      const dataPayload: Record<string, unknown> = {
-        ...(parsed.data ?? {}),
+      const notificationRecord = parsed.notificationId ? {
+        id: parsed.notificationId
+      } : await createNotificationRecord({
+        userId: parsed.userId,
+        templateId: template?.id ?? null,
+        title,
+        body: bodyText,
+        category: parsed.category ?? template?.category ?? "general",
+        priority: parsed.priority,
+        requestPayload: parsed,
+        tokenCount: dedupedTokens.length,
+        platform: derivedPlatform,
+        locale: parsed.locale
+      });
+      const dataPayload = {
+        ...parsed.data ?? {},
         category: parsed.category ?? template?.category ?? "general",
         priority: parsed.priority,
         requestId: parsed.requestId ?? notificationRecord.id,
-        locale: parsed.locale,
+        locale: parsed.locale
       };
-    
       applyDeepLinkMetadata(dataPayload, rawDeepLink, {
         userId: parsed.userId,
-        correlationId,
+        correlationId
       });
-      
       logInfo("Deep link payload (non-translation)", {
         rawDeepLink,
         deep_link: dataPayload.deep_link,
-        external_url: (dataPayload as Record<string, unknown>).external_url,
+        external_url: dataPayload.external_url,
         open_in_browser: dataPayload.open_in_browser,
         link_type: dataPayload.link_type,
         requestId: parsed.requestId ?? notificationRecord.id,
-        correlationId,
+        correlationId
       }, correlationId);
       console.log("[SFCM] Payload (non-translation)", {
         correlationId,
         locale: parsed.locale,
         linkSummary: summarizeLinkFields(rawDeepLink, dataPayload),
-        tokenCount: dedupedTokens.length,
+        tokenCount: dedupedTokens.length
       });
-
       logInfo("Prepared FCM send (non-translation)", {
         correlationId,
         locale: parsed.locale,
@@ -1013,7 +866,7 @@ serve(async (req) => {
         linkSummary: summarizeLinkFields(rawDeepLink, dataPayload),
         titleLength: title?.length ?? 0,
         bodyLength: bodyText?.length ?? 0,
-        priority: parsed.priority,
+        priority: parsed.priority
       }, correlationId);
       console.log("[SFCM] Send FCM (non-translation)", {
         correlationId,
@@ -1021,71 +874,66 @@ serve(async (req) => {
         tokenCount: dedupedTokens.length,
         linkSummary: summarizeLinkFields(rawDeepLink, dataPayload),
         titleLength: title?.length ?? 0,
-        bodyLength: bodyText?.length ?? 0,
+        bodyLength: bodyText?.length ?? 0
       });
-
       let sendResult;
       try {
-        sendResult = await sendMulticast(
-          dedupedTokens,
-          {
-            title,
-            body: bodyText,
-            data: toFcmData(dataPayload),
-            priority: parsed.priority,
-          },
-          {
-            correlationId,
-            locale: parsed.locale,
-            linkSummary: summarizeLinkFields(rawDeepLink, dataPayload),
-          },
-        );
+        sendResult = await sendMulticast(dedupedTokens, {
+          title,
+          body: bodyText,
+          data: toFcmData(dataPayload),
+          priority: parsed.priority
+        }, {
+          correlationId,
+          locale: parsed.locale,
+          linkSummary: summarizeLinkFields(rawDeepLink, dataPayload)
+        });
       } catch (error) {
         completePerformanceTracking(performanceTracker, req, 500, parsed.userId || undefined);
         logApiResponse(requestId, 500, Date.now() - performanceTracker.startTime, parsed.userId || undefined, correlationId);
         logError('FCM multicast failed', error instanceof Error ? error : new Error(String(error)), ErrorCategory.EXTERNAL_API, ErrorSeverity.HIGH, {
           tokenCount: dedupedTokens.length,
           priority: parsed.priority,
-          correlationId,
+          correlationId
         }, correlationId);
-        
-        return createSecureResponse(
-          JSON.stringify({ error: "Failed to send notification via FCM" }),
-          { status: 500, headers: { ...cors, "Content-Type": "application/json" } }
-        );
+        return createSecureResponse(JSON.stringify({
+          error: "Failed to send notification via FCM"
+        }), {
+          status: 500,
+          headers: {
+            ...cors,
+            "Content-Type": "application/json"
+          }
+        });
       }
-
       if (sendResult.invalidTokenIds.length) {
         await deactivateTokens(sendResult.invalidTokenIds);
       }
-
       await logDeliveryResults(notificationRecord.id, parsed.userId, sendResult.logs);
-
       await finalizeNotification(notificationRecord.id, {
         tokensTargeted: dedupedTokens.length,
         successCount: sendResult.successCount,
         failureCount: sendResult.failureCount,
         failureReasons: sendResult.failureReasons,
-        messageIds: sendResult.messageIds,
+        messageIds: sendResult.messageIds
       }, parsed);
-
-      notificationResults = [{
-        notificationId: notificationRecord.id,
-        tokensTargeted: dedupedTokens.length,
-        tokensSuccessful: sendResult.successCount,
-        tokensFailed: sendResult.failureCount,
-        success: sendResult.successCount > 0,
-      }];
-      
+      notificationResults = [
+        {
+          notificationId: notificationRecord.id,
+          tokensTargeted: dedupedTokens.length,
+          tokensSuccessful: sendResult.successCount,
+          tokensFailed: sendResult.failureCount,
+          success: sendResult.successCount > 0
+        }
+      ];
       overallSuccess = sendResult.successCount > 0;
-
       logInfo("FCM send result (non-translation)", {
         correlationId,
         tokenCount: dedupedTokens.length,
         successCount: sendResult.successCount,
         failureCount: sendResult.failureCount,
         invalidTokenIds: sendResult.invalidTokenIds.length,
-        failureReasons: sendResult.failureReasons,
+        failureReasons: sendResult.failureReasons
       }, correlationId);
       console.log("[SFCM] FCM result (non-translation)", {
         correlationId,
@@ -1093,233 +941,196 @@ serve(async (req) => {
         successCount: sendResult.successCount,
         failureCount: sendResult.failureCount,
         invalidTokenIds: sendResult.invalidTokenIds.length,
-        failureReasons: sendResult.failureReasons,
+        failureReasons: sendResult.failureReasons
       });
     }
-
     await invokeTokenCleanup();
-
-    const statusCode = overallSuccess ? 200 : (notificationResults.length > 0 ? 207 : 500);
+    const statusCode = overallSuccess ? 200 : notificationResults.length > 0 ? 207 : 500;
     completePerformanceTracking(performanceTracker, req, statusCode, parsed.userId || undefined);
     logApiResponse(requestId, statusCode, Date.now() - performanceTracker.startTime, parsed.userId || undefined, correlationId);
-    
-    const hasDeepLink =
-      rawDeepLink !== undefined &&
-      rawDeepLink !== null &&
-      (typeof rawDeepLink !== "string" || rawDeepLink.trim().length > 0);
-    const deepLinkSource = parsed.deep_link ? "top_level" : (deepLinkFromData ? "data" : "none");
-
+    const hasDeepLink = rawDeepLink !== undefined && rawDeepLink !== null && (typeof rawDeepLink !== "string" || rawDeepLink.trim().length > 0);
+    const deepLinkSource = parsed.deep_link ? "top_level" : deepLinkFromData ? "data" : "none";
     logInfo('FCM notification with deep_link', {
       userId: parsed.userId,
       hasDeepLink,
       deepLink: rawDeepLink,
       deepLinkSource,
-      correlationId,
+      correlationId
     }, correlationId);
-
     logInfo('FCM notification processing completed', {
       userId: parsed.userId,
       translate: parsed.translate,
       locale: parsed.locale,
       targetLocales: targetLocales,
       targetDeviceTypes: parsed.target_device_types,
-      locales: parsed.translate ? notificationResults.map(r => r.locale).filter((locale): locale is string => locale !== undefined) : undefined,
+      locales: parsed.translate ? notificationResults.map((r)=>r.locale).filter((locale)=>locale !== undefined) : undefined,
       notificationCount: notificationResults.length,
-      totalTokensTargeted: notificationResults.reduce((sum, r) => sum + r.tokensTargeted, 0),
-      totalTokensSuccessful: notificationResults.reduce((sum, r) => sum + r.tokensSuccessful, 0),
-      totalTokensFailed: notificationResults.reduce((sum, r) => sum + r.tokensFailed, 0),
-      success: overallSuccess,
+      totalTokensTargeted: notificationResults.reduce((sum, r)=>sum + r.tokensTargeted, 0),
+      totalTokensSuccessful: notificationResults.reduce((sum, r)=>sum + r.tokensSuccessful, 0),
+      totalTokensFailed: notificationResults.reduce((sum, r)=>sum + r.tokensFailed, 0),
+      success: overallSuccess
     }, correlationId);
-
-    return createSecureResponse(
-      JSON.stringify({
-        success: overallSuccess,
-        translate: parsed.translate,
-        locale: parsed.locale,
-        target_locales: targetLocales,
-        results: notificationResults,
-      }),
-      { status: statusCode, headers: { ...cors, "Content-Type": "application/json" } }
-    );
+    return createSecureResponse(JSON.stringify({
+      success: overallSuccess,
+      translate: parsed.translate,
+      locale: parsed.locale,
+      target_locales: targetLocales,
+      results: notificationResults
+    }), {
+      status: statusCode,
+      headers: {
+        ...cors,
+        "Content-Type": "application/json"
+      }
+    });
   } catch (error) {
     completePerformanceTracking(performanceTracker, req, 500, undefined);
     logApiResponse(requestId, 500, Date.now() - performanceTracker.startTime, undefined, correlationId);
-    
     if (error instanceof z.ZodError) {
       logError('Validation error in catch block', error, ErrorCategory.VALIDATION, ErrorSeverity.MEDIUM, {
-        correlationId,
+        correlationId
       }, correlationId);
-      
-      return createSecureResponse(
-        JSON.stringify({ error: "Validation failed", details: error.errors }),
-        { status: 422, headers: { ...cors, "Content-Type": "application/json" } }
-      );
+      return createSecureResponse(JSON.stringify({
+        error: "Validation failed",
+        details: error.errors
+      }), {
+        status: 422,
+        headers: {
+          ...cors,
+          "Content-Type": "application/json"
+        }
+      });
     }
-
     logFatal('Unhandled error in send-fcm-notification', error instanceof Error ? error : new Error(String(error)), ErrorCategory.SYSTEM, {
-      correlationId,
+      correlationId
     }, correlationId);
     console.error("[send-fcm-notification] fatal error", {
       correlationId,
       message: error instanceof Error ? error.message : String(error),
-      stack: error instanceof Error ? error.stack : undefined,
+      stack: error instanceof Error ? error.stack : undefined
     });
-
-    return createSecureResponse(
-      JSON.stringify({
-        error: "Internal Server Error",
-        message: error instanceof Error ? error.message : "Unknown error",
-        correlationId,
-      }),
-      { status: 500, headers: { ...cors, "Content-Type": "application/json" } }
-    );
-  } finally {
+    return createSecureResponse(JSON.stringify({
+      error: "Internal Server Error",
+      message: error instanceof Error ? error.message : "Unknown error",
+      correlationId
+    }), {
+      status: 500,
+      headers: {
+        ...cors,
+        "Content-Type": "application/json"
+      }
+    });
+  } finally{
     // Flush any remaining logs
     monitoring.flushLogsOnExit();
   }
 });
-
-async function getUserPreferences(userId: string | null): Promise<Preferences> {
+async function getUserPreferences(userId) {
   // For broadcast notifications (userId = null), return default preferences
   if (!userId) {
     return DEFAULT_PREFERENCES;
   }
-
-  const { data, error } = await supabase
-    .from("user_notification_preferences")
-    .select("push_enabled, quiet_hours_start, quiet_hours_end, marketing_enabled, transactional_enabled, priority_threshold")
-    .eq("user_id", userId)
-    .maybeSingle();
-
+  const { data, error } = await supabase.from("user_notification_preferences").select("push_enabled, quiet_hours_start, quiet_hours_end, marketing_enabled, transactional_enabled, priority_threshold").eq("user_id", userId).maybeSingle();
   if (error) {
     console.warn("user_notification_preferences unavailable, defaulting", error.message);
     return DEFAULT_PREFERENCES;
   }
-
   if (!data) return DEFAULT_PREFERENCES;
-  return data as Preferences;
+  return data;
 }
-
-function isWithinQuietHours(preferences: Preferences, referenceDate = new Date()): boolean {
+function isWithinQuietHours(preferences, referenceDate = new Date()) {
   if (!preferences.quiet_hours_start || !preferences.quiet_hours_end) {
     return false;
   }
-
   const startMinutes = toMinutes(preferences.quiet_hours_start);
   const endMinutes = toMinutes(preferences.quiet_hours_end);
   const currentMinutes = referenceDate.getUTCHours() * 60 + referenceDate.getUTCMinutes();
-
   if (startMinutes === null || endMinutes === null) return false;
-
   if (startMinutes < endMinutes) {
     return currentMinutes >= startMinutes && currentMinutes <= endMinutes;
   }
-
   return currentMinutes >= startMinutes || currentMinutes <= endMinutes;
 }
-
-function toMinutes(value: string): number | null {
-  const [hours, minutes] = value.split(":").map((part) => Number(part));
+function toMinutes(value) {
+  const [hours, minutes] = value.split(":").map((part)=>Number(part));
   if (Number.isNaN(hours) || Number.isNaN(minutes)) return null;
   return hours * 60 + minutes;
 }
-
-async function getActiveTokens(userId: string | null, deviceTypes?: string[]): Promise<TokenRow[]> {
+async function getActiveTokens(userId, deviceTypes) {
   // For broadcast notifications (userId = null), return empty array
   // Broadcast notifications should not call this function directly
   if (!userId) {
     return [];
   }
-
-  let query = supabase
-    .from("user_fcm_tokens")
-    .select("id, token, device_type, locale")
-    .eq("user_id", userId)
-    .eq("is_active", true);
-
+  let query = supabase.from("user_fcm_tokens").select("id, token, device_type, locale").eq("user_id", userId).eq("is_active", true);
   if (deviceTypes && deviceTypes.length > 0) {
     query = query.in("device_type", deviceTypes);
   }
-
   const { data, error } = await query;
-
   if (error) {
     throw new Error(`Failed to fetch user tokens: ${error.message}`);
   }
-
   return data ?? [];
 }
-
-async function getTokensGroupedByLocale(userId: string | null, deviceTypes?: string[]): Promise<Map<string, TokenRow[]>> {
+async function getTokensGroupedByLocale(userId, deviceTypes) {
   // For broadcast notifications (userId = null), return empty map
   // Broadcast notifications should not call this function directly
   if (!userId) {
     return new Map();
   }
-
   const tokens = await getActiveTokens(userId, deviceTypes);
-  const grouped = new Map<string, TokenRow[]>();
-  
-  for (const token of tokens) {
+  const grouped = new Map();
+  for (const token of tokens){
     const locale = token.locale || 'en'; // Default to 'en' if no locale specified
     if (!grouped.has(locale)) {
       grouped.set(locale, []);
     }
-    grouped.get(locale)!.push(token);
+    grouped.get(locale).push(token);
   }
-  
   return grouped;
 }
-
-function normalizeTokensFromPayload(tokens: IncomingToken[]): TokenRow[] {
-  return tokens.map((token) => {
+function normalizeTokensFromPayload(tokens) {
+  return tokens.map((token)=>{
     if (typeof token === "string") {
-      return { token, id: null, device_type: null, locale: null };
+      return {
+        token,
+        id: null,
+        device_type: null,
+        locale: null
+      };
     }
-
     return {
       token: token.token,
       id: token.id ?? null,
       device_type: token.device_type ?? null,
-      locale: token.locale ?? null,
+      locale: token.locale ?? null
     };
   });
 }
-
-function dedupeTokens(tokens: TokenRow[]): TokenRow[] {
-  const seen = new Map<string, TokenRow>();
-  for (const token of tokens) {
+function dedupeTokens(tokens) {
+  const seen = new Map();
+  for (const token of tokens){
     if (!seen.has(token.token)) {
       seen.set(token.token, token);
     }
   }
   return Array.from(seen.values());
 }
-
-async function resolveTemplate(payload: NotificationPayload): Promise<TemplateRow> {
-  let builder = supabase
-    .from("notification_templates")
-    .select("id, name, title_template, body_template, data_schema, category")
-    .eq("is_active", true)
-    .limit(1);
-
+async function resolveTemplate(payload) {
+  let builder = supabase.from("notification_templates").select("id, name, title_template, body_template, data_schema, category").eq("is_active", true).limit(1);
   if (payload.templateId) {
     builder = builder.eq("id", payload.templateId);
   } else if (payload.templateName) {
     builder = builder.eq("name", payload.templateName);
   }
-
   const { data, error } = await builder.maybeSingle();
-
   if (error || !data) {
     throw new Error("Notification template not found or inactive");
   }
-
-  return data as TemplateRow;
+  return data;
 }
-
-function renderTemplate(template: string, data: Record<string, unknown>): string {
-  return template.replace(/{{\s*([^}\s]+)(?:\s*\|\s*([^}]+))?\s*}}/g, (_, path, defaultValue) => {
+function renderTemplate(template, data) {
+  return template.replace(/{{\s*([^}\s]+)(?:\s*\|\s*([^}]+))?\s*}}/g, (_, path, defaultValue)=>{
     const value = resolvePath(data, path);
     if (value === undefined || value === null || value === "") {
       return defaultValue ?? "";
@@ -1327,149 +1138,97 @@ function renderTemplate(template: string, data: Record<string, unknown>): string
     return String(value);
   });
 }
-
-function resolvePath(data: Record<string, unknown>, path: string) {
-  return path.split(".").reduce<unknown>((acc, key) => {
+function resolvePath(data, path) {
+  return path.split(".").reduce((acc, key)=>{
     if (acc && typeof acc === "object" && key in acc) {
-      return (acc as Record<string, unknown>)[key];
+      return acc[key];
     }
     return undefined;
   }, data);
 }
-
-async function createNotificationRecord(params: {
-  userId: string | null;  // NULL for broadcast notifications
-  templateId: string | null;
-  title: string;
-  body: string;
-  category: string;
-  priority: "low" | "normal" | "high";
-  requestPayload: NotificationPayload;
-  tokenCount: number;
-  translationLocale?: string;
-  platform?: string | null;
-  locale?: string | null;
-}): Promise<NotificationRecord> {
-  const { data, error } = await supabase
-    .from("notifications")
-    .insert({
-      user_id: params.userId,
-      template_id: params.templateId,
-      title: params.title,
-      body: params.body,
-      category: params.category,
-      priority: params.priority,
-      platform: params.platform ?? null,
-      locale: params.locale ?? null,
-      status: "pending",
-      tokens_targeted: params.tokenCount,
-      metadata: {
-        request: params.requestPayload,
-        translation: params.translationLocale
-          ? { locale: params.translationLocale }
-          : params.requestPayload.locale
-            ? { locale: params.requestPayload.locale }
-            : undefined,
-      },
-    })
-    .select("id")
-    .single();
-
+async function createNotificationRecord(params) {
+  const { data, error } = await supabase.from("notifications").insert({
+    user_id: params.userId,
+    template_id: params.templateId,
+    title: params.title,
+    body: params.body,
+    category: params.category,
+    priority: params.priority,
+    platform: params.platform ?? null,
+    locale: params.locale ?? null,
+    status: "pending",
+    tokens_targeted: params.tokenCount,
+    metadata: {
+      request: params.requestPayload,
+      translation: params.translationLocale ? {
+        locale: params.translationLocale
+      } : params.requestPayload.locale ? {
+        locale: params.requestPayload.locale
+      } : undefined
+    }
+  }).select("id").single();
   if (error || !data) {
     throw new Error(`Failed to insert notification record: ${error?.message}`);
   }
-
-  return data as NotificationRecord;
+  return data;
 }
-
-async function finalizeNotification(
-  notificationId: string,
-  result: {
-    tokensTargeted: number;
-    successCount: number;
-    failureCount: number;
-    failureReasons: Record<string, number>;
-    messageIds: string[];
-  },
-  requestPayload: NotificationPayload,
-) {
+async function finalizeNotification(notificationId, result, requestPayload) {
   const nowIso = new Date().toISOString();
   const status = result.successCount > 0 ? "sent" : "failed";
-
-  const { error } = await supabase
-    .from("notifications")
-    .update({
-      status,
-      sent_at: nowIso,
-      delivered_at: result.successCount > 0 ? nowIso : null,
-      failed_at: result.failureCount > 0 && result.successCount === 0 ? nowIso : null,
-      failure_reason: result.failureCount > 0 ? Object.keys(result.failureReasons)[0] ?? null : null,
-      tokens_targeted: result.tokensTargeted,
-      tokens_successful: result.successCount,
-      tokens_failed: result.failureCount,
-      fcm_message_id: result.messageIds[0] ?? null,
-      metadata: {
-        request: requestPayload,
-        delivery: {
-          messageIds: result.messageIds,
-          failureReasons: result.failureReasons,
-        },
-      },
-    })
-    .eq("id", notificationId);
-
+  const { error } = await supabase.from("notifications").update({
+    status,
+    sent_at: nowIso,
+    delivered_at: result.successCount > 0 ? nowIso : null,
+    failed_at: result.failureCount > 0 && result.successCount === 0 ? nowIso : null,
+    failure_reason: result.failureCount > 0 ? Object.keys(result.failureReasons)[0] ?? null : null,
+    tokens_targeted: result.tokensTargeted,
+    tokens_successful: result.successCount,
+    tokens_failed: result.failureCount,
+    fcm_message_id: result.messageIds[0] ?? null,
+    metadata: {
+      request: requestPayload,
+      delivery: {
+        messageIds: result.messageIds,
+        failureReasons: result.failureReasons
+      }
+    }
+  }).eq("id", notificationId);
   if (error) {
-    console.error("Failed to finalize notification", { notificationId, error });
+    console.error("Failed to finalize notification", {
+      notificationId,
+      error
+    });
   }
 }
-
-async function deactivateTokens(tokenIds: string[]) {
+async function deactivateTokens(tokenIds) {
   if (tokenIds.length === 0) return;
-  const { error } = await supabase
-    .from("user_fcm_tokens")
-    .update({ is_active: false })
-    .in("id", tokenIds);
-
+  const { error } = await supabase.from("user_fcm_tokens").update({
+    is_active: false
+  }).in("id", tokenIds);
   if (error) {
     console.error("Failed to deactivate tokens", error);
   }
 }
-
-async function sendMulticast(
-  tokens: TokenRow[],
-  payload: {
-    title: string;
-    body: string;
-    data: Record<string, string>;
-    priority: "low" | "normal" | "high";
-  },
-  logContext?: {
-    correlationId?: string;
-    locale?: string | null;
-    linkSummary?: ReturnType<typeof summarizeLinkFields>;
-  },
-) {
-  const chunks: TokenRow[][] = [];
-  for (let i = 0; i < tokens.length; i += MAX_FCM_BATCH) {
+async function sendMulticast(tokens, payload, logContext) {
+  const chunks = [];
+  for(let i = 0; i < tokens.length; i += MAX_FCM_BATCH){
     chunks.push(tokens.slice(i, i + MAX_FCM_BATCH));
   }
-
   let successCount = 0;
   let failureCount = 0;
-  const invalidTokenIds: string[] = [];
-  const failureReasons: Record<string, number> = {};
-  const messageIds: string[] = [];
-  const logs: DeliveryLogEntry[] = [];
-
+  const invalidTokenIds = [];
+  const failureReasons = {};
+  const messageIds = [];
+  const logs = [];
   let chunkIndex = 0;
-  for (const chunk of chunks) {
+  for (const chunk of chunks){
     const chunkId = `${chunkIndex + 1}/${chunks.length}`;
     logInfo("FCM chunk dispatch", {
       correlationId: logContext?.correlationId,
       locale: logContext?.locale,
       chunkId,
       tokenCount: chunk.length,
-      deviceTypes: chunk.reduce<Record<string, number>>((acc, t) => {
+      deviceTypes: chunk.reduce((acc, t)=>{
         const key = (t.device_type ?? "unknown").toString();
         acc[key] = (acc[key] ?? 0) + 1;
         return acc;
@@ -1478,58 +1237,50 @@ async function sendMulticast(
       titleLength: payload.title?.length ?? 0,
       bodyLength: payload.body?.length ?? 0,
       dataKeys: Object.keys(payload.data),
-      priority: payload.priority,
+      priority: payload.priority
     }, logContext?.correlationId);
     console.log("[SFCM] Chunk dispatch", {
       correlationId: logContext?.correlationId,
       locale: logContext?.locale,
       chunkId,
       tokenCount: chunk.length,
-      deviceTypes: chunk.reduce<Record<string, number>>((acc, t) => {
+      deviceTypes: chunk.reduce((acc, t)=>{
         const key = (t.device_type ?? "unknown").toString();
         acc[key] = (acc[key] ?? 0) + 1;
         return acc;
       }, {}),
       linkSummary: logContext?.linkSummary,
-      dataKeys: Object.keys(payload.data),
+      dataKeys: Object.keys(payload.data)
     });
-
     let response;
     try {
-      response = await sendFCMMulticast(
-        serviceAccount,
-        chunk.map((t) => t.token),
-        {
-          title: payload.title,
-          body: payload.body,
-          data: payload.data,
-          priority: payload.priority,
-        }
-      );
+      response = await sendFCMMulticast(serviceAccount, chunk.map((t)=>t.token), {
+        title: payload.title,
+        body: payload.body,
+        data: payload.data,
+        priority: payload.priority
+      });
     } catch (error) {
       // Treat an unexpected transport/auth error as a failure for the whole chunk,
       // but don’t crash the entire request (prevents 500s for broadcast calls).
       const reason = error instanceof Error ? error.message : String(error);
       logError('FCM transport error', error instanceof Error ? error : new Error(reason), ErrorCategory.EXTERNAL_API, ErrorSeverity.HIGH, {
         tokenCount: chunk.length,
-        reason,
+        reason
       });
       failureReasons["transport_error"] = (failureReasons["transport_error"] ?? 0) + chunk.length;
-      logs.push(
-        ...chunk.map((tokenRow) => ({
+      logs.push(...chunk.map((tokenRow)=>({
           tokenId: tokenRow.id ?? null,
           token: tokenRow.token,
           deviceType: tokenRow.device_type ?? null,
-          status: "failure" as const,
+          status: "failure",
           errorCode: "transport_error",
-          errorMessage: reason,
-        }))
-      );
+          errorMessage: reason
+        })));
       failureCount += chunk.length;
       continue;
     }
-
-    response.responses.forEach((res, index: number) => {
+    response.responses.forEach((res, index)=>{
       if (res.success) {
         successCount += 1;
         if (res.messageId) {
@@ -1540,7 +1291,7 @@ async function sendMulticast(
           token: chunk[index]?.token ?? null,
           deviceType: chunk[index]?.device_type ?? null,
           status: "success",
-          messageId: res.messageId ?? null,
+          messageId: res.messageId ?? null
         });
       } else {
         failureCount += 1;
@@ -1558,7 +1309,7 @@ async function sendMulticast(
           deviceType: tokenRow?.device_type ?? null,
           status: "failure",
           errorCode,
-          errorMessage: res.error,
+          errorMessage: res.error
         });
       }
     });
@@ -1567,51 +1318,44 @@ async function sendMulticast(
       locale: logContext?.locale,
       chunkId,
       tokenCount: chunk.length,
-      successCount: response.responses.filter((r) => r.success).length,
-      failureCount: response.responses.filter((r) => !r.success).length,
+      successCount: response.responses.filter((r)=>r.success).length,
+      failureCount: response.responses.filter((r)=>!r.success).length,
       invalidTokenIds: invalidTokenIds.length,
-      failureReasons,
+      failureReasons
     }, logContext?.correlationId);
     console.log("[SFCM] Chunk completed", {
       correlationId: logContext?.correlationId,
       locale: logContext?.locale,
       chunkId,
       tokenCount: chunk.length,
-      successCount: response.responses.filter((r) => r.success).length,
-      failureCount: response.responses.filter((r) => !r.success).length,
+      successCount: response.responses.filter((r)=>r.success).length,
+      failureCount: response.responses.filter((r)=>!r.success).length,
       invalidTokenIds: invalidTokenIds.length,
-      failureReasons,
+      failureReasons
     });
     chunkIndex += 1;
   }
-
-  return { successCount, failureCount, invalidTokenIds, failureReasons, messageIds, logs };
+  return {
+    successCount,
+    failureCount,
+    invalidTokenIds,
+    failureReasons,
+    messageIds,
+    logs
+  };
 }
-
-function toFcmData(data: Record<string, unknown>): Record<string, string> {
-  const result: Record<string, string> = {};
-  for (const [key, value] of Object.entries(data)) {
+function toFcmData(data) {
+  const result = {};
+  for (const [key, value] of Object.entries(data)){
     if (value === undefined || value === null) continue;
     result[key] = typeof value === "string" ? value : JSON.stringify(value);
   }
   return result;
 }
-
-type DeliveryLogEntry = {
-  tokenId: string | null;
-  token: string | null;
-  deviceType: string | null;
-  status: "success" | "failure";
-  errorCode?: string;
-  errorMessage?: string;
-  messageId?: string | null;
-};
-
-async function logDeliveryResults(notificationId: string, userId: string | null, logs: DeliveryLogEntry[]) {
+async function logDeliveryResults(notificationId, userId, logs) {
   if (!logs.length) return;
-  
   // Use the secure logging function with token hashing
-  const promises = logs.map((log) => {
+  const promises = logs.map((log)=>{
     return supabase.rpc("log_delivery_results_secure", {
       p_notification_id: notificationId,
       p_user_id: userId,
@@ -1621,20 +1365,20 @@ async function logDeliveryResults(notificationId: string, userId: string | null,
       p_status: log.status,
       p_error_code: log.errorCode,
       p_error_message: log.errorMessage,
-      p_fcm_message_id: log.messageId ?? null,
+      p_fcm_message_id: log.messageId ?? null
     });
   });
-
   try {
     await Promise.all(promises);
   } catch (error) {
     console.error("Failed to log delivery results securely", error);
   }
 }
-
 async function invokeTokenCleanup() {
   try {
-    await supabase.rpc("cleanup_invalid_tokens", { p_max_age_days: DEFAULT_MAX_TOKEN_AGE_DAYS });
+    await supabase.rpc("cleanup_invalid_tokens", {
+      p_max_age_days: DEFAULT_MAX_TOKEN_AGE_DAYS
+    });
   } catch (error) {
     console.warn("cleanup_invalid_tokens rpc failed", error);
   }

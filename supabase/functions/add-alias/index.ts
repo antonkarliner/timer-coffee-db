@@ -40,12 +40,7 @@ Deno.serve(async (req)=>{
   }
   const { roaster_id, alias } = body;
   // Validate and coerce input
-  const strRoasterId =
-    typeof roaster_id === 'number'
-      ? String(roaster_id)
-      : typeof roaster_id === 'string'
-        ? roaster_id.trim()
-        : '';
+  const strRoasterId = typeof roaster_id === 'number' ? String(roaster_id) : typeof roaster_id === 'string' ? roaster_id.trim() : '';
   if (!strRoasterId) {
     return new Response(JSON.stringify({
       error: 'Missing or invalid roaster_id'
@@ -84,8 +79,8 @@ Deno.serve(async (req)=>{
   }
   // Process aliases
   const existing = roasterData.aliases;
-  const existingArr = existing ? String(existing).split(',').map(a => a.trim()) : [];
-  if (existingArr.map(a => a.toLowerCase()).includes(newAlias.toLowerCase())) {
+  const existingArr = existing ? String(existing).split(',').map((a)=>a.trim()) : [];
+  if (existingArr.map((a)=>a.toLowerCase()).includes(newAlias.toLowerCase())) {
     return new Response(JSON.stringify({
       error: 'Alias already exists'
     }), {
@@ -96,7 +91,10 @@ Deno.serve(async (req)=>{
       }
     });
   }
-  const aliasString = [...existingArr, newAlias].join(',');
+  const aliasString = [
+    ...existingArr,
+    newAlias
+  ].join(',');
   // Update the roaster with new aliases
   const { data, error: updateError } = await supabase.from('coffee_roasters').update({
     aliases: aliasString

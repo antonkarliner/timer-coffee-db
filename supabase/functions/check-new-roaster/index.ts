@@ -56,15 +56,7 @@ if (!supabaseUrl || !supabaseServiceRoleKey || !RESEND_API_KEY || !ADMIN_EMAIL |
   throw new Error("Required environment variables are not set");
 }
 const supabase = createClient(supabaseUrl, supabaseServiceRoleKey);
-
-// Shared types (moved to _shared/types.ts)
-import type {
-  GeocodeHit,
-  GoogleSearchItem,
-  CandidatePick,
-  NewRoasterLogRow as _NewRoasterLogRow
-} from "../_shared/types.ts";
-/* ── 1.  Nominatim search ─────────────────────────────────────── */ async function lookupWithNominatim(roaster: string, limit = 10): Promise<GeocodeHit[]> {
+/* ── 1.  Nominatim search ─────────────────────────────────────── */ async function lookupWithNominatim(roaster, limit = 10) {
   const coffeeWords = [
     "coffee",
     "café",
@@ -94,20 +86,19 @@ import type {
       }
     });
     if (!res.ok) return [];
-    type NominatimRow = { display_name: string; lat: string; lon: string };
-    const rows: NominatimRow[] = await res.json();
+    const rows = await res.json();
     return rows.map((d)=>({
-      address: d.display_name,
-      lat: +d.lat,
-      lng: +d.lon,
-      source: "nominatim" as const
-    }));
+        address: d.display_name,
+        lat: +d.lat,
+        lng: +d.lon,
+        source: "nominatim"
+      }));
   } catch (e) {
     console.error("[lookupWithNominatim]", e);
     return [];
   }
 }
-/* ── util: single‑shot geocoder ──────────────────────────────── */ async function geocodeWithMapsCo(address: string): Promise<GeocodeHit|null> {
+/* ── util: single‑shot geocoder ──────────────────────────────── */ async function geocodeWithMapsCo(address) {
   if (!GEOCODING_API_KEY) return null;
   try {
     const url = "https://geocode.maps.co/search?q=" + encodeURIComponent(address) + `&api_key=${GEOCODING_API_KEY}`;
@@ -130,15 +121,15 @@ import type {
     return null;
   }
 }
-async function geocodeWithNominatim(address: string): Promise<GeocodeHit|null> {
+async function geocodeWithNominatim(address) {
   const res = await lookupWithNominatim(address, 1);
   if (res[0]) return res[0];
   return await geocodeWithMapsCo(address); // may still be null
 }
-/* ── 2.  Vertex access token (cached) ─────────────────────────── */ let cachedToken: string | null = null;
-async function getVertexToken(): Promise<string> {
+/* ── 2.  Vertex access token (cached) ─────────────────────────── */ let cachedToken = null;
+async function getVertexToken() {
   if (cachedToken) return cachedToken;
-  const svc = JSON.parse(GOOGLE_APPLICATION_CREDENTIALS_JSON as string);
+  const svc = JSON.parse(GOOGLE_APPLICATION_CREDENTIALS_JSON);
   const iat = Math.floor(Date.now() / 1000);
   const exp = iat + 3600;
   const h = {
@@ -152,7 +143,7 @@ async function getVertexToken(): Promise<string> {
     iat,
     exp
   };
-  const b64url = (s: string)=>btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  const b64url = (s)=>btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   const unsigned = `${b64url(JSON.stringify(h))}.${b64url(JSON.stringify(p))}`;
   const keyDer = Uint8Array.from(atob(svc.private_key.replace(/-----\w+ PRIVATE KEY-----/g, "").replace(/\s+/g, "")), (c)=>c.charCodeAt(0));
   const cryptoKey = await crypto.subtle.importKey("pkcs8", keyDer, {
@@ -180,61 +171,57 @@ async function getVertexToken(): Promise<string> {
 }
 const GEMINI_MODEL = "gemini-2.5-flash";
 const GEMINI_IS_PREVIEW_MODEL = GEMINI_MODEL.includes("preview");
-const GEMINI_LOCATION = GEMINI_IS_PREVIEW_MODEL
-  ? "global"
-  : (GEMINI_REGION === "global" ? "global" : GEMINI_REGION);
-const GEMINI_HOST = GEMINI_IS_PREVIEW_MODEL
-  ? "aiplatform.googleapis.com"
-  : (GEMINI_REGION === "global" ? "aiplatform.googleapis.com" : `${GEMINI_REGION}-aiplatform.googleapis.com`);
-const GEMINI_ENDPOINT =
-  `https://${GEMINI_HOST}/v1/projects/${GEMINI_PROJECT_ID}/locations/${GEMINI_LOCATION}/publishers/google/models/${GEMINI_MODEL}:generateContent`;
+const GEMINI_LOCATION = GEMINI_IS_PREVIEW_MODEL ? "global" : GEMINI_REGION === "global" ? "global" : GEMINI_REGION;
+const GEMINI_HOST = GEMINI_IS_PREVIEW_MODEL ? "aiplatform.googleapis.com" : GEMINI_REGION === "global" ? "aiplatform.googleapis.com" : `${GEMINI_REGION}-aiplatform.googleapis.com`;
+const GEMINI_ENDPOINT = `https://${GEMINI_HOST}/v1/projects/${GEMINI_PROJECT_ID}/locations/${GEMINI_LOCATION}/publishers/google/models/${GEMINI_MODEL}:generateContent`;
 /* ── 3.  Gemini helpers  (revised 2025‑07‑28) ─────────────────── */ /** Build a request body that honours Vertex‑AI constraints:
  *  – `google_search` tool ⇢ no controlled generation (no schema/mime‑type)
  *  – controlled generation ⇢ must NOT include `google_search`
- */ /** Build a request body that respects Vertex‑AI rules */ function buildGeminiBody(
-  prompt: string,
-  { schema = null as unknown as Record<string, unknown> | null, useSearch = false, temperature = 0.1 } = {}
-) {
+ */ /** Build a request body that respects Vertex‑AI rules */ function buildGeminiBody(prompt, { schema = null, useSearch = false, temperature = 0.1 } = {}) {
   // 1) generationConfig — add extra fields only when allowed
-  const generationConfig: {
-    temperature: number;
-    responseMimeType?: string;
-    responseSchema?: Record<string, unknown>;
-  } = { temperature };
-
+  const generationConfig = {
+    temperature
+  };
   if (schema && !useSearch) {
     generationConfig.responseMimeType = "application/json";
     generationConfig.responseSchema = schema;
   }
-
   // 2) body
-  const body: {
-    contents: Array<{ role: string; parts: Array<{ text: string }> }>;
-    generationConfig: typeof generationConfig;
-    tools?: Array<{ google_search: Record<string, never> }>;
-  } = {
+  const body = {
     contents: [
-      { role: "user", parts: [{ text: prompt }] }
+      {
+        role: "user",
+        parts: [
+          {
+            text: prompt
+          }
+        ]
+      }
     ],
     generationConfig
   };
-
-  if (useSearch) body.tools = [{ google_search: {} }];
-
+  if (useSearch) body.tools = [
+    {
+      google_search: {}
+    }
+  ];
   return body;
 }
-/* ── Gemini helper: vet OSM candidates ───────────────────────── */ async function chooseBestWithGemini(
-  roaster: string,
-  candidates: GeocodeHit[]
-): Promise<CandidatePick|null> {
+/* ── Gemini helper: vet OSM candidates ───────────────────────── */ async function chooseBestWithGemini(roaster, candidates) {
   if (!candidates.length) return null;
   const token = await getVertexToken();
   const prompt = `You are a coffee‑industry data assistant.\n` + `Below are candidate addresses for the roaster "${roaster}".\n` + `Return ONLY JSON: {"index": number} — best match (0‑based) or -1 if none.\n\n` + candidates.map((c, i)=>`${i}. ${c.address} (${c.lat.toFixed(6)}, ${c.lng.toFixed(6)})`).join("\n");
   const body = buildGeminiBody(prompt, {
     schema: {
       type: "object",
-      properties: { index: { type: "integer" } },
-      required: ["index"]
+      properties: {
+        index: {
+          type: "integer"
+        }
+      },
+      required: [
+        "index"
+      ]
     }
   });
   const res = await fetch(GEMINI_ENDPOINT, {
@@ -256,18 +243,15 @@ const GEMINI_ENDPOINT =
     return index >= 0 && candidates[index] ? {
       ...candidates[index],
       source: "gemini"
-    } as CandidatePick : null;
+    } : null;
   } catch  {
     console.error("[chooseBestWithGemini] bad JSON", raw);
     return null;
   }
 }
-/* ── Gemini helper: web‑find an address (revised) ───────────── */ async function geminiFindAddress(roaster: string): Promise<GeocodeHit|null> {
+/* ── Gemini helper: web‑find an address (revised) ───────────── */ async function geminiFindAddress(roaster) {
   const token = await getVertexToken();
-  const prompt = `Provide the street address, latitude and longitude of the coffee ` +
-                 `roaster named "${roaster}". If you cannot find coordinates, set them ` +
-                 `to null.\n\nReturn **ONLY raw JSON with no markdown fences** in exactly this shape:` +
-                 ` {"address": string, "lat": number|null, "lng": number|null}`;
+  const prompt = `Provide the street address, latitude and longitude of the coffee ` + `roaster named "${roaster}". If you cannot find coordinates, set them ` + `to null.\n\nReturn **ONLY raw JSON with no markdown fences** in exactly this shape:` + ` {"address": string, "lat": number|null, "lng": number|null}`;
   const body = buildGeminiBody(prompt, {
     useSearch: true,
     temperature: 1.1
@@ -284,25 +268,19 @@ const GEMINI_ENDPOINT =
     console.error("[geminiFindAddress]", res.status, await res.text());
     return null;
   }
-  const raw     = (await res.json()).candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+  const raw = (await res.json()).candidates?.[0]?.content?.parts?.[0]?.text ?? "";
   const cleaned = stripCodeFence(raw);
-  // ---------- parse & repair ----------
-  type GeminiAddress = { address?: unknown; lat?: unknown; lng?: unknown };
-  let obj: GeminiAddress | null = null;
+  let obj = null;
   try {
-    obj = JSON.parse(cleaned) as GeminiAddress;
-  } catch {
-    // JSON not parseable; will attempt regex salvage below
+    obj = JSON.parse(cleaned);
+  } catch  {
+  // JSON not parseable; will attempt regex salvage below
   }
-  
-  /* 0️⃣ Valid JSON but address is null → Gemini couldn't find it */
-  if (obj && obj.address === null) {
+  /* 0️⃣ Valid JSON but address is null → Gemini couldn't find it */ if (obj && obj.address === null) {
     // Gemini returned valid "not found" response - this is normal
     return null;
   }
-  
-  /* 1️⃣ Valid JSON with an address string */
-  if (obj && typeof obj.address === "string" && obj.address.trim()) {
+  /* 1️⃣ Valid JSON with an address string */ if (obj && typeof obj.address === "string" && obj.address.trim()) {
     const lat = Number(obj.lat);
     const lng = Number(obj.lng);
     // 1a. Gemini already supplied usable numbers
@@ -312,31 +290,33 @@ const GEMINI_ENDPOINT =
         lat,
         lng,
         source: "gemini"
-      } as GeocodeHit;
+      };
     }
     // 1b. Coordinates missing → geocode ourselves
     const geo = await geocodeWithNominatim(obj.address);
-    if (geo) return { ...geo, source: "gemini+osm" } as GeocodeHit;
+    if (geo) return {
+      ...geo,
+      source: "gemini+osm"
+    };
   }
-  
-  /* 2️⃣ Raw text not JSON → salvage address with regex */
-  const m = cleaned.match(/"address"\s*:\s*"([^"]+)"/s);
+  /* 2️⃣ Raw text not JSON → salvage address with regex */ const m = cleaned.match(/"address"\s*:\s*"([^"]+)"/s);
   if (m) {
     const geo = await geocodeWithNominatim(m[1]);
-    if (geo) return { ...geo, source: "gemini+osm" } as GeocodeHit;
+    if (geo) return {
+      ...geo,
+      source: "gemini+osm"
+    };
   }
-  
-  /* 3️⃣ Truly unparseable - only log in this case */
-  console.error("[geminiFindAddress] unparsable output", raw);
+  /* 3️⃣ Truly unparseable - only log in this case */ console.error("[geminiFindAddress] unparsable output", raw);
   return null;
 }
-/* ── 4.  Master resolve ───────────────────────────────────────── */ async function resolveLocation(
-  roaster: string,
-  googleResults: GoogleSearchItem[] = []
-): Promise<GeocodeHit|null> {
-  const scraped  = await geocodeFromSearch(googleResults);     // new helper ↓
-  const osmHits  = await lookupWithNominatim(roaster, 10);
-  const candidates = [...scraped, ...osmHits];
+/* ── 4.  Master resolve ───────────────────────────────────────── */ async function resolveLocation(roaster, googleResults = []) {
+  const scraped = await geocodeFromSearch(googleResults); // new helper ↓
+  const osmHits = await lookupWithNominatim(roaster, 10);
+  const candidates = [
+    ...scraped,
+    ...osmHits
+  ];
   if (candidates.length) {
     const vetted = await chooseBestWithGemini(roaster, candidates);
     if (vetted) return vetted;
@@ -347,7 +327,7 @@ const GEMINI_ENDPOINT =
 // ── Google Custom Search helper ──
 // ── Google Custom Search helper ──
 // ── Google Custom Search helper ──
-async function searchRoasterWebsite(roaster: string, extra?: string): Promise<GoogleSearchItem[]> {
+async function searchRoasterWebsite(roaster, extra) {
   try {
     const coffeeWords = [
       "coffee",
@@ -374,22 +354,17 @@ async function searchRoasterWebsite(roaster: string, extra?: string): Promise<Go
     const url = `https://www.googleapis.com/customsearch/v1?key=${GOOGLE_SEARCH_API_KEY}` + `&cx=${GOOGLE_PROGRAMMABLE_ENGINE_ID}` + `&q=${encodeURIComponent(q)}`;
     const res = await fetch(url);
     if (!res.ok) throw new Error(`Google Custom Search error ${res.status}`);
-    type GItem = { title: string; link: string };
-    const items = ((await res.json()).items ?? []) as GItem[];
-    return items.slice(0, 5).map((it)=>({ title: it.title, link: it.link }));
+    const items = (await res.json()).items ?? [];
+    return items.slice(0, 5).map((it)=>({
+        title: it.title,
+        link: it.link
+      }));
   } catch (err) {
     console.error("[searchRoasterWebsite]", err);
     return [];
   }
 }
-/* ── 6.  DB + e‑mail helpers ---------------------------------------------------------- */ async function logCandidateToTable(
-  roaster: string,
-  coffeeBeanName: string,
-  candidates: Array<{ roaster_name: string; sim_score: number }>,
-  googleSearchResults: GoogleSearchItem[],
-  beanSearchResults: GoogleSearchItem[],
-  location: GeocodeHit | null
-) {
+/* ── 6.  DB + e‑mail helpers ---------------------------------------------------------- */ async function logCandidateToTable(roaster, coffeeBeanName, candidates, googleSearchResults, beanSearchResults, location) {
   const { error } = await supabase.schema("service").from("new_roaster_candidates").insert({
     roaster,
     coffee_bean_name: coffeeBeanName,
@@ -400,14 +375,7 @@ async function searchRoasterWebsite(roaster: string, extra?: string): Promise<Go
   });
   if (error) console.error("[logCandidateToTable]", error);
 }
-async function sendAlertEmail(
-  roaster: string,
-  coffeeBeanName: string,
-  similarCandidates: Array<{roaster_name:string; sim_score:number}>,
-  searchResults: GoogleSearchItem[],
-  beanSearchResults: GoogleSearchItem[],
-  location: GeocodeHit | null
-) {
+async function sendAlertEmail(roaster, coffeeBeanName, similarCandidates, searchResults, beanSearchResults, location) {
   const searchHtml = searchResults.length ? "<ul>" + searchResults.map((r)=>`<li><a href="${r.link}">${r.title}</a></li>`).join("") + "</ul>" : "<p>No search results found.</p>";
   const beanHtml = beanSearchResults.length ? "<ul>" + beanSearchResults.map((r)=>`<li><a href="${r.link}">${r.title}</a></li>`).join("") + "</ul>" : "<p>No search results for roaster + bean.</p>";
   const candHtml = similarCandidates.length ? "<ul>" + similarCandidates.map((c)=>`<li>${c.roaster_name} (Score: ${c.sim_score.toFixed(2)})</li>`).join("") + "</ul>" : "<p>No similar roasters found above threshold.</p>";
@@ -435,54 +403,44 @@ async function sendAlertEmail(
   });
   if (!res.ok) console.error("[sendAlertEmail]", res.status, await res.text());
 }
-/* ── Telegram notification helper ───────────────────────────── */
-async function sendTelegramNotification(
-  roaster: string,
-  coffeeBeanName: string,
-  similarCandidates: Array<{roaster_name:string; sim_score:number}>,
-  location: GeocodeHit | null
-) {
+/* ── Telegram notification helper ───────────────────────────── */ async function sendTelegramNotification(roaster, coffeeBeanName, similarCandidates, location) {
   if (!TELEGRAM_ENABLED) {
     console.log("[sendTelegramNotification] Telegram disabled via TELEGRAM_ENABLED");
     return;
   }
-
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_IDS) {
     console.log("[sendTelegramNotification] Telegram not configured, skipping");
     return;
   }
-
-  const chatIds = TELEGRAM_CHAT_IDS.split(",").map(id => id.trim()).filter(Boolean);
+  const chatIds = TELEGRAM_CHAT_IDS.split(",").map((id)=>id.trim()).filter(Boolean);
   if (chatIds.length === 0) {
     console.log("[sendTelegramNotification] No chat IDs configured");
     return;
   }
-
   // Format message
   let message = `☕ *New Roaster Candidate*\n\n`;
   message += `*Roaster:* ${roaster}\n`;
   message += `*Bean:* ${coffeeBeanName || "N/A"}\n\n`;
-
   if (similarCandidates.length > 0) {
     message += `*Similar roasters in DB:*\n`;
-    similarCandidates.slice(0, 5).forEach(c => {
+    similarCandidates.slice(0, 5).forEach((c)=>{
       message += `• ${c.roaster_name} (${(c.sim_score * 100).toFixed(0)}% match)\n`;
     });
   } else {
     message += `*No similar roasters found*\n`;
   }
-
   if (location) {
     message += `\n📍 *Location:* ${location.address}`;
   }
-
   // Send to all configured chat IDs
-  for (const chatId of chatIds) {
+  for (const chatId of chatIds){
     try {
       const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
       const res = await fetch(url, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json"
+        },
         body: JSON.stringify({
           chat_id: chatId,
           text: message,
@@ -490,7 +448,6 @@ async function sendTelegramNotification(
           disable_web_page_preview: true
         })
       });
-
       if (!res.ok) {
         const error = await res.text();
         console.error(`[sendTelegramNotification] Failed for chat ${chatId}:`, error);
@@ -502,16 +459,17 @@ async function sendTelegramNotification(
     }
   }
 }
-/* ── address scraping helpers (NEW) ──────────────────────────── */
-function stripCodeFence(s: string): string {
+/* ── address scraping helpers (NEW) ──────────────────────────── */ function stripCodeFence(s) {
   if (!s) return s;
   // remove ```json ... ``` or ``` ... ```
   return s.replace(/^```(\w+)?\s*/i, "").replace(/```$/i, "").trim();
 }
 const ADDRESS_RE = /\b\d{1,5}\s+[\w\.,'\-\s]{3,100},?\s+[A-Z][A-Za-z\.\-\s]{2,60},?\s+[A-Z]{2}\s+\d{4,6}\b/;
-async function scrapeAddressFromSite(url: string): Promise<string | null> {
+async function scrapeAddressFromSite(url) {
   try {
-    const res = await fetch(url, { redirect: "follow" as const });
+    const res = await fetch(url, {
+      redirect: "follow"
+    });
     if (!res.ok) return null;
     const text = await res.text();
     const m = text.match(ADDRESS_RE);
@@ -526,10 +484,10 @@ async function scrapeAddressFromSite(url: string): Promise<string | null> {
     return null;
   }
 }
-async function geocodeFromSearch(links: GoogleSearchItem[], n = 3): Promise<GeocodeHit[]> {
+async function geocodeFromSearch(links, n = 3) {
   const picked = links.slice(0, n);
-  const out: GeocodeHit[] = [];
-  for (const it of picked) {
+  const out = [];
+  for (const it of picked){
     const addr = await scrapeAddressFromSite(it.link);
     if (!addr) continue;
     const geo = await geocodeWithNominatim(addr) ?? await geocodeWithMapsCo(addr);
@@ -537,37 +495,31 @@ async function geocodeFromSearch(links: GoogleSearchItem[], n = 3): Promise<Geoc
   }
   return out;
 }
-/* ── 7.  Edge Function handler ------------------------------------------------------- */
-
-/**
+/* ── 7.  Edge Function handler ------------------------------------------------------- */ /**
  * Generate embedding for vector search using OpenAI API
- */
-async function generateEmbedding(text: string): Promise<number[] | null> {
+ */ async function generateEmbedding(text) {
   try {
     const openaiApiKey = Deno.env.get("OPENAI_API_KEY");
     if (!openaiApiKey) {
       console.log("[generateEmbedding] OPENAI_API_KEY not set, skipping vector search");
       return null;
     }
-
     const response = await fetch("https://api.openai.com/v1/embeddings", {
       method: "POST",
       headers: {
         "Authorization": `Bearer ${openaiApiKey}`,
-        "Content-Type": "application/json",
+        "Content-Type": "application/json"
       },
       body: JSON.stringify({
         input: text,
         model: "text-embedding-3-small",
-        dimensions: 384,
-      }),
+        dimensions: 384
+      })
     });
-
     if (!response.ok) {
       console.error("[generateEmbedding] OpenAI error:", response.status, await response.text());
       return null;
     }
-
     const data = await response.json();
     return data.data[0].embedding;
   } catch (error) {
@@ -575,33 +527,27 @@ async function generateEmbedding(text: string): Promise<number[] | null> {
     return null;
   }
 }
-
 /**
  * Search for roasters using vector similarity
- */
-async function searchRoastersByVector(roasterName: string): Promise<Array<{roaster_id: number; roaster_name: string; aliases: string | null; similarity_score: number}>> {
+ */ async function searchRoastersByVector(roasterName) {
   try {
     const embedding = await generateEmbedding(roasterName);
     if (!embedding) return [];
-
     const { data, error } = await supabase.rpc("search_roasters_by_vector", {
       query_embedding: embedding,
       match_threshold: 0.75,
-      match_count: 3,
+      match_count: 3
     });
-
     if (error) {
       console.error("[searchRoastersByVector] RPC error:", error);
       return [];
     }
-
-    return (data || []) as Array<{roaster_id: number; roaster_name: string; aliases: string | null; similarity_score: number}>;
+    return data || [];
   } catch (error) {
     console.error("[searchRoastersByVector] Exception:", error);
     return [];
   }
 }
-
 Deno.serve(async (req)=>{
   try {
     const { record, type } = await req.json();
@@ -618,9 +564,7 @@ Deno.serve(async (req)=>{
     }
     const roaster = record.roaster.trim();
     const coffeeBeanName = record.name?.trim() ?? "";
-
-    /* 0) Exact‑match RPC ---------------------------------------------------------- */
-    const { data: unaccentMatch, error: unaccentErr } = await supabase.rpc("search_roaster_unaccent", {
+    /* 0) Exact‑match RPC ---------------------------------------------------------- */ const { data: unaccentMatch, error: unaccentErr } = await supabase.rpc("search_roaster_unaccent", {
       search_name: roaster
     });
     if (unaccentErr) throw new Error(unaccentErr.message);
@@ -634,59 +578,38 @@ Deno.serve(async (req)=>{
         }
       });
     }
-
-    /* 1) Vector similarity search (new) ------------------------------------------ */
-    const vectorMatches = await searchRoastersByVector(roaster);
-
-    /* 2) Fuzzy candidates (trigram fallback) ------------------------------------- */
-    const SIMILARITY_THRESHOLD = 0.6;
+    /* 1) Vector similarity search (new) ------------------------------------------ */ const vectorMatches = await searchRoastersByVector(roaster);
+    /* 2) Fuzzy candidates (trigram fallback) ------------------------------------- */ const SIMILARITY_THRESHOLD = 0.6;
     const { data: roasterCandidates, error: candErr } = await supabase.rpc("search_roaster_candidates", {
       in_value: roaster,
       match_threshold: SIMILARITY_THRESHOLD
     });
     if (candErr) throw new Error(candErr.message);
-
     // Combine vector and trigram results, prioritizing vector matches
-    const candidatesToSend: Array<{roaster_name: string; sim_score: number}> = [];
-
+    const candidatesToSend = [];
     // Add vector matches first (with high scores)
-    for (const match of vectorMatches) {
+    for (const match of vectorMatches){
       candidatesToSend.push({
         roaster_name: match.roaster_name,
         sim_score: match.similarity_score
       });
     }
-
     // Add trigram matches that aren't already in the list
-    for (const candidate of (roasterCandidates || [])) {
-      const alreadyExists = candidatesToSend.some(c => c.roaster_name === candidate.roaster_name);
+    for (const candidate of roasterCandidates || []){
+      const alreadyExists = candidatesToSend.some((c)=>c.roaster_name === candidate.roaster_name);
       if (!alreadyExists) {
         candidatesToSend.push(candidate);
       }
     }
-
-    /* 3) Google web search -------------------------------------------------------- */
-    const googleResults = await searchRoasterWebsite(roaster);
+    /* 3) Google web search -------------------------------------------------------- */ const googleResults = await searchRoasterWebsite(roaster);
     const beanResults = await searchRoasterWebsite(roaster, coffeeBeanName);
-
-    /* 4) Location resolve --------------------------------------------------------- */
-    const locationResult = await resolveLocation(roaster, googleResults);
-
-    /* 5) Persist ------------------------------------------------------------------ */
-    await logCandidateToTable(roaster, coffeeBeanName, candidatesToSend, googleResults, beanResults, locationResult);
-
-    /* 6) Optional e‑mail ---------------------------------------------------------- */
-    if (ROASTER_EMAIL_ENABLED) {
+    /* 4) Location resolve --------------------------------------------------------- */ const locationResult = await resolveLocation(roaster, googleResults);
+    /* 5) Persist ------------------------------------------------------------------ */ await logCandidateToTable(roaster, coffeeBeanName, candidatesToSend, googleResults, beanResults, locationResult);
+    /* 6) Optional e‑mail ---------------------------------------------------------- */ if (ROASTER_EMAIL_ENABLED) {
       await sendAlertEmail(roaster, coffeeBeanName, candidatesToSend, googleResults, beanResults, locationResult);
     }
-
-    /* 7) Telegram notification ---------------------------------------------------- */
-    await sendTelegramNotification(roaster, coffeeBeanName, candidatesToSend, locationResult);
-
-    const msg = candidatesToSend.length > 0
-      ? `Logged candidate and ${ROASTER_EMAIL_ENABLED ? "sent e‑mail" : "did not e‑mail"}; ${candidatesToSend.length} similar (vector: ${vectorMatches.length}, trigram: ${roasterCandidates?.length || 0}).`
-      : `Logged candidate; ${ROASTER_EMAIL_ENABLED ? "e‑mailed" : "no e‑mail"}. No similar roasters.`;
-
+    /* 7) Telegram notification ---------------------------------------------------- */ await sendTelegramNotification(roaster, coffeeBeanName, candidatesToSend, locationResult);
+    const msg = candidatesToSend.length > 0 ? `Logged candidate and ${ROASTER_EMAIL_ENABLED ? "sent e‑mail" : "did not e‑mail"}; ${candidatesToSend.length} similar (vector: ${vectorMatches.length}, trigram: ${roasterCandidates?.length || 0}).` : `Logged candidate; ${ROASTER_EMAIL_ENABLED ? "e‑mailed" : "no e‑mail"}. No similar roasters.`;
     return new Response(JSON.stringify({
       success: true,
       message: msg,

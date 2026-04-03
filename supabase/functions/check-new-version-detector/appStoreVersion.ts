@@ -1,0 +1,82 @@
+import { generateAppStoreJWT } from "./generateAppStoreJWT.ts";
+import { compareVersionStrings } from "./versionUtils.ts";
+async function getAppResourceId(bundleId) {
+  const issuerId = Deno.env.get("APPSTORE_ISSUER_ID");
+  const keyId = Deno.env.get("APPSTORE_KEY_ID");
+  const privateKeyEnv = Deno.env.get("APPSTORE_PRIVATE_KEY");
+  if (!issuerId || !keyId || !privateKeyEnv) {
+    console.error("App Store Connect credentials are not set.");
+    return null;
+  }
+  const privateKey = privateKeyEnv.replace(/\\n/g, "\n");
+  const jwt = await generateAppStoreJWT(issuerId, keyId, privateKey);
+  const url = `https://api.appstoreconnect.apple.com/v1/apps?filter[bundleId]=${encodeURIComponent(bundleId)}&limit=1`;
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        "Content-Type": "application/json"
+      }
+    });
+    if (!response.ok) {
+      console.error("Failed to fetch App Store apps:", await response.text());
+      return null;
+    }
+    const data = await response.json();
+    if (data.data.length === 0) {
+      console.error("No app found with the provided bundle ID.");
+      return null;
+    }
+    return data.data[0].id;
+  } catch (error) {
+    console.error("Error fetching App Store resource ID:", error);
+    return null;
+  }
+}
+export async function getAppStoreVersion() {
+  const bundleId = "timer.coffee";
+  const appId = await getAppResourceId(bundleId);
+  if (!appId) {
+    return null;
+  }
+  const issuerId = Deno.env.get("APPSTORE_ISSUER_ID");
+  const keyId = Deno.env.get("APPSTORE_KEY_ID");
+  const privateKeyEnv = Deno.env.get("APPSTORE_PRIVATE_KEY");
+  if (!issuerId || !keyId || !privateKeyEnv) {
+    console.error("App Store Connect credentials are not set.");
+    return null;
+  }
+  const privateKey = privateKeyEnv.replace(/\\n/g, "\n");
+  const jwt = await generateAppStoreJWT(issuerId, keyId, privateKey);
+  const url = `https://api.appstoreconnect.apple.com/v1/apps/${appId}/appStoreVersions?filter[appStoreState]=READY_FOR_SALE&limit=50`;
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        "Content-Type": "application/json"
+      }
+    });
+    if (!response.ok) {
+      console.error("Failed to fetch App Store versions:", await response.text());
+      return null;
+    }
+    const data = await response.json();
+    if (data.data.length === 0) {
+      console.log("No ready versions found in App Store.");
+      return null;
+    }
+    let latestVersionString = data.data[0].attributes.versionString;
+    for (const version of data.data){
+      const currentVersionString = version.attributes.versionString;
+      if (compareVersionStrings(currentVersionString, latestVersionString) > 0) {
+        latestVersionString = currentVersionString;
+      }
+    }
+    return latestVersionString;
+  } catch (error) {
+    console.error("Error fetching App Store version:", error);
+    return null;
+  }
+}
