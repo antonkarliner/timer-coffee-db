@@ -16,18 +16,20 @@
 --     have been replaced with 410 tombstones
 
 -- 1. Remove the trigger that fired on every insert into public.notifications
-DROP TRIGGER IF EXISTS translate_notification_after_insert ON public.notifications;
+DO $$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = 'public' AND tablename = 'notifications') THEN
+    DROP TRIGGER IF EXISTS translate_notification_after_insert ON public.notifications;
+    DROP TRIGGER IF EXISTS handle_notifications_updated_at ON public.notifications;
+  END IF;
+END $$;
 
--- 2. Remove the updated_at bookkeeping trigger
-DROP TRIGGER IF EXISTS handle_notifications_updated_at ON public.notifications;
-
--- 3. Drop the trigger function (OneSignal translation dispatcher)
+-- 2. Drop the trigger function (OneSignal translation dispatcher)
 DROP FUNCTION IF EXISTS public.translate_notification_after_insert();
 
--- 4. Drop the OneSignal send function (was never connected to an active cron job
+-- 3. Drop the OneSignal send function (was never connected to an active cron job
 --    after the FCM migration; process_scheduled_notifications_cron() already
 --    points to process-scheduled-notifications-fcm)
 DROP FUNCTION IF EXISTS public.process_and_send_scheduled_notifications();
 
--- 5. Drop the dead table (no FK references, no active writers)
+-- 4. Drop the dead table (no FK references, no active writers)
 DROP TABLE IF EXISTS public.notifications;

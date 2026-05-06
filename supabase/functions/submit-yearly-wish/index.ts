@@ -8,14 +8,18 @@ const MAX_REQUESTS = 3;
 const WINDOW_SECONDS = 60;
 const openaiApiKey = Deno.env.get("OPENAI_API_KEY_NON_PERSONAL");
 const groqApiKey = Deno.env.get("GROQ_API_KEY");
+const cerebrasApiKey = Deno.env.get("CEREBRAS_API_KEY");
+const geminiServiceAccountKeyJson = Deno.env.get("GOOGLE_APPLICATION_CREDENTIALS_JSON");
+const geminiProjectId = Deno.env.get("GEMINI_PROJECT_ID") ?? "";
+const geminiRegion = Deno.env.get("GEMINI_REGION") ?? "";
 const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
 const supabaseServiceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
 if (!openaiApiKey) {
   console.error("OPENAI_API_KEY_NON_PERSONAL is not set in environment variables.");
   Deno.exit(1);
 }
-if (!groqApiKey) {
-  console.error("GROQ_API_KEY is not set in environment variables.");
+if (!groqApiKey && !cerebrasApiKey && !geminiServiceAccountKeyJson) {
+  console.error("No secondary moderation provider is configured. Set GROQ_API_KEY, CEREBRAS_API_KEY, or Gemini credentials.");
   Deno.exit(1);
 }
 if (!supabaseUrl) {
@@ -34,9 +38,13 @@ const supabaseAdmin = createClient(supabaseUrl, supabaseServiceRoleKey, {
 });
 const moderator = createModerationClient({
   openaiApiKey: openaiApiKey,
-  groqApiKey: groqApiKey
+  groqApiKey: groqApiKey,
+  cerebrasApiKey: cerebrasApiKey,
+  geminiServiceAccountKeyJson: geminiServiceAccountKeyJson,
+  geminiProjectId: geminiProjectId,
+  geminiRegion: geminiRegion
 });
-function decodeJwtPayload(token) {
+function decodeJwtPayload(token: string): Record<string, unknown> | null {
   try {
     const parts = token.split(".");
     if (parts.length !== 3) {
@@ -50,7 +58,7 @@ function decodeJwtPayload(token) {
     return null;
   }
 }
-function jsonResponse(body, status, cors) {
+function jsonResponse(body: unknown, status: number, cors: HeadersInit) {
   return new Response(JSON.stringify(body), {
     status,
     headers: {

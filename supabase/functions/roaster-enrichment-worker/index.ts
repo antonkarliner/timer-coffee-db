@@ -2,8 +2,19 @@
 import { serve } from "https://deno.land/std@0.223.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.42.5";
 import { getCorsHeaders } from "../_shared/cors.ts";
-import { getEnvVar, validateAndLogEnvironment } from "../_shared/env-validation.ts";
-import { ErrorCategory, ErrorSeverity, flushLogsOnExit, generateCorrelationId, logError, logInfo, logWarning } from "../_shared/monitoring.ts";
+import {
+  getEnvVar,
+  validateAndLogEnvironment,
+} from "../_shared/env-validation.ts";
+import {
+  ErrorCategory,
+  ErrorSeverity,
+  flushLogsOnExit,
+  generateCorrelationId,
+  logError,
+  logInfo,
+  logWarning,
+} from "../_shared/monitoring.ts";
 validateAndLogEnvironment();
 const FUNCTION_NAME = "roaster-enrichment-worker";
 const JOB_LOCKED_BY = "roaster-enrichment-worker";
@@ -14,16 +25,20 @@ const groqApiKey = getEnvVar("GROQ_API_KEY");
 const deepseekApiKey = getEnvVar("DEEPSEEK_API_KEY");
 const openaiApiKey = getEnvVar("OPENAI_API_KEY_NON_PERSONAL");
 if (!supabaseUrl || !supabaseServiceRoleKey || !cronJobSecret) {
-  throw new Error("Missing required Supabase configuration for roaster enrichment worker");
+  throw new Error(
+    "Missing required Supabase configuration for roaster enrichment worker",
+  );
 }
 if (!groqApiKey || !deepseekApiKey || !openaiApiKey) {
-  throw new Error("Missing required LLM API keys for roaster enrichment worker");
+  throw new Error(
+    "Missing required LLM API keys for roaster enrichment worker",
+  );
 }
 const supabase = createClient(supabaseUrl, supabaseServiceRoleKey, {
   auth: {
     persistSession: false,
-    detectSessionInUrl: false
-  }
+    detectSessionInUrl: false,
+  },
 });
 const GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions";
 const DEEPSEEK_ENDPOINT = "https://api.deepseek.com/v1/chat/completions";
@@ -31,7 +46,7 @@ const MAX_JOB_RETRIES = 3;
 const RETRY_BACKOFF_MINUTES = [
   15,
   60,
-  360
+  360,
 ];
 // Timeout configuration (Edge function timeout is ~150s, we need to finish before that)
 const AI_API_TIMEOUT_MS = 10000; // 10s max for AI API calls
@@ -45,6 +60,7 @@ const GPT_LOGO_MODEL = "gpt-5-mini";
 const GPT_PARSE_MODEL = "gpt-5-mini";
 const GPT_EXTRACT_MODEL = "gpt-5.2";
 const SEARCH_RESULT_LIMIT = 6;
+const CANDIDATE_CONTEXT_LIMIT = 8;
 const SEARCH_AGGREGATOR_DOMAINS = [
   "facebook.com",
   "instagram.com",
@@ -56,7 +72,7 @@ const SEARCH_AGGREGATOR_DOMAINS = [
   "google.com",
   "foursquare.com",
   "sprudge.com",
-  "coffeereview.com"
+  "coffeereview.com",
 ];
 const ADDRESS_PATH_KEYWORDS = [
   "/contact",
@@ -67,32 +83,62 @@ const ADDRESS_PATH_KEYWORDS = [
   "/visit",
   "/roastery",
   "/our-coffee",
-  "/team"
+  "/team",
 ];
 const MAX_PAGES_PER_DOMAIN = 2; // Reduced from 3 to prevent timeouts
 const MAX_TOTAL_DISCOVERED_PAGES = 4; // Reduced from 7 to prevent timeouts
-const MAX_LOGOS_TO_VERIFY = 1; // Reduced from 2 - verify only 1 logo max to prevent timeouts
+const MAX_LOGOS_TO_VERIFY = 3; // Verify a small ranked set without blowing the function budget
 const PARSE_BATCH_SIZE = 3; // Process 3 pages per invocation (increased from 1)
 const FETCH_BATCH_SIZE = 3; // Fetch 3 URLs per invocation (increased from 1)
 const GROQ_TRIAGE_MODELS = [
   "meta-llama/llama-4-scout-17b-16e-instruct",
-  "llama-3.3-70b-versatile"
+  "llama-3.3-70b-versatile",
 ];
-const ADDRESS_REGEX = /\b\d{1,5}\s+[\w\.,'\-\s]{3,120},?\s+[\p{L}\s\.-]{2,80},?\s+[\p{L}\.\-\s]{2,80}\b/giu;
+const ADDRESS_REGEX =
+  /\b\d{1,5}\s+[\w\.,'\-\s]{3,120},?\s+[\p{L}\s\.-]{2,80},?\s+[\p{L}\.\-\s]{2,80}\b/giu;
 class ProviderRetryableError extends Error {
   status;
-  constructor(message, status){
+  constructor(message, status) {
     super(message);
     this.status = status;
   }
+}
+function buildReenrichmentPromptBlock(opts) {
+  const reviewerNotes = opts?.reviewerNotes ?? null;
+  const rejectionReason = opts?.rejectionReason ?? null;
+  const priorProposed = opts?.priorProposed ?? null;
+  const priorConfidence = typeof opts?.priorConfidence === "number"
+    ? opts.priorConfidence
+    : null;
+  const includePriorPayload = opts?.includePriorPayload !== false;
+  if (!reviewerNotes && !rejectionReason && !priorProposed) return "";
+  const lines = [
+    "",
+    "RE-ENRICHMENT CONTEXT (a previous attempt was rejected by a human reviewer):",
+  ];
+  if (rejectionReason) lines.push(`- Rejection reason: ${rejectionReason}`);
+  if (reviewerNotes) {
+    lines.push(`- Reviewer notes: ${JSON.stringify(reviewerNotes)}`);
+  }
+  if (includePriorPayload && priorProposed) {
+    lines.push(`- Previous proposed output: ${JSON.stringify(priorProposed)}`);
+    if (priorConfidence != null) {
+      lines.push(`- Previous confidence: ${priorConfidence}`);
+    }
+  }
+  lines.push(
+    "Treat the previous output as suspect. Where reviewer notes contradict the previous output or your initial inclination, prefer the reviewer's direction.",
+  );
+  return lines.join("\n");
 }
 async function verifyLogoWithOpenAI(imageUrl, roasterName, correlationId) {
   logInfo("Verifying logo with GPT", {
     imageUrl,
     roasterName,
-    model: GPT_LOGO_MODEL
+    model: GPT_LOGO_MODEL,
   }, correlationId);
-  const prompt = `You are a logo verification expert. Analyze this image and determine if it is a company logo.
+  const prompt =
+    `You are a logo verification expert. Analyze this image and determine if it is a company logo.
 
 Image URL: ${imageUrl}
 Expected brand name: ${roasterName}
@@ -114,12 +160,12 @@ Logo characteristics to look for:
   const requestBody = {
     model: GPT_LOGO_MODEL,
     reasoning: {
-      effort: "minimal"
+      effort: "minimal",
     },
     text: {
       format: {
-        type: "json_object"
-      }
+        type: "json_object",
+      },
     },
     input: [
       {
@@ -127,29 +173,29 @@ Logo characteristics to look for:
         content: [
           {
             type: "input_text",
-            text: prompt
+            text: prompt,
           },
           {
             type: "input_image",
-            image_url: imageUrl
-          }
-        ]
-      }
-    ]
+            image_url: imageUrl,
+          },
+        ],
+      },
+    ],
   };
   try {
     const response = await fetchWithRetry(OPENAI_ENDPOINT, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${openaiApiKey}`,
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
       },
-      body: JSON.stringify(requestBody)
+      body: JSON.stringify(requestBody),
     }, {
       correlationId,
       label: "gpt_logo_verify",
       timeoutMs: LOGO_VERIFY_TIMEOUT_MS,
-      maxAttempts: 1
+      maxAttempts: 1,
     });
     if (!response.ok) {
       const errorBody = await response.text();
@@ -157,12 +203,12 @@ Logo characteristics to look for:
         imageUrl,
         status: response.status,
         body: errorBody.slice(0, 500),
-        model: GPT_LOGO_MODEL
+        model: GPT_LOGO_MODEL,
       }, correlationId);
       return {
         isLogo: false,
         confidence: 0,
-        reason: `HTTP error: ${response.status}`
+        reason: `HTTP error: ${response.status}`,
       };
     }
     const json = await response.json();
@@ -170,33 +216,33 @@ Logo characteristics to look for:
     const parsed = parseModelJson(outputText, {
       isLogo: false,
       confidence: 0,
-      reason: "Failed to parse response"
+      reason: "Failed to parse response",
     });
     logInfo("Logo verification result", {
       isLogo: parsed.isLogo,
       confidence: parsed.confidence,
-      reason: parsed.reason
+      reason: parsed.reason,
     }, correlationId);
     return {
       isLogo: parsed.isLogo ?? false,
       confidence: parsed.confidence ?? 0,
-      reason: parsed.reason ?? "No reason provided"
+      reason: parsed.reason ?? "No reason provided",
     };
   } catch (error) {
     // Fail gracefully on timeout or any error
     const errorMessage = getErrorMessage(error);
     logWarning("Logo verification failed", {
       imageUrl,
-      error: errorMessage
+      error: errorMessage,
     }, correlationId);
     return {
       isLogo: false,
       confidence: 0,
-      reason: `Verification failed: ${errorMessage.slice(0, 50)}`
+      reason: `Verification failed: ${errorMessage.slice(0, 50)}`,
     };
   }
 }
-const sleep = (ms)=>new Promise((resolve)=>setTimeout(resolve, ms));
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 function parseRetryAfter(value) {
   if (!value) return null;
   const seconds = Number(value);
@@ -212,11 +258,11 @@ function computeBackoff(attempt, baseMs = 500, maxMs = 8000) {
 }
 async function fetchWithTimeout(url, options, timeoutMs) {
   const controller = new AbortController();
-  const timeoutId = setTimeout(()=>controller.abort(), timeoutMs);
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch(url, {
       ...options,
-      signal: controller.signal
+      signal: controller.signal,
     });
     clearTimeout(timeoutId);
     return response;
@@ -228,23 +274,42 @@ async function fetchWithTimeout(url, options, timeoutMs) {
     throw error;
   }
 }
-async function fetchWithRetry(url, options, { maxAttempts = 3, correlationId, label, timeoutMs } = {}) {
+async function fetchWithRetry(
+  url,
+  options,
+  {
+    maxAttempts = 3,
+    correlationId,
+    label,
+    timeoutMs,
+  }: {
+    maxAttempts?: number;
+    correlationId?: string;
+    label?: string;
+    timeoutMs?: number;
+  } = {},
+) {
   let lastResponse = null;
-  for(let attempt = 1; attempt <= maxAttempts; attempt += 1){
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
-      const response = timeoutMs ? await fetchWithTimeout(url, options, timeoutMs) : await fetch(url, options);
+      const response = timeoutMs
+        ? await fetchWithTimeout(url, options, timeoutMs)
+        : await fetch(url, options);
       lastResponse = response;
       if (response.status !== 429) {
         return response;
       }
       const retryAfter = parseRetryAfter(response.headers.get("retry-after"));
       const MAX_RETRY_DELAY_MS = 30000; // 30 seconds max delay
-      const delay = Math.min(retryAfter ?? computeBackoff(attempt), MAX_RETRY_DELAY_MS);
+      const delay = Math.min(
+        retryAfter ?? computeBackoff(attempt),
+        MAX_RETRY_DELAY_MS,
+      );
       logWarning("Rate limited, retrying", {
         label,
         attempt,
         status: response.status,
-        delay_ms: delay
+        delay_ms: delay,
       }, correlationId);
       await sleep(delay);
     } catch (error) {
@@ -255,7 +320,7 @@ async function fetchWithRetry(url, options, { maxAttempts = 3, correlationId, la
           label,
           attempt,
           url,
-          message: errorMessage
+          message: errorMessage,
         }, correlationId);
         throw error;
       }
@@ -267,7 +332,7 @@ async function fetchWithRetry(url, options, { maxAttempts = 3, correlationId, la
         label,
         attempt,
         delay_ms: delay,
-        message: errorMessage
+        message: errorMessage,
       }, correlationId);
       await sleep(delay);
     }
@@ -289,14 +354,19 @@ function parseModelJson(raw, fallback) {
   if (!raw) return fallback;
   try {
     return JSON.parse(stripCodeFence(raw));
-  } catch  {
+  } catch {
     return fallback;
   }
 }
 function extractOpenAiOutputText(json) {
   const outputItems = safeArray(json?.output);
-  const contentItems = outputItems.flatMap((item)=>safeArray(item?.content));
-  return json?.output_text ?? contentItems.find((content)=>content?.type === "output_text" && typeof content.text === "string")?.text ?? contentItems.find((content)=>typeof content?.text === "string")?.text ?? "{}";
+  const contentItems = outputItems.flatMap((item) => safeArray(item?.content));
+  return json?.output_text ??
+    contentItems.find((content) =>
+      content?.type === "output_text" && typeof content.text === "string"
+    )?.text ??
+    contentItems.find((content) => typeof content?.text === "string")?.text ??
+    "{}";
 }
 function getErrorMessage(error) {
   if (error instanceof Error) return error.message;
@@ -322,7 +392,7 @@ function getErrorDetails(error) {
   if (error && typeof error === "object") {
     try {
       raw = JSON.stringify(error);
-    } catch  {
+    } catch {
       raw = undefined;
     }
   }
@@ -331,19 +401,21 @@ function getErrorDetails(error) {
     message,
     type,
     name,
-    raw
+    raw,
   };
 }
 function normalizeUrl(value) {
   try {
     const parsed = new URL(value);
-    if (![
-      'http:',
-      'https:'
-    ].includes(parsed.protocol)) return null;
+    if (
+      ![
+        "http:",
+        "https:",
+      ].includes(parsed.protocol)
+    ) return null;
     parsed.hash = "";
     return parsed.toString();
-  } catch  {
+  } catch {
     return null;
   }
 }
@@ -362,10 +434,10 @@ function isBinaryLikeUrl(value) {
       ".rar",
       ".7z",
       ".tar",
-      ".gz"
+      ".gz",
     ];
-    return BINARY_EXTENSIONS.some((ext)=>pathname.endsWith(ext));
-  } catch  {
+    return BINARY_EXTENSIONS.some((ext) => pathname.endsWith(ext));
+  } catch {
     return false;
   }
 }
@@ -375,7 +447,7 @@ function normalizeDomain(value) {
 function extractDomain(value) {
   try {
     return normalizeDomain(new URL(value).hostname);
-  } catch  {
+  } catch {
     return null;
   }
 }
@@ -383,14 +455,17 @@ function filterLogosByExtension(urls) {
   const ALLOWED_EXTENSIONS = [
     ".png",
     ".jpg",
-    ".jpeg"
+    ".jpeg",
+    ".webp",
   ];
-  return urls.filter((url)=>{
+  return urls.filter((url) => {
     try {
       const parsed = new URL(url);
       const pathname = parsed.pathname.toLowerCase();
-      return ALLOWED_EXTENSIONS.some((ext)=>pathname.endsWith(ext) || pathname.includes(`${ext}?`));
-    } catch  {
+      return ALLOWED_EXTENSIONS.some((ext) =>
+        pathname.endsWith(ext) || pathname.includes(`${ext}?`)
+      );
+    } catch {
       return false;
     }
   });
@@ -398,11 +473,13 @@ function filterLogosByExtension(urls) {
 function isAggregatorDomain(domain) {
   if (!domain) return false;
   const normalized = normalizeDomain(domain);
-  return SEARCH_AGGREGATOR_DOMAINS.some((blocked)=>normalized === blocked || normalized.endsWith(`.${blocked}`));
+  return SEARCH_AGGREGATOR_DOMAINS.some((blocked) =>
+    normalized === blocked || normalized.endsWith(`.${blocked}`)
+  );
 }
 function uniqueStrings(values) {
   const seen = new Set();
-  return values.filter((value)=>{
+  return values.filter((value) => {
     if (seen.has(value)) return false;
     seen.add(value);
     return true;
@@ -411,15 +488,209 @@ function uniqueStrings(values) {
 function safeArray(value) {
   return Array.isArray(value) ? value : [];
 }
+function parseCandidateNotes(notes) {
+  if (typeof notes !== "string" || !notes.trim()) return null;
+  try {
+    return JSON.parse(notes);
+  } catch {
+    return null;
+  }
+}
+function compactCandidateLocation(location) {
+  if (!location || typeof location !== "object") return null;
+  const record = location;
+  return {
+    address: typeof record.address === "string" ? record.address : null,
+    lat: typeof record.lat === "number" ? record.lat : null,
+    lng: typeof record.lng === "number" ? record.lng : null,
+    source: typeof record.source === "string" ? record.source : null,
+  };
+}
+function buildCandidateContext(candidates, correlationId) {
+  const compactCandidates = candidates.slice(0, CANDIDATE_CONTEXT_LIMIT).map(
+    (candidate) => {
+      const notesContext = parseCandidateNotes(candidate.notes);
+      return {
+        id: candidate.id ?? null,
+        roaster: typeof candidate.roaster === "string"
+          ? candidate.roaster
+          : null,
+        coffee_bean_name: typeof candidate.coffee_bean_name === "string"
+          ? candidate.coffee_bean_name
+          : null,
+        location: compactCandidateLocation(candidate.location),
+        similar_candidates: safeArray(candidate.similar_candidates).slice(0, 5)
+          .map((match) => ({
+            roaster_name: typeof match.roaster_name === "string"
+              ? match.roaster_name
+              : null,
+            sim_score: typeof match.sim_score === "number"
+              ? match.sim_score
+              : null,
+          })).filter((match) => match.roaster_name),
+        source_record: notesContext?.source_record ?? null,
+      };
+    },
+  );
+  const initialLocations = uniqueStrings(
+    compactCandidates.map((candidate) => candidate.location?.address).filter(
+      (address) => Boolean(address),
+    ),
+  );
+  const likelyExistingMatches = [];
+  const seenMatches = new Set();
+  for (const candidate of compactCandidates) {
+    for (const match of candidate.similar_candidates) {
+      const key = String(match.roaster_name).toLowerCase();
+      if (!key || seenMatches.has(key)) continue;
+      seenMatches.add(key);
+      likelyExistingMatches.push(match);
+      if (likelyExistingMatches.length >= 8) break;
+    }
+    if (likelyExistingMatches.length >= 8) break;
+  }
+  const searchEvidence = buildSearchEvidenceFromCandidates(
+    candidates,
+    correlationId,
+  );
+  logInfo("Candidate context built", {
+    candidate_count: compactCandidates.length,
+    initial_location_count: initialLocations.length,
+    likely_existing_match_count: likelyExistingMatches.length,
+    search_result_count: searchEvidence?.results.length ?? 0,
+  }, correlationId);
+  return {
+    candidates: compactCandidates,
+    initial_locations: initialLocations,
+    likely_existing_matches: likelyExistingMatches,
+    search_evidence: searchEvidence,
+  };
+}
 function extractMetaContent(html, property) {
-  const regex = new RegExp(`<meta[^>]+(?:property|name)=["']${property}["'][^>]+content=["']([^"']+)["'][^>]*>`, "i");
+  const regex = new RegExp(
+    `<meta[^>]+(?:property|name)=["']${property}["'][^>]+content=["']([^"']+)["'][^>]*>`,
+    "i",
+  );
   const match = html.match(regex);
   return match?.[1] ?? null;
 }
+function resolveUrlCandidate(baseUrl, value) {
+  if (!value) return null;
+  try {
+    const parsed = new URL(value, baseUrl);
+    if (
+      ![
+        "http:",
+        "https:",
+      ].includes(parsed.protocol)
+    ) return null;
+    parsed.hash = "";
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+function extractAttributeValue(attrs, name) {
+  const regex = new RegExp(`${name}\\s*=\\s*["']([^"']+)["']`, "i");
+  return attrs.match(regex)?.[1] ?? null;
+}
+function parseSrcsetUrls(value) {
+  return value.split(",").map((part) => part.trim().split(/\s+/)[0]).filter(
+    Boolean,
+  );
+}
+function extractHtmlLogoCandidates(baseUrl, html) {
+  const logos = [];
+  const pushCandidate = (value) => {
+    const normalized = resolveUrlCandidate(baseUrl, value);
+    if (normalized) logos.push(normalized);
+  };
+  for (const match of html.matchAll(/<img\b([^>]+)>/gi)) {
+    const attrs = match[1] ?? "";
+    pushCandidate(extractAttributeValue(attrs, "src"));
+    pushCandidate(extractAttributeValue(attrs, "data-src"));
+    const srcset = extractAttributeValue(attrs, "srcset") ??
+      extractAttributeValue(attrs, "data-srcset");
+    if (srcset) {
+      for (const candidate of parseSrcsetUrls(srcset)) {
+        pushCandidate(candidate);
+      }
+    }
+  }
+  for (const match of html.matchAll(/<source\b([^>]+)>/gi)) {
+    const attrs = match[1] ?? "";
+    const srcset = extractAttributeValue(attrs, "srcset") ??
+      extractAttributeValue(attrs, "data-srcset");
+    if (srcset) {
+      for (const candidate of parseSrcsetUrls(srcset)) {
+        pushCandidate(candidate);
+      }
+    }
+  }
+  for (const match of html.matchAll(/<link\b([^>]+)>/gi)) {
+    const attrs = match[1] ?? "";
+    const rel = extractAttributeValue(attrs, "rel")?.toLowerCase() ?? "";
+    if (!rel.includes("icon") && !rel.includes("apple-touch-icon")) continue;
+    pushCandidate(extractAttributeValue(attrs, "href"));
+  }
+  for (
+    const match of html.matchAll(
+      /["'`](https?:\/\/[^"'`\s]+?\.(?:png|jpe?g|webp)(?:\?[^"'`\s]*)?|\/[^"'`\s]+?\.(?:png|jpe?g|webp)(?:\?[^"'`\s]*)?)["'`]/gi,
+    )
+  ) {
+    pushCandidate(match[1]);
+  }
+  return uniqueStrings(filterLogosByExtension(logos));
+}
+function slugTokens(value) {
+  return value.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .split(/[^a-z0-9]+/).filter((token) => token.length >= 3);
+}
+function rankLogoCandidates(candidates, roasterName, website) {
+  const websiteDomain = website ? extractDomain(website) : null;
+  const nameTokens = slugTokens(roasterName);
+  const scored = candidates.map((url) => {
+    let score = 0;
+    let pathname = "";
+    let hostname = "";
+    try {
+      const parsed = new URL(url);
+      pathname = parsed.pathname.toLowerCase();
+      hostname = parsed.hostname.toLowerCase();
+      const normalizedDomain = normalizeDomain(hostname);
+      if (websiteDomain && normalizedDomain === websiteDomain) score += 5;
+      if (pathname.includes("/cdn/shop/files/")) score += 4;
+      if (
+        /(^|[\/_-])(logo|logos|wordmark|brand|branding|header|site-title|navbar)([\/_.-]|$)/i
+          .test(pathname)
+      ) score += 8;
+      if (/(icon|favicon|apple-touch-icon)/i.test(pathname)) score += 3;
+      if (
+        /(product|products|collection|collections|article|blog|hero|banner|slide|thumb|gallery)/i
+          .test(pathname)
+      ) score -= 4;
+      if (/(giftcard|gift-card|gift_card)/i.test(pathname)) score -= 1;
+    } catch {
+      score -= 10;
+    }
+    const urlLower = url.toLowerCase();
+    for (const token of nameTokens) {
+      if (urlLower.includes(token)) score += 2;
+    }
+    return {
+      url,
+      score,
+    };
+  });
+  scored.sort((a, b) => b.score - a.score || a.url.length - b.url.length);
+  return scored.map((entry) => entry.url);
+}
 function extractJsonLd(html) {
-  const matches = html.matchAll(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi);
+  const matches = html.matchAll(
+    /<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi,
+  );
   const jsonLd = [];
-  for (const match of matches){
+  for (const match of matches) {
     const raw = match[1]?.trim();
     if (!raw) continue;
     try {
@@ -430,7 +701,7 @@ function extractJsonLd(html) {
       } else {
         jsonLd.push(parsed);
       }
-    } catch  {
+    } catch {
       continue;
     }
   }
@@ -438,32 +709,36 @@ function extractJsonLd(html) {
 }
 function extractInternalLinks(baseUrl, html) {
   const base = new URL(baseUrl);
-  const links = Array.from(html.matchAll(/<a[^>]+href=["']([^"']+)["']/gi)).map((match)=>match[1]).filter((href)=>Boolean(href));
-  const resolved = links.map((href)=>{
+  const links = Array.from(html.matchAll(/<a[^>]+href=["']([^"']+)["']/gi)).map(
+    (match) => match[1],
+  ).filter((href) => Boolean(href));
+  const resolved = links.map((href) => {
     try {
       const url = new URL(href, base);
       if (url.hostname !== base.hostname) return null;
-      if (![
-        'http:',
-        'https:'
-      ].includes(url.protocol)) return null;
+      if (
+        ![
+          "http:",
+          "https:",
+        ].includes(url.protocol)
+      ) return null;
       url.hash = "";
       return url.toString();
-    } catch  {
+    } catch {
       return null;
     }
-  }).filter((href)=>Boolean(href));
+  }).filter((href) => Boolean(href));
   return uniqueStrings(resolved);
 }
 function isAddressPageCandidate(pathname) {
   const normalized = pathname.toLowerCase();
-  return ADDRESS_PATH_KEYWORDS.some((keyword)=>normalized.includes(keyword));
+  return ADDRESS_PATH_KEYWORDS.some((keyword) => normalized.includes(keyword));
 }
 function extractFromJsonLd(data) {
   const logos = [];
   const names = [];
   const addresses = [];
-  for (const entry of data){
+  for (const entry of data) {
     if (!entry || typeof entry !== "object") continue;
     const record = entry;
     const name = record.name;
@@ -485,27 +760,33 @@ function extractFromJsonLd(data) {
         addressRecord.addressLocality,
         addressRecord.addressRegion,
         addressRecord.postalCode,
-        addressRecord.addressCountry
-      ].filter((part)=>typeof part === "string" && part.trim()).map((part)=>String(part).trim());
+        addressRecord.addressCountry,
+      ].filter((part) => typeof part === "string" && part.trim()).map((part) =>
+        String(part).trim()
+      );
       if (parts.length) addresses.push(parts.join(", "));
     }
   }
   return {
     logos: uniqueStrings(logos),
     names: uniqueStrings(names),
-    addresses: uniqueStrings(addresses)
+    addresses: uniqueStrings(addresses),
   };
 }
 function extractAddresses(html) {
-  const matches = Array.from(html.matchAll(ADDRESS_REGEX)).map((match)=>match[0]);
-  return uniqueStrings(matches.map((value)=>value.trim())).slice(0, 6);
+  const matches = Array.from(html.matchAll(ADDRESS_REGEX)).map((match) =>
+    match[0]
+  );
+  return uniqueStrings(matches.map((value) => value.trim())).slice(0, 6);
 }
 async function parsePageWithLLM(url, html, correlationId) {
   logInfo("Parsing page with LLM", {
     url,
-    model: GPT_PARSE_MODEL
+    model: GPT_PARSE_MODEL,
   }, correlationId);
-  const prompt = `Parse this HTML page and extract structured information about a coffee roaster.
+  const manualParsed = parsePageEvidence(url, html);
+  const prompt =
+    `Parse this HTML page and extract structured information about a coffee roaster.
 Return ONLY JSON with this exact structure:
 {
   "title": string|null,
@@ -521,7 +802,7 @@ Important instructions:
 1. Extract the page title from <title> tag
 2. Extract JSON-LD from <script type="application/ld+json"> tags
 3. Extract og:logo and og:image from meta tags
-4. Find all logo URLs (must end with .png, .jpg, or .jpeg)
+4. Find all logo URLs (must end with .png, .jpg, .jpeg, or .webp)
 5. Find all physical addresses
 6. Find all company/roaster names
 
@@ -530,26 +811,26 @@ HTML content: ${html.slice(0, 10000)}`; // Limit to first 10KB
     const requestBody = {
       model: GPT_PARSE_MODEL,
       reasoning: {
-        effort: "minimal"
+        effort: "minimal",
       },
       text: {
         format: {
-          type: "json_object"
-        }
+          type: "json_object",
+        },
       },
-      input: prompt
+      input: prompt,
     };
     const response = await fetchWithRetry(OPENAI_ENDPOINT, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${openaiApiKey}`,
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
       },
-      body: JSON.stringify(requestBody)
+      body: JSON.stringify(requestBody),
     }, {
       correlationId,
       label: "gpt_parse",
-      timeoutMs: AI_API_TIMEOUT_MS
+      timeoutMs: AI_API_TIMEOUT_MS,
     });
     if (!response.ok) {
       const errorBody = await response.text();
@@ -557,7 +838,7 @@ HTML content: ${html.slice(0, 10000)}`; // Limit to first 10KB
         url,
         status: response.status,
         body: errorBody.slice(0, 500),
-        model: GPT_PARSE_MODEL
+        model: GPT_PARSE_MODEL,
       }, correlationId);
       throw new Error(`GPT parsing failed: ${response.status}`);
     }
@@ -566,18 +847,43 @@ HTML content: ${html.slice(0, 10000)}`; // Limit to first 10KB
     const result = parseModelJson(outputText, {});
     return {
       url,
-      title: typeof result.title === "string" ? result.title : null,
-      jsonLd: safeArray(result.jsonLd),
-      ogLogo: typeof result.ogLogo === "string" ? result.ogLogo : null,
-      ogImage: typeof result.ogImage === "string" ? result.ogImage : null,
-      logos: filterLogosByExtension(safeArray(result.logos)),
-      addresses: safeArray(result.addresses),
-      names: safeArray(result.names)
+      title: typeof result.title === "string"
+        ? result.title
+        : manualParsed.title,
+      jsonLd: manualParsed.jsonLd,
+      ogLogo: typeof result.ogLogo === "string"
+        ? result.ogLogo
+        : manualParsed.ogLogo,
+      ogImage: typeof result.ogImage === "string"
+        ? result.ogImage
+        : manualParsed.ogImage,
+      logos: filterLogosByExtension(uniqueStrings([
+        ...safeArray(result.logos),
+        ...manualParsed.logos,
+        ...typeof result.ogLogo === "string"
+          ? [
+            result.ogLogo,
+          ]
+          : [],
+        ...typeof result.ogImage === "string"
+          ? [
+            result.ogImage,
+          ]
+          : [],
+      ])),
+      addresses: uniqueStrings([
+        ...safeArray(result.addresses),
+        ...manualParsed.addresses,
+      ]),
+      names: uniqueStrings([
+        ...safeArray(result.names),
+        ...manualParsed.names,
+      ]),
     };
   } catch (error) {
     logWarning("LLM parsing failed, falling back to manual parsing", {
       url,
-      error: getErrorMessage(error)
+      error: getErrorMessage(error),
     }, correlationId);
     // Fallback to manual parsing if LLM fails
     return parsePageEvidence(url, html);
@@ -593,6 +899,7 @@ function parsePageEvidence(url, html) {
   const ogImage = extractMetaContent(limitedHtml, "og:image");
   const addresses = extractAddresses(limitedHtml);
   const jsonLdExtracted = extractFromJsonLd(jsonLd);
+  const htmlExtracted = extractHtmlLogoCandidates(url, limitedHtml);
   return {
     url,
     title,
@@ -601,18 +908,23 @@ function parsePageEvidence(url, html) {
     ogImage,
     logos: filterLogosByExtension(uniqueStrings([
       ...jsonLdExtracted.logos,
-      ...ogLogo ? [
-        ogLogo
-      ] : [],
-      ...ogImage ? [
-        ogImage
-      ] : []
+      ...htmlExtracted,
+      ...ogLogo
+        ? [
+          ogLogo,
+        ]
+        : [],
+      ...ogImage
+        ? [
+          ogImage,
+        ]
+        : [],
     ])),
     addresses: uniqueStrings([
       ...jsonLdExtracted.addresses,
-      ...addresses
+      ...addresses,
     ]),
-    names: jsonLdExtracted.names
+    names: jsonLdExtracted.names,
   };
 }
 function sanitizeParsedPage(page) {
@@ -622,116 +934,197 @@ function sanitizeParsedPage(page) {
     jsonLd: page.jsonLd,
     ogLogo: page.ogLogo ? sanitizeForJson(page.ogLogo) : null,
     ogImage: page.ogImage ? sanitizeForJson(page.ogImage) : null,
-    logos: page.logos.map((value)=>sanitizeForJson(value)),
-    addresses: page.addresses.map((value)=>sanitizeForJson(value)),
-    names: page.names.map((value)=>sanitizeForJson(value))
+    logos: page.logos.map((value) => sanitizeForJson(value)),
+    addresses: page.addresses.map((value) => sanitizeForJson(value)),
+    names: page.names.map((value) => sanitizeForJson(value)),
   };
 }
 async function lockNextJob(correlationId) {
   const now = new Date().toISOString();
   logInfo("Checking for queued enrichment jobs", {
-    run_after_lte: now
+    run_after_lte: now,
   }, correlationId);
-  const { data: job, error } = await supabase.schema("service").from("roaster_enrichment_jobs").select("*").eq("state", "queued").lte("run_after", now).order("id", {
-    ascending: true
+  const { data: job, error } = await supabase.schema("service").from(
+    "roaster_enrichment_jobs",
+  ).select("*").eq("state", "queued").lte("run_after", now).order("id", {
+    ascending: true,
   }).limit(1).maybeSingle();
   if (error) {
-    logError("Failed to fetch queued enrichment job", toError(error), ErrorCategory.DATABASE, ErrorSeverity.HIGH, {}, correlationId);
+    logError(
+      "Failed to fetch queued enrichment job",
+      toError(error),
+      ErrorCategory.DATABASE,
+      ErrorSeverity.HIGH,
+      {},
+      correlationId,
+    );
     throw error;
   }
   if (!job) {
     logInfo("No queued enrichment jobs found", {}, correlationId);
     return null;
   }
-  const { data: updated, error: updateError } = await supabase.schema("service").from("roaster_enrichment_jobs").update({
-    state: "running",
-    locked_at: new Date().toISOString(),
-    locked_by: JOB_LOCKED_BY,
-    attempts: (job.attempts ?? 0) + 1
-  }).eq("id", job.id).eq("state", "queued").select("*").maybeSingle();
+  const { data: updated, error: updateError } = await supabase.schema("service")
+    .from("roaster_enrichment_jobs").update({
+      state: "running",
+      locked_at: new Date().toISOString(),
+      locked_by: JOB_LOCKED_BY,
+    }).eq("id", job.id).eq("state", "queued").select("*").maybeSingle();
   if (updateError) {
-    logError("Failed to lock enrichment job", toError(updateError), ErrorCategory.DATABASE, ErrorSeverity.HIGH, {
-      job_id: job.id
-    }, correlationId);
+    logError(
+      "Failed to lock enrichment job",
+      toError(updateError),
+      ErrorCategory.DATABASE,
+      ErrorSeverity.HIGH,
+      {
+        job_id: job.id,
+      },
+      correlationId,
+    );
     throw updateError;
   }
   if (!updated) {
     logWarning("Enrichment job already locked by another worker", {
-      job_id: job.id
+      job_id: job.id,
     }, correlationId);
     return null;
   }
   logInfo("Enrichment job locked", {
     job_id: updated.id,
     cluster_id: updated.cluster_id,
-    attempts: updated.attempts
+    failure_attempts: updated.attempts ?? 0,
   }, correlationId);
   return updated;
 }
-async function updateJobState(jobId, state, lastError, correlationId) {
+async function updateJobState(
+  jobId,
+  state,
+  lastError,
+  correlationId,
+  extraFields = {},
+) {
   logInfo("Updating enrichment job state", {
     job_id: jobId,
-    state
-  }, correlationId);
-  const { error } = await supabase.schema("service").from("roaster_enrichment_jobs").update({
     state,
-    last_error: lastError
+  }, correlationId);
+  const { error } = await supabase.schema("service").from(
+    "roaster_enrichment_jobs",
+  ).update({
+    ...extraFields,
+    state,
+    last_error: lastError,
   }).eq("id", jobId);
   if (error) {
-    logError("Failed to update job state", toError(error), ErrorCategory.DATABASE, ErrorSeverity.MEDIUM, {
-      job_id: jobId,
-      state
-    }, correlationId);
+    logError(
+      "Failed to update job state",
+      toError(error),
+      ErrorCategory.DATABASE,
+      ErrorSeverity.MEDIUM,
+      {
+        job_id: jobId,
+        state,
+      },
+      correlationId,
+    );
     return;
   }
   logInfo("Enrichment job state updated", {
     job_id: jobId,
-    state
+    state,
   }, correlationId);
 }
-async function updateJobStage(jobId, stage, stageData, correlationId) {
+async function updateJobStage(jobOrId, stage, stageData, correlationId) {
+  // Accept either a full job row (preferred) or a bare jobId for backward
+  // compatibility. When given the full row, preserve `reenrichment` from the
+  // previous stage_data so context survives across pipeline stages.
+  let jobId;
+  let mergedStageData = stageData;
+  if (jobOrId && typeof jobOrId === "object") {
+    jobId = jobOrId.id;
+    const previousReenrichment = jobOrId.stage_data?.reenrichment ?? null;
+    if (
+      previousReenrichment && stageData &&
+      stageData.reenrichment === undefined
+    ) {
+      mergedStageData = {
+        ...stageData,
+        reenrichment: previousReenrichment,
+      };
+    }
+  } else {
+    jobId = jobOrId;
+  }
   logInfo("Updating job stage", {
     job_id: jobId,
-    stage
-  }, correlationId);
-  const { error } = await supabase.schema("service").from("roaster_enrichment_jobs").update({
     stage,
-    stage_data: stageData,
+  }, correlationId);
+  const { error } = await supabase.schema("service").from(
+    "roaster_enrichment_jobs",
+  ).update({
+    stage,
+    stage_data: mergedStageData,
     run_after: new Date().toISOString(),
-    correlation_id: correlationId
+    correlation_id: correlationId,
   }).eq("id", jobId);
   if (error) {
-    logError("Failed to update job stage", toError(error), ErrorCategory.DATABASE, ErrorSeverity.MEDIUM, {
-      job_id: jobId,
-      stage
-    }, correlationId);
+    logError(
+      "Failed to update job stage",
+      toError(error),
+      ErrorCategory.DATABASE,
+      ErrorSeverity.MEDIUM,
+      {
+        job_id: jobId,
+        stage,
+      },
+      correlationId,
+    );
     throw error;
   }
   logInfo("Job stage updated", {
     job_id: jobId,
-    stage
+    stage,
   }, correlationId);
 }
 async function processTriageStage(job, correlationId) {
   logInfo("Processing triage stage", {
     job_id: job.id,
-    cluster_id: job.cluster_id
+    cluster_id: job.cluster_id,
   }, correlationId);
-  const { cluster, candidates } = await loadClusterContext(job, correlationId);
-  const triage = await triageAndNormalize(cluster, candidates, correlationId);
+  const { cluster, candidates, reenrichment } = await loadClusterContext(
+    job,
+    correlationId,
+  );
+  if (reenrichment) {
+    logInfo("Re-enrichment context detected", {
+      cluster_id: cluster.id,
+      has_prior_result: !!reenrichment.prior_result_id,
+      has_reviewer_notes: !!reenrichment.reviewer_notes,
+      rejection_reason: reenrichment.rejection_reason,
+    }, correlationId);
+  }
+  const triage = await triageAndNormalize(
+    cluster,
+    candidates,
+    correlationId,
+    reenrichment,
+  );
+  const candidateContext = buildCandidateContext(candidates, correlationId);
   // Store minimal candidate data (first 5) to keep stage_data small
-  const minimalCandidates = candidates.slice(0, 5).map((c)=>({
-      id: c.id,
-      roaster: c.roaster,
-      coffee_bean_name: c.coffee_bean_name,
-      google_search_results: c.google_search_results,
-      bean_search_results: c.bean_search_results,
-      cluster_id: c.cluster_id
-    }));
+  const minimalCandidates = candidates.slice(0, 5).map((c) => ({
+    id: c.id,
+    roaster: c.roaster,
+    coffee_bean_name: c.coffee_bean_name,
+    similar_candidates: c.similar_candidates,
+    google_search_results: c.google_search_results,
+    bean_search_results: c.bean_search_results,
+    location: c.location,
+    notes: c.notes,
+    cluster_id: c.cluster_id,
+  }));
   // Collect URLs from candidates
   const urls = collectCandidateUrls(candidates, correlationId);
   // Advance to fetch-candidates stage - include cluster and URLs to avoid re-fetching
-  await updateJobStage(job.id, "fetch-candidates", {
+  await updateJobStage(job, "fetch-candidates", {
     triage,
     cluster: {
       id: cluster.id,
@@ -741,52 +1134,65 @@ async function processTriageStage(job, correlationId) {
       occurrences: cluster.occurrences,
       status: cluster.status,
       best_match_roaster_id: cluster.best_match_roaster_id,
-      confidence: cluster.confidence
+      confidence: cluster.confidence,
     },
     candidates: minimalCandidates,
+    candidate_context: candidateContext,
     candidate_urls: urls,
-    fetched_pages: []
+    fetched_pages: [],
+    reenrichment: reenrichment ?? null,
   }, correlationId);
   logInfo("Triage stage completed, advanced to fetch-candidates", {
     job_id: job.id,
-    url_count: urls.length
+    url_count: urls.length,
   }, correlationId);
   return {
-    nextStage: "fetch-candidates"
+    nextStage: "fetch-candidates",
   };
 }
 async function processEvidenceStage(job, correlationId) {
   logInfo("Processing evidence stage (legacy)", {
     job_id: job.id,
-    cluster_id: job.cluster_id
+    cluster_id: job.cluster_id,
   }, correlationId);
   // Load stage data from triage
   const stageData = job.stage_data;
   const { triage, candidates, cluster } = stageData;
   // Use candidates from stage_data instead of re-fetching
   const urls = collectCandidateUrls(candidates, correlationId);
-  const evidenceBundle = await buildEvidenceBundle(urls, correlationId);
+  const baseEvidenceBundle = await buildEvidenceBundle(urls, correlationId);
+  const candidateContext = stageData.candidate_context ??
+    buildCandidateContext(candidates ?? [], correlationId);
+  const evidenceBundle = {
+    ...baseEvidenceBundle,
+    candidate_context: candidateContext,
+    addresses: uniqueStrings([
+      ...baseEvidenceBundle.addresses,
+      ...(candidateContext?.initial_locations ?? []),
+    ]),
+  };
   // Advance to summary stage - pass cluster through
-  await updateJobStage(job.id, "summary", {
+  await updateJobStage(job, "summary", {
     triage,
     cluster,
+    candidate_context: candidateContext,
     urls,
-    evidence_bundle: evidenceBundle
+    evidence_bundle: evidenceBundle,
   }, correlationId);
   logInfo("Evidence stage completed, advanced to summary", {
     job_id: job.id,
     url_count: urls.length,
-    page_count: evidenceBundle.pages.length
+    page_count: evidenceBundle.pages.length,
   }, correlationId);
   return {
-    nextStage: "summary"
+    nextStage: "summary",
   };
 }
 // ==================== NEW MICRO-STAGE HANDLERS ====================
 async function processFetchCandidatesStage(job, correlationId) {
   logInfo("Processing fetch-candidates stage", {
     job_id: job.id,
-    cluster_id: job.cluster_id
+    cluster_id: job.cluster_id,
   }, correlationId);
   const stageData = job.stage_data;
   const { candidate_urls: urls } = stageData;
@@ -796,7 +1202,7 @@ async function processFetchCandidatesStage(job, correlationId) {
   // For backward compatibility: resume from already fetched count if no progress tracked
   const progress = stageData.fetch_progress ?? {
     next_index: fetchedPages.length,
-    total_urls: urls.length
+    total_urls: urls.length,
   };
   // Calculate batch range
   const startIndex = progress.next_index;
@@ -806,40 +1212,44 @@ async function processFetchCandidatesStage(job, correlationId) {
     batch_start: startIndex,
     batch_end: endIndex - 1,
     total_urls: progress.total_urls,
-    already_fetched: fetchedPages.length
+    already_fetched: fetchedPages.length,
   }, correlationId);
   // Fetch only this batch
-  for(let i = startIndex; i < endIndex; i++){
+  for (let i = startIndex; i < endIndex; i++) {
     const url = urls[i];
     logInfo(`Fetching candidate URL ${i + 1}/${urls.length}`, {
-      url
+      url,
     }, correlationId);
     try {
       const response = await fetchWithRetry(url, {
         method: "GET",
         redirect: "follow",
         headers: {
-          "User-Agent": "timer.coffee/1.0 (admin@timer.coffee)"
-        }
+          "User-Agent": "timer.coffee/1.0 (admin@timer.coffee)",
+        },
       }, {
         maxAttempts: 2,
         correlationId,
         label: "fetch_candidate",
-        timeoutMs: FETCH_TIMEOUT_MS
+        timeoutMs: FETCH_TIMEOUT_MS,
       });
       if (response.ok) {
-        const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
-        if (contentType && !contentType.includes("text/html") && !contentType.includes("application/xhtml+xml")) {
+        const contentType =
+          response.headers.get("content-type")?.toLowerCase() ?? "";
+        if (
+          contentType && !contentType.includes("text/html") &&
+          !contentType.includes("application/xhtml+xml")
+        ) {
           logWarning("Skipping non-HTML candidate URL", {
             url,
             status: response.status,
-            content_type: contentType
+            content_type: contentType,
           }, correlationId);
           fetchedPages.push({
             url,
             html: "",
             status: response.status,
-            fetched_at: new Date().toISOString()
+            fetched_at: new Date().toISOString(),
           });
           continue;
         }
@@ -848,35 +1258,35 @@ async function processFetchCandidatesStage(job, correlationId) {
           url,
           html,
           status: response.status,
-          fetched_at: new Date().toISOString()
+          fetched_at: new Date().toISOString(),
         });
         logInfo(`Successfully fetched candidate URL`, {
           url,
           status: response.status,
-          size: html.length
+          size: html.length,
         }, correlationId);
       } else {
         logWarning(`Candidate URL fetch failed`, {
           url,
-          status: response.status
+          status: response.status,
         }, correlationId);
         fetchedPages.push({
           url,
           html: "",
           status: response.status,
-          fetched_at: new Date().toISOString()
+          fetched_at: new Date().toISOString(),
         });
       }
     } catch (error) {
       logWarning(`Candidate URL fetch error`, {
         url,
-        error: getErrorMessage(error)
+        error: getErrorMessage(error),
       }, correlationId);
       fetchedPages.push({
         url,
         html: "",
         status: 0,
-        fetched_at: new Date().toISOString()
+        fetched_at: new Date().toISOString(),
       });
     }
   }
@@ -885,45 +1295,45 @@ async function processFetchCandidatesStage(job, correlationId) {
   const hasMoreUrls = nextIndex < progress.total_urls;
   if (hasMoreUrls) {
     // Stay in fetch-candidates stage, update progress
-    await updateJobStage(job.id, "fetch-candidates", {
+    await updateJobStage(job, "fetch-candidates", {
       ...stageData,
       fetched_pages: fetchedPages,
       fetch_progress: {
         next_index: nextIndex,
-        total_urls: progress.total_urls
-      }
+        total_urls: progress.total_urls,
+      },
     }, correlationId);
     logInfo("Fetch-candidates batch complete, more URLs pending", {
       job_id: job.id,
       fetched_count: fetchedPages.length,
       next_index: nextIndex,
-      total_urls: progress.total_urls
+      total_urls: progress.total_urls,
     }, correlationId);
     return {
-      nextStage: "fetch-candidates"
+      nextStage: "fetch-candidates",
     };
   } else {
     // All URLs fetched, advance to parse-candidates
     // Clean up progress tracking from stage_data
     const { fetch_progress: _, ...stageDataWithoutProgress } = stageData;
-    await updateJobStage(job.id, "parse-candidates", {
+    await updateJobStage(job, "parse-candidates", {
       ...stageDataWithoutProgress,
-      fetched_pages: fetchedPages
+      fetched_pages: fetchedPages,
     }, correlationId);
     logInfo("Fetch-candidates stage completed, advanced to parse-candidates", {
       job_id: job.id,
       fetched_count: fetchedPages.length,
-      total_urls: progress.total_urls
+      total_urls: progress.total_urls,
     }, correlationId);
     return {
-      nextStage: "parse-candidates"
+      nextStage: "parse-candidates",
     };
   }
 }
 async function processParseCandidatesStage(job, correlationId) {
   logInfo("Processing parse-candidates stage", {
     job_id: job.id,
-    cluster_id: job.cluster_id
+    cluster_id: job.cluster_id,
   }, correlationId);
   const stageData = job.stage_data;
   const { fetched_pages: fetchedPages } = stageData;
@@ -933,40 +1343,47 @@ async function processParseCandidatesStage(job, correlationId) {
   // For backward compatibility: resume from already parsed count if no progress tracked
   const progress = stageData.parse_progress ?? {
     next_index: parsedPages.length,
-    total_pages: fetchedPages.length
+    total_pages: fetchedPages.length,
   };
   // Calculate batch range
   const startIndex = progress.next_index;
-  const endIndex = Math.min(startIndex + PARSE_BATCH_SIZE, progress.total_pages);
+  const endIndex = Math.min(
+    startIndex + PARSE_BATCH_SIZE,
+    progress.total_pages,
+  );
   logInfo("Parsing candidate pages batch", {
     job_id: job.id,
     batch_start: startIndex,
     batch_end: endIndex - 1,
     total_pages: progress.total_pages,
-    already_parsed: parsedPages.length
+    already_parsed: parsedPages.length,
   }, correlationId);
   // Process only this batch
-  for(let i = startIndex; i < endIndex; i++){
+  for (let i = startIndex; i < endIndex; i++) {
     const fetched = fetchedPages[i];
     if (!fetched.html) {
       logWarning(`Skipping empty HTML for URL`, {
         url: fetched.url,
-        index: i
+        index: i,
       }, correlationId);
       continue;
     }
     try {
-      const page = await parsePageWithLLM(fetched.url, fetched.html, correlationId);
+      const page = await parsePageWithLLM(
+        fetched.url,
+        fetched.html,
+        correlationId,
+      );
       parsedPages.push({
         url: fetched.url,
-        page: sanitizeParsedPage(page)
+        page: sanitizeParsedPage(page),
       });
       logInfo(`Parsed candidate page`, {
         url: fetched.url,
         index: i,
         title: page.title,
         logo_count: page.logos.length,
-        address_count: page.addresses.length
+        address_count: page.addresses.length,
       }, correlationId);
     } catch (error) {
       const details = getErrorDetails(error);
@@ -978,7 +1395,7 @@ async function processParseCandidatesStage(job, correlationId) {
         error: details.message,
         error_type: details.type,
         error_name: details.name,
-        error_raw: details.raw
+        error_raw: details.raw,
       }, correlationId);
     }
   }
@@ -987,45 +1404,45 @@ async function processParseCandidatesStage(job, correlationId) {
   const hasMorePages = nextIndex < progress.total_pages;
   if (hasMorePages) {
     // Stay in parse-candidates stage, update progress
-    await updateJobStage(job.id, "parse-candidates", {
+    await updateJobStage(job, "parse-candidates", {
       ...stageData,
       parsed_pages: parsedPages,
       parse_progress: {
         next_index: nextIndex,
-        total_pages: progress.total_pages
-      }
+        total_pages: progress.total_pages,
+      },
     }, correlationId);
     logInfo("Parse-candidates batch complete, more pages pending", {
       job_id: job.id,
       parsed_count: parsedPages.length,
       next_index: nextIndex,
-      total_pages: progress.total_pages
+      total_pages: progress.total_pages,
     }, correlationId);
     return {
-      nextStage: "parse-candidates"
+      nextStage: "parse-candidates",
     };
   } else {
     // All pages parsed, advance to discover-links
     // Clean up progress tracking from stage_data
     const { parse_progress: _, ...stageDataWithoutProgress } = stageData;
-    await updateJobStage(job.id, "discover-links", {
+    await updateJobStage(job, "discover-links", {
       ...stageDataWithoutProgress,
-      parsed_pages: parsedPages
+      parsed_pages: parsedPages,
     }, correlationId);
     logInfo("Parse-candidates stage completed, advanced to discover-links", {
       job_id: job.id,
       parsed_count: parsedPages.length,
-      total_pages: progress.total_pages
+      total_pages: progress.total_pages,
     }, correlationId);
     return {
-      nextStage: "discover-links"
+      nextStage: "discover-links",
     };
   }
 }
 async function processDiscoverLinksStage(job, correlationId) {
   logInfo("Processing discover-links stage", {
     job_id: job.id,
-    cluster_id: job.cluster_id
+    cluster_id: job.cluster_id,
   }, correlationId);
   const stageData = job.stage_data;
   const { parsed_pages: parsedPages, candidate_urls: urls } = stageData;
@@ -1033,29 +1450,32 @@ async function processDiscoverLinksStage(job, correlationId) {
   const domainCounts = new Map();
   const discoveredUrls = [];
   // Count existing URLs per domain
-  for (const url of urls){
+  for (const url of urls) {
     const domain = extractDomain(url);
     if (domain) {
       domainCounts.set(domain, (domainCounts.get(domain) ?? 0) + 1);
     }
   }
   // Discover internal links from parsed pages
-  for (const parsed of parsedPages){
+  for (const parsed of parsedPages) {
     if (!parsed.page) continue;
     // Re-fetch to get raw HTML for link extraction (we only stored parsed data)
     // Actually, we need the raw HTML - let's use the fetched_pages from stage data
-    const fetchedPage = stageData.fetched_pages.find((fp)=>fp.url === parsed.url);
+    const fetchedPage = stageData.fetched_pages.find((fp) =>
+      fp.url === parsed.url
+    );
     if (!fetchedPage || !fetchedPage.html) continue;
-    const internalLinks = extractInternalLinks(parsed.url, fetchedPage.html).filter((link)=>{
-      const domain = extractDomain(link);
-      if (!domain || isAggregatorDomain(domain)) return false;
-      if (!isAddressPageCandidate(new URL(link).pathname)) return false;
-      const domainCount = domainCounts.get(domain) ?? 0;
-      if (domainCount >= MAX_PAGES_PER_DOMAIN) return false;
-      if (seenUrls.has(link)) return false;
-      return true;
-    });
-    for (const link of internalLinks){
+    const internalLinks = extractInternalLinks(parsed.url, fetchedPage.html)
+      .filter((link) => {
+        const domain = extractDomain(link);
+        if (!domain || isAggregatorDomain(domain)) return false;
+        if (!isAddressPageCandidate(new URL(link).pathname)) return false;
+        const domainCount = domainCounts.get(domain) ?? 0;
+        if (domainCount >= MAX_PAGES_PER_DOMAIN) return false;
+        if (seenUrls.has(link)) return false;
+        return true;
+      });
+    for (const link of internalLinks) {
       if (discoveredUrls.length >= MAX_TOTAL_DISCOVERED_PAGES) break;
       const domain = extractDomain(link);
       if (!domain) continue;
@@ -1070,26 +1490,27 @@ async function processDiscoverLinksStage(job, correlationId) {
   logInfo("Discovered internal links", {
     job_id: job.id,
     discovered_count: discoveredUrls.length,
-    discovered_urls: discoveredUrls
+    discovered_urls: discoveredUrls,
   }, correlationId);
   // Advance to fetch-discovered stage - drop raw HTML since it's no longer needed
-  const { fetched_pages: _fetchedPages, ...stageDataWithoutFetchedPages } = stageData;
-  await updateJobStage(job.id, "fetch-discovered", {
+  const { fetched_pages: _fetchedPages, ...stageDataWithoutFetchedPages } =
+    stageData;
+  await updateJobStage(job, "fetch-discovered", {
     ...stageDataWithoutFetchedPages,
-    discovered_urls: discoveredUrls
+    discovered_urls: discoveredUrls,
   }, correlationId);
   logInfo("Discover-links stage completed, advanced to fetch-discovered", {
     job_id: job.id,
-    discovered_count: discoveredUrls.length
+    discovered_count: discoveredUrls.length,
   }, correlationId);
   return {
-    nextStage: "fetch-discovered"
+    nextStage: "fetch-discovered",
   };
 }
 async function processFetchDiscoveredStage(job, correlationId) {
   logInfo("Processing fetch-discovered stage", {
     job_id: job.id,
-    cluster_id: job.cluster_id
+    cluster_id: job.cluster_id,
   }, correlationId);
   const stageData = job.stage_data;
   const { discovered_urls: urls } = stageData;
@@ -1099,7 +1520,7 @@ async function processFetchDiscoveredStage(job, correlationId) {
   // For backward compatibility: resume from already fetched count if no progress tracked
   const progress = stageData.fetch_discovered_progress ?? {
     next_index: fetchedDiscovered.length,
-    total_urls: urls.length
+    total_urls: urls.length,
   };
   // Calculate batch range
   const startIndex = progress.next_index;
@@ -1109,40 +1530,44 @@ async function processFetchDiscoveredStage(job, correlationId) {
     batch_start: startIndex,
     batch_end: endIndex - 1,
     total_urls: progress.total_urls,
-    already_fetched: fetchedDiscovered.length
+    already_fetched: fetchedDiscovered.length,
   }, correlationId);
   // Fetch only this batch
-  for(let i = startIndex; i < endIndex; i++){
+  for (let i = startIndex; i < endIndex; i++) {
     const url = urls[i];
     logInfo(`Fetching discovered URL ${i + 1}/${urls.length}`, {
-      url
+      url,
     }, correlationId);
     try {
       const response = await fetchWithRetry(url, {
         method: "GET",
         redirect: "follow",
         headers: {
-          "User-Agent": "timer.coffee/1.0 (admin@timer.coffee)"
-        }
+          "User-Agent": "timer.coffee/1.0 (admin@timer.coffee)",
+        },
       }, {
         maxAttempts: 2,
         correlationId,
         label: "fetch_discovered",
-        timeoutMs: FETCH_TIMEOUT_MS
+        timeoutMs: FETCH_TIMEOUT_MS,
       });
       if (response.ok) {
-        const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
-        if (contentType && !contentType.includes("text/html") && !contentType.includes("application/xhtml+xml")) {
+        const contentType =
+          response.headers.get("content-type")?.toLowerCase() ?? "";
+        if (
+          contentType && !contentType.includes("text/html") &&
+          !contentType.includes("application/xhtml+xml")
+        ) {
           logWarning("Skipping non-HTML discovered URL", {
             url,
             status: response.status,
-            content_type: contentType
+            content_type: contentType,
           }, correlationId);
           fetchedDiscovered.push({
             url,
             html: "",
             status: response.status,
-            fetched_at: new Date().toISOString()
+            fetched_at: new Date().toISOString(),
           });
           continue;
         }
@@ -1151,35 +1576,35 @@ async function processFetchDiscoveredStage(job, correlationId) {
           url,
           html,
           status: response.status,
-          fetched_at: new Date().toISOString()
+          fetched_at: new Date().toISOString(),
         });
         logInfo(`Successfully fetched discovered URL`, {
           url,
           status: response.status,
-          size: html.length
+          size: html.length,
         }, correlationId);
       } else {
         logWarning(`Discovered URL fetch failed`, {
           url,
-          status: response.status
+          status: response.status,
         }, correlationId);
         fetchedDiscovered.push({
           url,
           html: "",
           status: response.status,
-          fetched_at: new Date().toISOString()
+          fetched_at: new Date().toISOString(),
         });
       }
     } catch (error) {
       logWarning(`Discovered URL fetch error`, {
         url,
-        error: getErrorMessage(error)
+        error: getErrorMessage(error),
       }, correlationId);
       fetchedDiscovered.push({
         url,
         html: "",
         status: 0,
-        fetched_at: new Date().toISOString()
+        fetched_at: new Date().toISOString(),
       });
     }
   }
@@ -1188,45 +1613,46 @@ async function processFetchDiscoveredStage(job, correlationId) {
   const hasMoreUrls = nextIndex < progress.total_urls;
   if (hasMoreUrls) {
     // Stay in fetch-discovered stage, update progress
-    await updateJobStage(job.id, "fetch-discovered", {
+    await updateJobStage(job, "fetch-discovered", {
       ...stageData,
       fetched_discovered: fetchedDiscovered,
       fetch_discovered_progress: {
         next_index: nextIndex,
-        total_urls: progress.total_urls
-      }
+        total_urls: progress.total_urls,
+      },
     }, correlationId);
     logInfo("Fetch-discovered batch complete, more URLs pending", {
       job_id: job.id,
       fetched_count: fetchedDiscovered.length,
       next_index: nextIndex,
-      total_urls: progress.total_urls
+      total_urls: progress.total_urls,
     }, correlationId);
     return {
-      nextStage: "fetch-discovered"
+      nextStage: "fetch-discovered",
     };
   } else {
     // All URLs fetched, advance to parse-discovered
     // Clean up progress tracking from stage_data
-    const { fetch_discovered_progress: _, ...stageDataWithoutProgress } = stageData;
-    await updateJobStage(job.id, "parse-discovered", {
+    const { fetch_discovered_progress: _, ...stageDataWithoutProgress } =
+      stageData;
+    await updateJobStage(job, "parse-discovered", {
       ...stageDataWithoutProgress,
-      fetched_discovered: fetchedDiscovered
+      fetched_discovered: fetchedDiscovered,
     }, correlationId);
     logInfo("Fetch-discovered stage completed, advanced to parse-discovered", {
       job_id: job.id,
       fetched_count: fetchedDiscovered.length,
-      total_urls: progress.total_urls
+      total_urls: progress.total_urls,
     }, correlationId);
     return {
-      nextStage: "parse-discovered"
+      nextStage: "parse-discovered",
     };
   }
 }
 async function processParseDiscoveredStage(job, correlationId) {
   logInfo("Processing parse-discovered stage", {
     job_id: job.id,
-    cluster_id: job.cluster_id
+    cluster_id: job.cluster_id,
   }, correlationId);
   const stageData = job.stage_data;
   const { fetched_discovered: fetchedDiscovered } = stageData;
@@ -1236,46 +1662,53 @@ async function processParseDiscoveredStage(job, correlationId) {
   // For backward compatibility: resume from already parsed count if no progress tracked
   const progress = stageData.parse_progress ?? {
     next_index: parsedDiscovered.length,
-    total_pages: fetchedDiscovered.length
+    total_pages: fetchedDiscovered.length,
   };
   // Calculate batch range
   const startIndex = progress.next_index;
-  const endIndex = Math.min(startIndex + PARSE_BATCH_SIZE, progress.total_pages);
+  const endIndex = Math.min(
+    startIndex + PARSE_BATCH_SIZE,
+    progress.total_pages,
+  );
   logInfo("Parsing discovered pages batch", {
     job_id: job.id,
     batch_start: startIndex,
     batch_end: endIndex - 1,
     total_pages: progress.total_pages,
-    already_parsed: parsedDiscovered.length
+    already_parsed: parsedDiscovered.length,
   }, correlationId);
   // Process only this batch
-  for(let i = startIndex; i < endIndex; i++){
+  for (let i = startIndex; i < endIndex; i++) {
     const fetched = fetchedDiscovered[i];
     if (!fetched.html) {
       logWarning(`Skipping empty HTML for discovered URL`, {
         url: fetched.url,
-        index: i
+        index: i,
       }, correlationId);
       continue;
     }
     try {
-      const page = await parsePageWithLLM(fetched.url, fetched.html, correlationId);
+      const page = await parsePageWithLLM(
+        fetched.url,
+        fetched.html,
+        correlationId,
+      );
       parsedDiscovered.push({
         url: fetched.url,
-        page: sanitizeParsedPage(page)
+        page: sanitizeParsedPage(page),
       });
       logInfo(`Parsed discovered page`, {
         url: fetched.url,
         index: i,
         title: page.title,
         logo_count: page.logos.length,
-        address_count: page.addresses.length
+        address_count: page.addresses.length,
       }, correlationId);
     } catch (error) {
       logWarning(`Failed to parse discovered page`, {
         url: fetched.url,
         index: i,
-        error: getErrorMessage(error)
+        error: getErrorMessage(error),
       }, correlationId);
     }
   }
@@ -1284,58 +1717,75 @@ async function processParseDiscoveredStage(job, correlationId) {
   const hasMorePages = nextIndex < progress.total_pages;
   if (hasMorePages) {
     // Stay in parse-discovered stage, update progress
-    await updateJobStage(job.id, "parse-discovered", {
+    await updateJobStage(job, "parse-discovered", {
       ...stageData,
       parsed_discovered: parsedDiscovered,
       parse_progress: {
         next_index: nextIndex,
-        total_pages: progress.total_pages
-      }
+        total_pages: progress.total_pages,
+      },
     }, correlationId);
     logInfo("Parse-discovered batch complete, more pages pending", {
       job_id: job.id,
       parsed_count: parsedDiscovered.length,
       next_index: nextIndex,
-      total_pages: progress.total_pages
+      total_pages: progress.total_pages,
     }, correlationId);
     return {
-      nextStage: "parse-discovered"
+      nextStage: "parse-discovered",
     };
   } else {
     // All pages parsed, advance to aggregate-evidence - drop raw HTML blobs no longer needed
-    const { parse_progress: _, fetched_discovered: _fd, fetched_pages: _fp, ...stageDataWithoutProgress } = stageData;
-    await updateJobStage(job.id, "aggregate-evidence", {
+    const {
+      parse_progress: _,
+      fetched_discovered: _fd,
+      fetched_pages: _fp,
+      ...stageDataWithoutProgress
+    } = stageData;
+    await updateJobStage(job, "aggregate-evidence", {
       ...stageDataWithoutProgress,
-      parsed_discovered: parsedDiscovered
+      parsed_discovered: parsedDiscovered,
     }, correlationId);
-    logInfo("Parse-discovered stage completed, advanced to aggregate-evidence", {
-      job_id: job.id,
-      parsed_count: parsedDiscovered.length,
-      total_pages: progress.total_pages
-    }, correlationId);
+    logInfo(
+      "Parse-discovered stage completed, advanced to aggregate-evidence",
+      {
+        job_id: job.id,
+        parsed_count: parsedDiscovered.length,
+        total_pages: progress.total_pages,
+      },
+      correlationId,
+    );
     return {
-      nextStage: "aggregate-evidence"
+      nextStage: "aggregate-evidence",
     };
   }
 }
 async function processAggregateEvidenceStage(job, correlationId) {
   logInfo("Processing aggregate-evidence stage", {
     job_id: job.id,
-    cluster_id: job.cluster_id
+    cluster_id: job.cluster_id,
   }, correlationId);
   const stageData = job.stage_data;
-  const { triage, cluster, parsed_pages: parsedPages, parsed_discovered: parsedDiscovered, candidate_urls: urls, discovered_urls: discoveredUrls } = stageData;
+  const {
+    triage,
+    cluster,
+    parsed_pages: parsedPages,
+    parsed_discovered: parsedDiscovered,
+    candidate_urls: urls,
+    discovered_urls: discoveredUrls,
+    candidate_context: candidateContext,
+  } = stageData;
   // Combine all pages
   const allPages = [
-    ...parsedPages.map((p)=>p.page),
-    ...parsedDiscovered.map((p)=>p.page)
+    ...parsedPages.map((p) => p.page),
+    ...parsedDiscovered.map((p) => p.page),
   ];
   // Aggregate data
   const allLogos = [];
   const allAddresses = [];
   const allNames = [];
   const allJsonLd = [];
-  for (const page of allPages){
+  for (const page of allPages) {
     allLogos.push(...page.logos);
     allAddresses.push(...page.addresses);
     allNames.push(...page.names);
@@ -1344,137 +1794,176 @@ async function processAggregateEvidenceStage(job, correlationId) {
   const evidenceBundle = {
     urls: uniqueStrings([
       ...urls,
-      ...discoveredUrls ?? []
+      ...(discoveredUrls ?? []),
     ]),
     pages: allPages,
     jsonLd: allJsonLd,
     logos: uniqueStrings(allLogos),
-    addresses: uniqueStrings(allAddresses),
-    names: uniqueStrings(allNames)
+    addresses: uniqueStrings([
+      ...allAddresses,
+      ...(candidateContext?.initial_locations ?? []),
+    ]),
+    names: uniqueStrings(allNames),
+    candidate_context: candidateContext ?? null,
   };
   logInfo("Evidence aggregated", {
     job_id: job.id,
     total_pages: allPages.length,
     logo_count: evidenceBundle.logos.length,
-    address_count: evidenceBundle.addresses.length
+    address_count: evidenceBundle.addresses.length,
   }, correlationId);
   // Advance to summary stage
-  await updateJobStage(job.id, "summary", {
+  await updateJobStage(job, "summary", {
     triage,
     cluster,
+    candidate_context: candidateContext ?? null,
     urls: evidenceBundle.urls,
-    evidence_bundle: evidenceBundle
+    evidence_bundle: evidenceBundle,
   }, correlationId);
   logInfo("Aggregate-evidence stage completed, advanced to summary", {
     job_id: job.id,
     url_count: evidenceBundle.urls.length,
-    page_count: evidenceBundle.pages.length
+    page_count: evidenceBundle.pages.length,
   }, correlationId);
   return {
-    nextStage: "summary"
+    nextStage: "summary",
   };
 }
 async function processSummaryStage(job, correlationId) {
   logInfo("Processing summary stage", {
     job_id: job.id,
-    cluster_id: job.cluster_id
+    cluster_id: job.cluster_id,
   }, correlationId);
   // Load stage data from evidence
   const stageData = job.stage_data;
-  const { triage, urls, evidence_bundle: evidenceBundle, cluster } = stageData;
+  const {
+    triage,
+    urls,
+    evidence_bundle: evidenceBundle,
+    cluster,
+    candidate_context: candidateContext,
+  } = stageData;
+  const reenrichment = stageData.reenrichment ?? null;
   // Run DeepSeek summarization
-  const evidenceSummary = await summarizeEvidenceWithDeepSeek(evidenceBundle, triage, correlationId);
+  const evidenceSummary = await summarizeEvidenceWithDeepSeek(
+    evidenceBundle,
+    triage,
+    correlationId,
+    undefined,
+    reenrichment,
+  );
   // Advance to extract stage - pass cluster through
-  await updateJobStage(job.id, "extract", {
+  await updateJobStage(job, "extract", {
     triage,
     evidence_summary: evidenceSummary,
     evidence_bundle_urls: urls,
-    cluster
+    cluster,
+    candidate_context: candidateContext ?? null,
   }, correlationId);
   logInfo("Summary stage completed, advanced to extract", {
     job_id: job.id,
     website: evidenceSummary.website,
     logo_count: evidenceSummary.logos.length,
-    address_count: evidenceSummary.addresses.length
+    address_count: evidenceSummary.addresses.length,
   }, correlationId);
   return {
-    nextStage: "extract"
+    nextStage: "extract",
   };
 }
 async function processExtractStage(job, correlationId) {
   logInfo("Processing extract stage", {
     job_id: job.id,
-    cluster_id: job.cluster_id
+    cluster_id: job.cluster_id,
   }, correlationId);
   // Load stage data from summary
   const stageData = job.stage_data;
-  const { triage, evidence_summary, evidence_bundle_urls: urls, cluster } = stageData;
+  const {
+    triage,
+    evidence_summary,
+    evidence_bundle_urls: urls,
+    cluster,
+    candidate_context: candidateContext,
+  } = stageData;
+  const reenrichment = stageData.reenrichment ?? null;
   // Run GPT extraction
-  const extraction = await extractWithOpenAI(evidence_summary, triage, correlationId);
+  const extraction = await extractWithOpenAI(
+    evidence_summary,
+    triage,
+    correlationId,
+    reenrichment,
+    candidateContext ?? null,
+  );
   // Advance to validate stage - pass cluster through
-  await updateJobStage(job.id, "validate", {
+  await updateJobStage(job, "validate", {
     triage,
     evidence_summary,
     extraction,
     urls,
-    cluster
+    cluster,
+    candidate_context: candidateContext ?? null,
   }, correlationId);
   logInfo("Extract stage completed, advanced to validate", {
     job_id: job.id,
     confidence: extraction.confidence,
-    proposed_name: extraction.proposed.roaster_name
+    proposed_name: extraction.proposed.roaster_name,
   }, correlationId);
   return {
-    nextStage: "validate"
+    nextStage: "validate",
   };
 }
 async function translateLocationToEnglish(city, country, correlationId) {
   if (!city && !country) {
     return {
       city: null,
-      country: null
+      country: null,
     };
   }
   logInfo("Translating location to English", {
     city,
-    country
+    country,
   }, correlationId);
   try {
-    const response = await fetchWithRetry("https://api.openai.com/v1/responses", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${openaiApiKey}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        model: "gpt-5.2",
-        text: {
-          format: {
-            type: "json_object"
-          }
+    const response = await fetchWithRetry(
+      "https://api.openai.com/v1/responses",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${openaiApiKey}`,
+          "Content-Type": "application/json",
         },
-        input: `Translate these location names to English. Return ONLY JSON with keys: {"city": string|null, "country": string|null}
+        body: JSON.stringify({
+          model: "gpt-5.2",
+          text: {
+            format: {
+              type: "json_object",
+            },
+          },
+          input:
+            `Translate these location names to English. Return ONLY JSON with keys: {"city": string|null, "country": string|null}
 City: ${city || "null"}
-Country: ${country || "null"}`
-      })
-    }, {
-      correlationId,
-      label: "translate_location",
-      timeoutMs: AI_API_TIMEOUT_MS
-    });
+Country: ${country || "null"}`,
+        }),
+      },
+      {
+        correlationId,
+        label: "translate_location",
+        timeoutMs: AI_API_TIMEOUT_MS,
+      },
+    );
     if (!response.ok) {
       logWarning("Location translation failed, using original", {
         city,
         country,
-        status: response.status
+        status: response.status,
       }, correlationId);
       return {
         city,
-        country
+        country,
       };
     }
     const json = await response.json();
-    const outputText = json?.output_text ?? json?.output?.[0]?.content?.[0]?.text ?? "{}";
+    const outputText = json?.output_text ??
+      json?.output?.[0]?.content?.[0]?.text ?? "{}";
     const parsed = parseModelJson(outputText, {});
     const translatedCity = parsed.city ?? city;
     const translatedCountry = parsed.country ?? country;
@@ -1482,33 +1971,39 @@ Country: ${country || "null"}`
       original_city: city,
       translated_city: translatedCity,
       original_country: country,
-      translated_country: translatedCountry
+      translated_country: translatedCountry,
     }, correlationId);
     return {
       city: translatedCity,
-      country: translatedCountry
+      country: translatedCountry,
     };
   } catch (error) {
     logWarning("Location translation error, using original", {
       city,
       country,
-      error: getErrorMessage(error)
+      error: getErrorMessage(error),
     }, correlationId);
     return {
       city,
-      country
+      country,
     };
   }
 }
 async function processValidateStage(job, correlationId) {
   logInfo("Processing validate stage", {
     job_id: job.id,
-    cluster_id: job.cluster_id
+    cluster_id: job.cluster_id,
   }, correlationId);
   // Load stage data from extract
   // Support both new format (with cluster) and legacy format (without cluster)
   const stageData = job.stage_data;
-  const { triage, evidence_summary, extraction, urls } = stageData;
+  const {
+    triage,
+    evidence_summary,
+    extraction,
+    urls,
+    candidate_context: candidateContext,
+  } = stageData;
   // Load cluster from stage_data or fetch it (backward compatibility)
   let cluster;
   if (stageData.cluster) {
@@ -1517,180 +2012,275 @@ async function processValidateStage(job, correlationId) {
     const context = await loadClusterContext(job, correlationId);
     cluster = context.cluster;
   }
+  const reenrichment = stageData.reenrichment ?? null;
   // Run validation if needed
   let validation = undefined;
-  const requiresValidation = needsValidation(extraction);
+  const requiresValidation = needsValidation(extraction) || !!reenrichment;
   if (requiresValidation) {
-    const searchEvidence = buildSearchEvidenceFromCandidates([], correlationId);
-    validation = await validateWithOpenAI(evidence_summary, triage, extraction, searchEvidence, correlationId);
+    const searchEvidence = candidateContext?.search_evidence ??
+      buildSearchEvidenceFromCandidates(
+        stageData.candidates ?? [],
+        correlationId,
+      );
+    validation = await validateWithOpenAI(
+      evidence_summary,
+      triage,
+      extraction,
+      searchEvidence,
+      correlationId,
+      reenrichment,
+      candidateContext ?? null,
+    );
   }
   logInfo("Validation completed", {
     job_id: job.id,
     required_validation: requiresValidation,
-    had_validation: !!validation
+    had_validation: !!validation,
   }, correlationId);
   // Advance to translate-location stage
-  await updateJobStage(job.id, "translate-location", {
+  await updateJobStage(job, "translate-location", {
     triage,
     evidence_summary,
     extraction,
     urls,
     cluster,
+    candidate_context: candidateContext ?? null,
     validation,
-    requires_validation: requiresValidation
+    requires_validation: requiresValidation,
   }, correlationId);
   logInfo("Validate stage completed, advanced to translate-location", {
     job_id: job.id,
-    required_validation: requiresValidation
+    required_validation: requiresValidation,
   }, correlationId);
   return {
-    nextStage: "translate-location"
+    nextStage: "translate-location",
   };
 }
 async function processTranslateLocationStage(job, correlationId) {
   logInfo("Processing translate-location stage", {
     job_id: job.id,
-    cluster_id: job.cluster_id
+    cluster_id: job.cluster_id,
   }, correlationId);
   const stageData = job.stage_data;
-  const { triage, evidence_summary, extraction, urls, cluster, validation, requires_validation } = stageData;
+  const {
+    triage,
+    evidence_summary,
+    extraction,
+    urls,
+    cluster,
+    candidate_context: candidateContext,
+    validation,
+    requires_validation,
+  } = stageData;
   // Determine final proposed fields
   const finalProposed = validation?.proposed ?? {
-    ...extraction.proposed
+    ...extraction.proposed,
   };
   // Translate location to English if needed
   if (finalProposed.city || finalProposed.country) {
-    const translation = await translateLocationToEnglish(finalProposed.city, finalProposed.country, correlationId);
+    const translation = await translateLocationToEnglish(
+      finalProposed.city,
+      finalProposed.country,
+      correlationId,
+    );
     finalProposed.city = translation.city;
     finalProposed.country = translation.country;
   }
   // Determine status and confidence
-  const finalConfidence = validation?.confidence ?? extraction.confidence ?? 0.5;
-  const status = validation?.needs_review || finalConfidence < 0.6 ? "needs_review" : "completed";
+  const finalConfidence = validation?.confidence ?? extraction.confidence ??
+    0.5;
+  const status = validation?.needs_review || finalConfidence < 0.6
+    ? "needs_review"
+    : "completed";
   logInfo("Location translation completed", {
     job_id: job.id,
     city: finalProposed.city,
     country: finalProposed.country,
     status,
-    confidence: finalConfidence
+    confidence: finalConfidence,
   }, correlationId);
   // Advance to find-matches stage
-  await updateJobStage(job.id, "find-matches", {
+  await updateJobStage(job, "find-matches", {
     triage,
     evidence_summary,
     extraction,
     urls,
     cluster,
+    candidate_context: candidateContext ?? null,
     validation,
     requires_validation,
     final_proposed: finalProposed,
     final_confidence: finalConfidence,
-    status
+    status,
   }, correlationId);
   logInfo("Translate-location stage completed, advanced to find-matches", {
     job_id: job.id,
     status,
-    confidence: finalConfidence
+    confidence: finalConfidence,
   }, correlationId);
   return {
-    nextStage: "find-matches"
+    nextStage: "find-matches",
   };
 }
 async function processFindMatchesStage(job, correlationId) {
   logInfo("Processing find-matches stage", {
     job_id: job.id,
-    cluster_id: job.cluster_id
+    cluster_id: job.cluster_id,
   }, correlationId);
   const stageData = job.stage_data;
-  const { triage, evidence_summary, extraction, urls, cluster, validation, requires_validation, final_proposed, final_confidence, status } = stageData;
-  // Find potential roaster matches
-  const potentialMatches = await findPotentialMatches(cluster, triage, correlationId);
-  logInfo("Potential matches found", {
-    job_id: job.id,
-    match_count: potentialMatches.length
-  }, correlationId);
-  // Advance to persist-result stage
-  await updateJobStage(job.id, "persist-result", {
+  const {
     triage,
     evidence_summary,
     extraction,
     urls,
     cluster,
+    candidate_context: candidateContext,
     validation,
     requires_validation,
     final_proposed,
     final_confidence,
     status,
-    potential_matches: potentialMatches
+  } = stageData;
+  // Find potential roaster matches
+  const potentialMatches = await findPotentialMatches(
+    cluster,
+    triage,
+    correlationId,
+  );
+  logInfo("Potential matches found", {
+    job_id: job.id,
+    match_count: potentialMatches.length,
+  }, correlationId);
+  // Advance to persist-result stage
+  await updateJobStage(job, "persist-result", {
+    triage,
+    evidence_summary,
+    extraction,
+    urls,
+    cluster,
+    candidate_context: candidateContext ?? null,
+    validation,
+    requires_validation,
+    final_proposed,
+    final_confidence,
+    status,
+    potential_matches: potentialMatches,
   }, correlationId);
   logInfo("Find-matches stage completed, advanced to persist-result", {
     job_id: job.id,
-    match_count: potentialMatches.length
+    match_count: potentialMatches.length,
   }, correlationId);
   return {
-    nextStage: "persist-result"
+    nextStage: "persist-result",
   };
 }
 async function processPersistResultStage(job, correlationId) {
   logInfo("Processing persist-result stage", {
     job_id: job.id,
-    cluster_id: job.cluster_id
+    cluster_id: job.cluster_id,
   }, correlationId);
   const stageData = job.stage_data;
-  const { triage, extraction, urls, validation, final_proposed, final_confidence, status, potential_matches } = stageData;
+  const {
+    triage,
+    extraction,
+    urls,
+    validation,
+    candidate_context: candidateContext,
+    final_proposed,
+    final_confidence,
+    status,
+    potential_matches,
+  } = stageData;
+  const reenrichment = stageData.reenrichment ?? null;
   // Build signals object
   const signals = {
     models: {
       triage: triage.model,
       evidence: "deepseek-chat",
       extraction: GPT_EXTRACT_MODEL,
-      validation: validation ? "gpt-5.2" : null
+      validation: validation ? "gpt-5.2" : null,
     },
     triage,
     extraction: {
       conflicts: extraction.conflicts,
-      notes: extraction.notes
+      notes: extraction.notes,
     },
-    validation: validation ? {
-      needs_review: validation.needs_review,
-      notes: validation.notes
-    } : null
+    validation: validation
+      ? {
+        needs_review: validation.needs_review,
+        notes: validation.notes,
+      }
+      : null,
+    candidate_context: candidateContext
+      ? {
+        initial_locations: candidateContext.initial_locations ?? [],
+        likely_existing_matches: candidateContext.likely_existing_matches ?? [],
+        search_result_count: candidateContext.search_evidence?.results.length ??
+          0,
+        candidate_count: candidateContext.candidates?.length ?? 0,
+      }
+      : null,
+    reenriched_from: reenrichment
+      ? {
+        prior_result_id: reenrichment.prior_result_id ?? null,
+        rejection_reason: reenrichment.rejection_reason ?? null,
+        reviewer_notes_present: !!reenrichment.reviewer_notes,
+      }
+      : null,
   };
   // Build persisted result
   const persisted = {
     status,
     proposed: final_proposed,
-    sources: urls.map((url)=>({
-        url
-      })),
+    sources: urls.map((url) => ({
+      url,
+    })),
     signals,
     confidence: final_confidence,
-    error: null
+    error: null,
   };
   // Persist result
-  await persistResult(job.cluster_id, persisted, potential_matches, correlationId);
+  await persistResult(
+    job.cluster_id,
+    persisted,
+    potential_matches,
+    correlationId,
+  );
   // Mark job as done
   await updateJobState(job.id, "done", null, correlationId);
   logInfo("Persist-result stage completed, job done", {
     job_id: job.id,
     status,
     confidence: final_confidence,
-    match_count: potential_matches.length
+    match_count: potential_matches.length,
   }, correlationId);
   return persisted;
 }
 // Timeout for stuck jobs (15 minutes)
 const STUCK_JOB_TIMEOUT_MINUTES = 15;
 async function cleanupStuckJobs(correlationId) {
-  const stuckThreshold = new Date(Date.now() - STUCK_JOB_TIMEOUT_MINUTES * 60 * 1000).toISOString();
+  const stuckThreshold = new Date(
+    Date.now() - STUCK_JOB_TIMEOUT_MINUTES * 60 * 1000,
+  ).toISOString();
   logInfo("Checking for stuck enrichment jobs", {
     stuck_threshold: stuckThreshold,
-    timeout_minutes: STUCK_JOB_TIMEOUT_MINUTES
+    timeout_minutes: STUCK_JOB_TIMEOUT_MINUTES,
   }, correlationId);
   // Find jobs stuck in 'running' state for more than the timeout period
-  const { data: stuckJobs, error: fetchError } = await supabase.schema("service").from("roaster_enrichment_jobs").select("id, cluster_id, locked_at, attempts").eq("state", "running").lt("locked_at", stuckThreshold);
+  const { data: stuckJobs, error: fetchError } = await supabase.schema(
+    "service",
+  ).from("roaster_enrichment_jobs").select(
+    "id, cluster_id, locked_at, attempts",
+  ).eq("state", "running").lt("locked_at", stuckThreshold);
   if (fetchError) {
-    logError("Failed to fetch stuck jobs", toError(fetchError), ErrorCategory.DATABASE, ErrorSeverity.MEDIUM, {}, correlationId);
+    logError(
+      "Failed to fetch stuck jobs",
+      toError(fetchError),
+      ErrorCategory.DATABASE,
+      ErrorSeverity.MEDIUM,
+      {},
+      correlationId,
+    );
     return 0;
   }
   if (!stuckJobs || stuckJobs.length === 0) {
@@ -1698,38 +2288,62 @@ async function cleanupStuckJobs(correlationId) {
     return 0;
   }
   logInfo(`Found ${stuckJobs.length} stuck job(s)`, {
-    job_ids: stuckJobs.map((j)=>j.id)
+    job_ids: stuckJobs.map((j) => j.id),
   }, correlationId);
   // Reset stuck jobs to 'queued' state
-  const jobIds = stuckJobs.map((j)=>j.id);
-  const { error: updateError } = await supabase.schema("service").from("roaster_enrichment_jobs").update({
+  const jobIds = stuckJobs.map((j) => j.id);
+  const { error: updateError } = await supabase.schema("service").from(
+    "roaster_enrichment_jobs",
+  ).update({
     state: "queued",
     locked_at: null,
     locked_by: null,
-    last_error: `Auto-reset: job stuck in running state for >${STUCK_JOB_TIMEOUT_MINUTES} minutes`,
-    run_after: new Date().toISOString()
+    last_error:
+      `Auto-reset: job stuck in running state for >${STUCK_JOB_TIMEOUT_MINUTES} minutes`,
+    run_after: new Date().toISOString(),
   }).in("id", jobIds);
   if (updateError) {
-    logError("Failed to reset stuck jobs", toError(updateError), ErrorCategory.DATABASE, ErrorSeverity.HIGH, {
-      job_count: stuckJobs.length
-    }, correlationId);
+    logError(
+      "Failed to reset stuck jobs",
+      toError(updateError),
+      ErrorCategory.DATABASE,
+      ErrorSeverity.HIGH,
+      {
+        job_count: stuckJobs.length,
+      },
+      correlationId,
+    );
     return 0;
   }
-  logInfo(`Successfully reset ${stuckJobs.length} stuck job(s) to queued state`, {
-    job_ids: jobIds
-  }, correlationId);
+  logInfo(
+    `Successfully reset ${stuckJobs.length} stuck job(s) to queued state`,
+    {
+      job_ids: jobIds,
+    },
+    correlationId,
+  );
   return stuckJobs.length;
 }
 async function loadClusterContext(job, correlationId) {
   logInfo("Loading cluster context", {
     job_id: job.id,
-    cluster_id: job.cluster_id
+    cluster_id: job.cluster_id,
   }, correlationId);
-  const { data: cluster, error: clusterError } = await supabase.schema("service").from("roaster_candidate_clusters").select("*").eq("id", job.cluster_id).maybeSingle();
+  const { data: cluster, error: clusterError } = await supabase.schema(
+    "service",
+  ).from("roaster_candidate_clusters").select("*").eq("id", job.cluster_id)
+    .maybeSingle();
   if (clusterError || !cluster) {
-    logError("Failed to load cluster", clusterError ? toError(clusterError) : new Error("Cluster not found"), ErrorCategory.DATABASE, ErrorSeverity.HIGH, {
-      cluster_id: job.cluster_id
-    }, correlationId);
+    logError(
+      "Failed to load cluster",
+      clusterError ? toError(clusterError) : new Error("Cluster not found"),
+      ErrorCategory.DATABASE,
+      ErrorSeverity.HIGH,
+      {
+        cluster_id: job.cluster_id,
+      },
+      correlationId,
+    );
     throw clusterError ?? new Error("Cluster not found");
   }
   logInfo("Cluster loaded", {
@@ -1737,55 +2351,150 @@ async function loadClusterContext(job, correlationId) {
     normalized_name: cluster.normalized_name,
     candidate_count: cluster.candidate_count,
     occurrences: cluster.occurrences,
-    status: cluster.status
+    status: cluster.status,
   }, correlationId);
-  const { data: candidates, error: candidatesError } = await supabase.schema("service").from("new_roaster_candidates").select("*").eq("cluster_id", job.cluster_id).order("inserted_at", {
-    ascending: false
-  });
+  const { data: candidates, error: candidatesError } = await supabase.schema(
+    "service",
+  ).from("new_roaster_candidates").select("*").eq("cluster_id", job.cluster_id)
+    .order("inserted_at", {
+      ascending: false,
+    });
   if (candidatesError) {
-    logError("Failed to load candidates", toError(candidatesError), ErrorCategory.DATABASE, ErrorSeverity.HIGH, {
-      cluster_id: job.cluster_id
-    }, correlationId);
+    logError(
+      "Failed to load candidates",
+      toError(candidatesError),
+      ErrorCategory.DATABASE,
+      ErrorSeverity.HIGH,
+      {
+        cluster_id: job.cluster_id,
+      },
+      correlationId,
+    );
     throw candidatesError;
   }
   logInfo("Cluster candidates loaded", {
     cluster_id: job.cluster_id,
-    candidate_count: (candidates ?? []).length
+    candidate_count: (candidates ?? []).length,
   }, correlationId);
+  const reviewerNotes = typeof job.reviewer_notes === "string"
+    ? job.reviewer_notes
+    : null;
+  const rejectionReason = typeof job.rejection_reason === "string"
+    ? job.rejection_reason
+    : null;
+  const priorResultId = typeof job.prior_result_id === "string"
+    ? job.prior_result_id
+    : null;
+  let priorResult = null;
+  if (priorResultId) {
+    const { data: explicitPrior, error: explicitPriorError } = await supabase
+      .schema("service")
+      .from("roaster_enrichment_results")
+      .select("id, cluster_id, proposed, confidence, status, updated_at")
+      .eq("id", priorResultId)
+      .maybeSingle();
+    if (explicitPriorError) {
+      logWarning("Failed to load explicit prior result", {
+        prior_result_id: priorResultId,
+        error: getErrorMessage(explicitPriorError),
+      }, correlationId);
+    } else if (explicitPrior && explicitPrior.cluster_id !== job.cluster_id) {
+      logWarning("Prior result cluster mismatch; ignoring", {
+        prior_result_id: priorResultId,
+        prior_cluster_id: explicitPrior.cluster_id,
+        job_cluster_id: job.cluster_id,
+      }, correlationId);
+    } else if (explicitPrior) {
+      priorResult = explicitPrior;
+    }
+  }
+  if (!priorResult) {
+    const { data: latestPrior } = await supabase.schema("service").from(
+      "roaster_enrichment_results",
+    )
+      .select("id, cluster_id, proposed, confidence, status, updated_at")
+      .eq("cluster_id", job.cluster_id)
+      .order("updated_at", {
+        ascending: false,
+      })
+      .limit(1)
+      .maybeSingle();
+    if (latestPrior) {
+      priorResult = latestPrior;
+    }
+  }
+  const reenrichment = (priorResult || reviewerNotes || rejectionReason)
+    ? {
+      reviewer_notes: reviewerNotes,
+      rejection_reason: rejectionReason,
+      prior_result_id: priorResult?.id ?? priorResultId ?? null,
+      prior_proposed: priorResult?.proposed ?? null,
+      prior_confidence: typeof priorResult?.confidence === "number"
+        ? priorResult.confidence
+        : null,
+    }
+    : null;
   return {
     cluster: cluster,
-    candidates: candidates ?? []
+    candidates: candidates ?? [],
+    priorResult,
+    reenrichment,
   };
 }
 function collectCandidateUrls(candidates, correlationId) {
-  const urls = [];
+  const urlEntries = [];
   const seenDomains = new Set();
   logInfo("Collecting candidate URLs", {
-    candidate_count: candidates.length
+    candidate_count: candidates.length,
   }, correlationId);
-  for (const candidate of candidates){
+  for (const candidate of candidates) {
     const googleResults = safeArray(candidate.google_search_results);
     const beanResults = safeArray(candidate.bean_search_results);
     const mergedResults = [
       ...googleResults,
-      ...beanResults
+      ...beanResults,
     ];
-    for (const result of mergedResults){
+    for (const result of mergedResults) {
       const rawUrl = result.link ?? result.url;
       if (!rawUrl) continue;
       const normalized = normalizeUrl(rawUrl);
       if (!normalized) continue;
       if (isBinaryLikeUrl(normalized)) {
         logInfo("Skipping binary candidate URL", {
-          url: normalized
+          url: normalized,
         }, correlationId);
         continue;
       }
-      const domain = new URL(normalized).hostname;
+      const domain = extractDomain(normalized);
+      const evidenceScore = typeof result.evidence_score === "number"
+        ? result.evidence_score
+        : 0;
+      const sourceBoost = result.query_kind === "roaster_bean" ? 4 : 0;
+      const aggregatorPenalty = isAggregatorDomain(domain) ? -30 : 0;
+      urlEntries.push({
+        url: normalized,
+        domain,
+        score: evidenceScore + sourceBoost + aggregatorPenalty,
+      });
+    }
+  }
+  urlEntries.sort((a, b) => b.score - a.score || a.url.length - b.url.length);
+  const urls = [];
+  for (const entry of urlEntries) {
+    if (!entry.domain) continue;
+    if (seenDomains.has(entry.domain)) continue;
+    seenDomains.add(entry.domain);
+    urls.push(entry.url);
+    if (urls.length >= 6) break;
+  }
+  if (urls.length < 3) {
+    for (const entry of urlEntries) {
+      const domain = entry.domain;
+      if (!domain) continue;
       if (seenDomains.has(domain)) continue;
       seenDomains.add(domain);
-      urls.push(normalized);
-      if (urls.length >= 6) return urls;
+      urls.push(entry.url);
+      if (urls.length >= 6) break;
     }
   }
   if (!urls.length) {
@@ -1793,7 +2502,7 @@ function collectCandidateUrls(candidates, correlationId) {
   } else {
     logInfo("Candidate URLs collected", {
       url_count: urls.length,
-      urls
+      urls,
     }, correlationId);
   }
   return urls;
@@ -1801,7 +2510,7 @@ function collectCandidateUrls(candidates, correlationId) {
 function buildSearchEvidenceFromCandidates(candidates, correlationId) {
   const results = [];
   const seenUrls = new Set();
-  const pushResult = (result, source)=>{
+  const pushResult = (result, source) => {
     if (results.length >= SEARCH_RESULT_LIMIT) return;
     const rawUrl = result.link ?? result.url;
     if (!rawUrl) return;
@@ -1812,35 +2521,53 @@ function buildSearchEvidenceFromCandidates(candidates, correlationId) {
       title: typeof result.title === "string" ? result.title : null,
       url: normalized,
       domain,
-      source
+      snippet: typeof result.snippet === "string" ? result.snippet : null,
+      display_link: typeof result.display_link === "string"
+        ? result.display_link
+        : typeof result.displayLink === "string"
+        ? result.displayLink
+        : null,
+      query: typeof result.query === "string" ? result.query : null,
+      query_kind: typeof result.query_kind === "string"
+        ? result.query_kind
+        : null,
+      evidence_score: typeof result.evidence_score === "number"
+        ? result.evidence_score
+        : null,
+      source,
     });
     seenUrls.add(normalized);
   };
-  for (const candidate of candidates){
+  for (const candidate of candidates) {
     const googleResults = safeArray(candidate.google_search_results);
     const beanResults = safeArray(candidate.bean_search_results);
-    for (const result of googleResults)pushResult(result, "google");
-    for (const result of beanResults)pushResult(result, "bean");
+    for (const result of googleResults) pushResult(result, "google");
+    for (const result of beanResults) pushResult(result, "bean");
     if (results.length >= SEARCH_RESULT_LIMIT) break;
   }
   if (!results.length) {
     logInfo("No stored search evidence found", {
-      candidate_count: candidates.length
+      candidate_count: candidates.length,
     }, correlationId);
     return null;
   }
-  const officialSite = results.find((result)=>!isAggregatorDomain(result.domain))?.url ?? null;
-  const candidateDomains = uniqueStrings(results.map((result)=>result.domain).filter((domain)=>Boolean(domain)));
+  const officialSite =
+    results.find((result) => !isAggregatorDomain(result.domain))?.url ?? null;
+  const candidateDomains = uniqueStrings(
+    results.map((result) => result.domain).filter((domain) => Boolean(domain)),
+  );
   logInfo("Search evidence built from stored results", {
     result_count: results.length,
-    official_site: officialSite
+    official_site: officialSite,
   }, correlationId);
   return {
     source: "stored_results",
     results,
     official_site: officialSite,
     candidate_domains: candidateDomains,
-    queries: []
+    queries: uniqueStrings(
+      results.map((result) => result.query).filter((query) => Boolean(query)),
+    ),
   };
 }
 async function buildEvidenceBundle(urls, correlationId) {
@@ -1854,9 +2581,9 @@ async function buildEvidenceBundle(urls, correlationId) {
   const seenUrls = new Set();
   logInfo("Building evidence bundle", {
     url_count: urls.length,
-    urls
+    urls,
   }, correlationId);
-  for (const url of urls){
+  for (const url of urls) {
     try {
       seenUrls.add(url);
       const baseDomain = extractDomain(url);
@@ -1864,23 +2591,23 @@ async function buildEvidenceBundle(urls, correlationId) {
         domainCounts.set(baseDomain, (domainCounts.get(baseDomain) ?? 0) + 1);
       }
       logInfo("Fetching evidence URL", {
-        url
+        url,
       }, correlationId);
       const response = await fetchWithRetry(url, {
         method: "GET",
         redirect: "follow",
         headers: {
-          "User-Agent": "timer.coffee/1.0 (admin@timer.coffee)"
-        }
+          "User-Agent": "timer.coffee/1.0 (admin@timer.coffee)",
+        },
       }, {
         maxAttempts: 2,
         correlationId,
-        label: "website_fetch"
+        label: "website_fetch",
       });
       if (!response.ok) {
         logWarning("Website fetch failed", {
           url,
-          status: response.status
+          status: response.status,
         }, correlationId);
         continue;
       }
@@ -1891,14 +2618,14 @@ async function buildEvidenceBundle(urls, correlationId) {
         title: page.title,
         logo_count: page.logos.length,
         address_count: page.addresses.length,
-        name_count: page.names.length
+        name_count: page.names.length,
       }, correlationId);
       pages.push(page);
       jsonLd.push(...page.jsonLd);
       logos.push(...page.logos);
       addresses.push(...page.addresses);
       names.push(...page.names);
-      const internalLinks = extractInternalLinks(url, html).filter((link)=>{
+      const internalLinks = extractInternalLinks(url, html).filter((link) => {
         const domain = extractDomain(link);
         if (!domain || isAggregatorDomain(domain)) return false;
         if (!isAddressPageCandidate(new URL(link).pathname)) return false;
@@ -1907,7 +2634,7 @@ async function buildEvidenceBundle(urls, correlationId) {
         if (seenUrls.has(link)) return false;
         return true;
       });
-      for (const link of internalLinks){
+      for (const link of internalLinks) {
         if (discoveredUrls.length >= MAX_TOTAL_DISCOVERED_PAGES) break;
         const domain = extractDomain(link);
         if (!domain) continue;
@@ -1920,36 +2647,36 @@ async function buildEvidenceBundle(urls, correlationId) {
     } catch (error) {
       logWarning("Website fetch error", {
         url,
-        message: getErrorMessage(error)
+        message: getErrorMessage(error),
       }, correlationId);
     }
   }
   if (discoveredUrls.length) {
     logInfo("Discovered address-related links", {
       discovered_count: discoveredUrls.length,
-      discovered_urls: discoveredUrls
+      discovered_urls: discoveredUrls,
     }, correlationId);
   }
-  for (const url of discoveredUrls){
+  for (const url of discoveredUrls) {
     try {
       logInfo("Fetching discovered address page", {
-        url
+        url,
       }, correlationId);
       const response = await fetchWithRetry(url, {
         method: "GET",
         redirect: "follow",
         headers: {
-          "User-Agent": "timer.coffee/1.0 (admin@timer.coffee)"
-        }
+          "User-Agent": "timer.coffee/1.0 (admin@timer.coffee)",
+        },
       }, {
         maxAttempts: 2,
         correlationId,
-        label: "website_fetch"
+        label: "website_fetch",
       });
       if (!response.ok) {
         logWarning("Discovered page fetch failed", {
           url,
-          status: response.status
+          status: response.status,
         }, correlationId);
         continue;
       }
@@ -1960,7 +2687,7 @@ async function buildEvidenceBundle(urls, correlationId) {
         title: page.title,
         logo_count: page.logos.length,
         address_count: page.addresses.length,
-        name_count: page.names.length
+        name_count: page.names.length,
       }, correlationId);
       pages.push(page);
       jsonLd.push(...page.jsonLd);
@@ -1970,7 +2697,7 @@ async function buildEvidenceBundle(urls, correlationId) {
     } catch (error) {
       logWarning("Discovered page fetch error", {
         url,
-        message: getErrorMessage(error)
+        message: getErrorMessage(error),
       }, correlationId);
     }
   }
@@ -1979,51 +2706,54 @@ async function buildEvidenceBundle(urls, correlationId) {
     page_count: pages.length,
     logo_count: logos.length,
     address_count: addresses.length,
-    name_count: names.length
+    name_count: names.length,
   }, correlationId);
   return {
     urls: uniqueStrings([
       ...urls,
-      ...discoveredUrls
+      ...discoveredUrls,
     ]),
     pages,
     jsonLd,
     logos: uniqueStrings(logos),
     addresses: uniqueStrings(addresses),
-    names: uniqueStrings(names)
+    names: uniqueStrings(names),
   };
 }
 async function callGroqJson(prompt, model, correlationId) {
   logInfo("Groq triage request", {
     model,
-    prompt_length: prompt.length
+    prompt_length: prompt.length,
   }, correlationId);
   const response = await fetchWithRetry(GROQ_ENDPOINT, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${groqApiKey}`,
-      "Content-Type": "application/json"
+      "Content-Type": "application/json",
     },
     body: JSON.stringify({
       model,
       messages: [
         {
           role: "user",
-          content: prompt
-        }
+          content: prompt,
+        },
       ],
       response_format: {
-        type: "json_object"
+        type: "json_object",
       },
-      temperature: 0.2
-    })
+      temperature: 0.2,
+    }),
   }, {
     correlationId,
     label: "groq_triage",
-    timeoutMs: AI_API_TIMEOUT_MS
+    timeoutMs: AI_API_TIMEOUT_MS,
   });
   if (response.status === 429 || response.status >= 500) {
-    throw new ProviderRetryableError(`Groq retryable error: ${response.status}`, response.status);
+    throw new ProviderRetryableError(
+      `Groq retryable error: ${response.status}`,
+      response.status,
+    );
   }
   if (!response.ok) {
     throw new Error(`Groq request failed: ${response.status}`);
@@ -2031,46 +2761,76 @@ async function callGroqJson(prompt, model, correlationId) {
   const json = await response.json();
   const content = json?.choices?.[0]?.message?.content ?? "{}";
   logInfo("Groq triage response received", {
-    model
+    model,
   }, correlationId);
   return parseModelJson(content, {});
 }
-async function triageAndNormalize(cluster, candidates, correlationId) {
-  const candidateNames = uniqueStrings(candidates.map((candidate)=>candidate.roaster).filter(Boolean));
+async function triageAndNormalize(
+  cluster,
+  candidates,
+  correlationId,
+  reenrichment,
+) {
+  const candidateNames = uniqueStrings(
+    candidates.map((candidate) => candidate.roaster).filter(Boolean),
+  );
   logInfo("Starting triage and normalization", {
     cluster_id: cluster.id,
     candidate_count: candidates.length,
-    candidate_name_count: candidateNames.length
+    candidate_name_count: candidateNames.length,
+    reenrichment: !!reenrichment,
   }, correlationId);
-  const prompt = `Normalize the roaster name and detect aliases. Return ONLY JSON with keys:
+  const reenrichmentBlock = buildReenrichmentPromptBlock({
+    reviewerNotes: reenrichment?.reviewer_notes ?? null,
+    rejectionReason: reenrichment?.rejection_reason ?? null,
+    priorProposed: reenrichment?.prior_proposed ?? null,
+    priorConfidence: reenrichment?.prior_confidence ?? null,
+    includePriorPayload: true,
+  });
+  const prompt =
+    `Normalize the roaster name and detect aliases. Return ONLY JSON with keys:
 {"display_name": string|null, "normalized_name": string|null, "aliases": string[], "is_roaster": boolean|null, "confidence": number|null, "notes": string|null}.
 Cluster display name: ${cluster.display_name ?? ""}
-Candidate names: ${candidateNames.join(" | ")}`;
-  for (const model of GROQ_TRIAGE_MODELS){
+Candidate names: ${candidateNames.join(" | ")}${reenrichmentBlock}`;
+  for (const model of GROQ_TRIAGE_MODELS) {
     try {
       const result = await callGroqJson(prompt, model, correlationId);
-      const aliases = safeArray(result.aliases).filter((value)=>typeof value === "string");
+      const aliases = safeArray(result.aliases).filter((value) =>
+        typeof value === "string"
+      );
       logInfo("Triage completed", {
         cluster_id: cluster.id,
         model,
-        confidence: typeof result.confidence === "number" ? result.confidence : null,
+        confidence: typeof result.confidence === "number"
+          ? result.confidence
+          : null,
         aliases_count: aliases.length,
-        display_name: typeof result.display_name === "string" ? result.display_name : cluster.display_name
+        display_name: typeof result.display_name === "string"
+          ? result.display_name
+          : cluster.display_name,
       }, correlationId);
       return {
-        display_name: typeof result.display_name === "string" ? result.display_name : cluster.display_name,
-        normalized_name: typeof result.normalized_name === "string" ? result.normalized_name : cluster.normalized_name,
+        display_name: typeof result.display_name === "string"
+          ? result.display_name
+          : cluster.display_name,
+        normalized_name: typeof result.normalized_name === "string"
+          ? result.normalized_name
+          : cluster.normalized_name,
         aliases,
-        is_roaster: typeof result.is_roaster === "boolean" ? result.is_roaster : null,
-        confidence: typeof result.confidence === "number" ? result.confidence : null,
+        is_roaster: typeof result.is_roaster === "boolean"
+          ? result.is_roaster
+          : null,
+        confidence: typeof result.confidence === "number"
+          ? result.confidence
+          : null,
         notes: typeof result.notes === "string" ? result.notes : null,
-        model
+        model,
       };
     } catch (error) {
       if (error instanceof ProviderRetryableError) {
         logWarning("Groq triage fallback", {
           model,
-          status: error.status
+          status: error.status,
         }, correlationId);
         continue;
       }
@@ -2079,51 +2839,76 @@ Candidate names: ${candidateNames.join(" | ")}`;
   }
   throw new Error("All Groq triage models failed");
 }
-async function summarizeEvidenceWithDeepSeek(bundle, triage, correlationId, jobDeadline) {
+async function summarizeEvidenceWithDeepSeek(
+  bundle,
+  triage,
+  correlationId,
+  jobDeadline,
+  reenrichment,
+) {
   // Helper to check deadline if provided
-  const isNearDeadline = (bufferMs = 10000)=>jobDeadline ? Date.now() + bufferMs > jobDeadline : false;
+  const isNearDeadline = (bufferMs = 10000) =>
+    jobDeadline ? Date.now() + bufferMs > jobDeadline : false;
   const summaryStartTime = Date.now();
   logInfo("Summarizing evidence with DeepSeek", {
     model: "deepseek-chat",
     url_count: bundle.urls.length,
-    page_count: bundle.pages.length
+    page_count: bundle.pages.length,
+    reenrichment: !!reenrichment,
   }, correlationId);
-  const prompt = `Summarize the evidence into JSON. Use ONLY the evidence provided.
-IMPORTANT: Only include logo URLs that end with .png, .jpg, or .jpeg extensions. Exclude all other image formats.
+  // Summary stage focuses on faithfully summarizing evidence; we pass the
+  // reviewer's reason/notes so the model can flag relevant evidence, but we
+  // deliberately do NOT include the prior proposed payload here to avoid
+  // contaminating the evidence summary.
+  const reenrichmentBlock = buildReenrichmentPromptBlock({
+    reviewerNotes: reenrichment?.reviewer_notes ?? null,
+    rejectionReason: reenrichment?.rejection_reason ?? null,
+    priorProposed: null,
+    priorConfidence: null,
+    includePriorPayload: false,
+  });
+  const prompt =
+    `Summarize the evidence into JSON. Use ONLY the evidence provided.
+IMPORTANT: Only include logo URLs that end with .png, .jpg, .jpeg, or .webp extensions. Exclude all other image formats.
 
 Return JSON with keys:
 {"website": string|null, "logos": string[], "addresses": string[], "city": string|null, "state": string|null, "country": string|null, "socials": string[], "sources": string[], "notes": string|null}
-Triage: ${JSON.stringify({
-    display_name: triage.display_name,
-    aliases: triage.aliases
-  })}
-Evidence: ${JSON.stringify({
-    urls: bundle.urls,
-    pages: bundle.pages
-  })}`;
+Triage: ${
+      JSON.stringify({
+        display_name: triage.display_name,
+        aliases: triage.aliases,
+      })
+    }
+Evidence: ${
+      JSON.stringify({
+        urls: bundle.urls,
+        pages: bundle.pages,
+        candidate_context: bundle.candidate_context ?? null,
+      })
+    }${reenrichmentBlock}`;
   const response = await fetchWithRetry(DEEPSEEK_ENDPOINT, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${deepseekApiKey}`,
-      "Content-Type": "application/json"
+      "Content-Type": "application/json",
     },
     body: JSON.stringify({
       model: "deepseek-chat",
       messages: [
         {
           role: "user",
-          content: prompt
-        }
+          content: prompt,
+        },
       ],
       response_format: {
-        type: "json_object"
+        type: "json_object",
       },
-      temperature: 0.2
-    })
+      temperature: 0.2,
+    }),
   }, {
     correlationId,
     label: "deepseek_preextract",
-    timeoutMs: AI_API_TIMEOUT_MS
+    timeoutMs: AI_API_TIMEOUT_MS,
   });
   if (!response.ok) {
     const body = await response.text();
@@ -2140,40 +2925,53 @@ Evidence: ${JSON.stringify({
     country: null,
     socials: [],
     sources: [],
-    notes: null
+    notes: null,
   });
   const logos = safeArray(parsed.logos);
   const addresses = safeArray(parsed.addresses);
   const socials = safeArray(parsed.socials);
   const roasterName = triage.display_name || triage.normalized_name || "";
+  const rankedLogos = rankLogoCandidates(
+    filterLogosByExtension(uniqueStrings(logos)),
+    roasterName,
+    parsed.website ?? null,
+  );
   // Verify each logo candidate with GPT before returning (limit to prevent timeouts)
   const verifiedLogos = [];
-  const logosToVerify = logos.slice(0, MAX_LOGOS_TO_VERIFY);
-  if (logos.length > MAX_LOGOS_TO_VERIFY) {
+  const logosToVerify = rankedLogos.slice(0, MAX_LOGOS_TO_VERIFY);
+  if (rankedLogos.length > MAX_LOGOS_TO_VERIFY) {
     logInfo("Limiting logo verification to prevent timeout", {
-      total_logos: logos.length,
-      verifying: MAX_LOGOS_TO_VERIFY
+      total_logos: rankedLogos.length,
+      verifying: MAX_LOGOS_TO_VERIFY,
     }, correlationId);
   }
-  for (const logoUrl of logosToVerify){
+  for (const logoUrl of logosToVerify) {
     // Skip logo verification if running low on time
     if (isNearDeadline(15000)) {
-      logWarning("Skipping remaining logo verification due to deadline", {}, correlationId);
+      logWarning(
+        "Skipping remaining logo verification due to deadline",
+        {},
+        correlationId,
+      );
       break;
     }
-    const verification = await verifyLogoWithOpenAI(logoUrl, roasterName, correlationId);
+    const verification = await verifyLogoWithOpenAI(
+      logoUrl,
+      roasterName,
+      correlationId,
+    );
     if (verification.isLogo && verification.confidence >= 0.7) {
       verifiedLogos.push(logoUrl);
       logInfo("Logo verified", {
         url: logoUrl,
         confidence: verification.confidence,
-        reason: verification.reason
+        reason: verification.reason,
       }, correlationId);
     } else {
       logInfo("Logo rejected", {
         url: logoUrl,
         confidence: verification.confidence,
-        reason: verification.reason
+        reason: verification.reason,
       }, correlationId);
     }
   }
@@ -2181,10 +2979,13 @@ Evidence: ${JSON.stringify({
   let notes = parsed.notes;
   if (verifiedLogos.length === 0 && logos.length > 0) {
     logWarning("No verified logos found", {
-      original_logo_count: logos.length,
-      roaster_name: roasterName
+      original_logo_count: rankedLogos.length,
+      roaster_name: roasterName,
     }, correlationId);
-    notes = `No verified logo found. ${logos.length} candidates rejected. ${notes ?? ""}`;
+    notes =
+      `No verified logo found. ${rankedLogos.length} candidates rejected. ${
+        notes ?? ""
+      }`;
   }
   const deepSeekDuration = Date.now() - summaryStartTime;
   logInfo("Evidence summary generated", {
@@ -2194,8 +2995,8 @@ Evidence: ${JSON.stringify({
     logo_count: verifiedLogos.length,
     address_count: addresses.length,
     socials_count: socials.length,
-    original_logos_count: logos.length,
-    verified_logos_count: verifiedLogos.length
+    original_logos_count: rankedLogos.length,
+    verified_logos_count: verifiedLogos.length,
   }, correlationId);
   return {
     website: parsed.website ?? null,
@@ -2207,20 +3008,35 @@ Evidence: ${JSON.stringify({
     socials,
     sources: uniqueStrings([
       ...parsed.sources ?? [],
-      ...bundle.urls
+      ...bundle.urls,
     ]),
-    notes
+    notes,
   };
 }
-async function extractWithOpenAI(summary, triage, correlationId) {
+async function extractWithOpenAI(
+  summary,
+  triage,
+  correlationId,
+  reenrichment,
+  candidateContext,
+) {
   logInfo("Starting GPT extraction", {
     website: summary.website,
     logo_count: summary.logos.length,
     address_count: summary.addresses.length,
     source_count: summary.sources.length,
-    model: GPT_EXTRACT_MODEL
+    model: GPT_EXTRACT_MODEL,
+    reenrichment: !!reenrichment,
   }, correlationId);
-  const prompt = `You are extracting roaster fields from evidence. Return ONLY JSON with keys:
+  const reenrichmentBlock = buildReenrichmentPromptBlock({
+    reviewerNotes: reenrichment?.reviewer_notes ?? null,
+    rejectionReason: reenrichment?.rejection_reason ?? null,
+    priorProposed: reenrichment?.prior_proposed ?? null,
+    priorConfidence: reenrichment?.prior_confidence ?? null,
+    includePriorPayload: true,
+  });
+  const prompt =
+    `You are extracting roaster fields from evidence. Return ONLY JSON with keys:
 {"proposed": {"roaster_name": string|null, "aliases": string[], "roaster_website_url": string|null, "roaster_logo_url": string|null, "city": string|null, "state": string|null, "country": string|null, "address": string|null, "is_roaster": boolean|null}, "confidence": number|null, "conflicts": string[], "notes": string|null}
 
 CRITICAL REQUIREMENTS:
@@ -2229,37 +3045,40 @@ CRITICAL REQUIREMENTS:
 3. If no valid logo exists in logos array, set roaster_logo_url to null.
 
 Evidence summary: ${JSON.stringify(summary)}
-Triage: ${JSON.stringify(triage)}`;
+Candidate context from check-new-roaster: ${
+      candidateContext ? JSON.stringify(candidateContext) : "null"
+    }
+Triage: ${JSON.stringify(triage)}${reenrichmentBlock}`;
   const requestBody = {
     model: GPT_EXTRACT_MODEL,
     reasoning: {
-      effort: "none"
+      effort: "none",
     },
     text: {
       format: {
-        type: "json_object"
-      }
+        type: "json_object",
+      },
     },
-    input: prompt
+    input: prompt,
   };
   const response = await fetchWithRetry(OPENAI_ENDPOINT, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${openaiApiKey}`,
-      "Content-Type": "application/json"
+      "Content-Type": "application/json",
     },
-    body: JSON.stringify(requestBody)
+    body: JSON.stringify(requestBody),
   }, {
     correlationId,
     label: "gpt_extract",
-    timeoutMs: OPENAI_EXTRACT_TIMEOUT_MS
+    timeoutMs: OPENAI_EXTRACT_TIMEOUT_MS,
   });
   if (!response.ok) {
     const body = await response.text();
     logWarning("GPT extraction HTTP error", {
       status: response.status,
       body: body.slice(0, 500),
-      model: GPT_EXTRACT_MODEL
+      model: GPT_EXTRACT_MODEL,
     }, correlationId);
     throw new Error(`GPT extraction failed: ${response.status} ${body}`);
   }
@@ -2275,20 +3094,22 @@ Triage: ${JSON.stringify(triage)}`;
       state: null,
       country: null,
       address: null,
-      is_roaster: null
+      is_roaster: null,
     },
     confidence: null,
     conflicts: [],
-    notes: null
+    notes: null,
   });
   const aliases = safeArray(parsed.proposed?.aliases);
   const conflicts = safeArray(parsed.conflicts);
   logInfo("GPT extraction completed", {
-    confidence: typeof parsed.confidence === "number" ? parsed.confidence : null,
+    confidence: typeof parsed.confidence === "number"
+      ? parsed.confidence
+      : null,
     conflicts_count: conflicts.length,
     proposed_name: parsed.proposed?.roaster_name ?? null,
     proposed_country: parsed.proposed?.country ?? null,
-    proposed_website: parsed.proposed?.roaster_website_url ?? null
+    proposed_website: parsed.proposed?.roaster_website_url ?? null,
   }, correlationId);
   return {
     proposed: {
@@ -2300,74 +3121,107 @@ Triage: ${JSON.stringify(triage)}`;
       state: parsed.proposed?.state ?? null,
       country: parsed.proposed?.country ?? null,
       address: parsed.proposed?.address ?? null,
-      is_roaster: typeof parsed.proposed?.is_roaster === "boolean" ? parsed.proposed.is_roaster : null
+      is_roaster: typeof parsed.proposed?.is_roaster === "boolean"
+        ? parsed.proposed.is_roaster
+        : null,
     },
-    confidence: typeof parsed.confidence === "number" ? parsed.confidence : null,
+    confidence: typeof parsed.confidence === "number"
+      ? parsed.confidence
+      : null,
     conflicts,
-    notes: parsed.notes ?? null
+    notes: parsed.notes ?? null,
   };
 }
-async function validateWithOpenAI(summary, triage, extraction, searchEvidence, correlationId) {
+async function validateWithOpenAI(
+  summary,
+  triage,
+  extraction,
+  searchEvidence,
+  correlationId,
+  reenrichment,
+  candidateContext,
+) {
   logInfo("Starting OpenAI validation", {
     extraction_confidence: extraction.confidence ?? null,
     conflict_count: extraction.conflicts.length,
     search_result_count: searchEvidence?.results.length ?? 0,
-    search_source: searchEvidence?.source ?? null
+    search_source: searchEvidence?.source ?? null,
+    reenrichment: !!reenrichment,
   }, correlationId);
-  const prompt = `Validate and refine the proposed roaster data. Return ONLY JSON with keys:
+  const reenrichmentBlock = buildReenrichmentPromptBlock({
+    reviewerNotes: reenrichment?.reviewer_notes ?? null,
+    rejectionReason: reenrichment?.rejection_reason ?? null,
+    priorProposed: reenrichment?.prior_proposed ?? null,
+    priorConfidence: reenrichment?.prior_confidence ?? null,
+    includePriorPayload: true,
+  });
+  const prompt =
+    `Validate and refine the proposed roaster data. Return ONLY JSON with keys:
 {"proposed": {"roaster_name": string|null, "aliases": string[], "roaster_website_url": string|null, "roaster_logo_url": string|null, "city": string|null, "state": string|null, "country": string|null, "address": string|null, "is_roaster": boolean|null}, "confidence": number|null, "needs_review": boolean, "notes": string|null}
 
-IMPORTANT: Ensure that roaster_logo_url (if present) ends with .png, .jpg, or .jpeg extension. If the proposed logo is not in this format, either find a .png/.jpg/.jpeg logo from the evidence or set it to null.
+IMPORTANT: Ensure that roaster_logo_url (if present) ends with .png, .jpg, .jpeg, or .webp extension. If the proposed logo is not in this format, either find a compliant logo from the evidence or set it to null.
 
 Evidence summary: ${JSON.stringify(summary)}
 Triage: ${JSON.stringify(triage)}
 Search evidence: ${searchEvidence ? JSON.stringify(searchEvidence) : "null"}
-Proposed: ${JSON.stringify(extraction)}.`;
+Candidate context from check-new-roaster: ${
+      candidateContext ? JSON.stringify(candidateContext) : "null"
+    }
+Proposed: ${JSON.stringify(extraction)}.${reenrichmentBlock}`;
   const response = await fetchWithRetry(OPENAI_ENDPOINT, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${openaiApiKey}`,
-      "Content-Type": "application/json"
+      "Content-Type": "application/json",
     },
     body: JSON.stringify({
       model: "gpt-5.2",
       reasoning: {
-        effort: "none"
+        effort: "none",
       },
       text: {
         format: {
-          type: "json_object"
-        }
+          type: "json_object",
+        },
       },
-      input: prompt
-    })
+      input: prompt,
+    }),
   }, {
     correlationId,
     label: "openai_validate",
-    timeoutMs: OPENAI_VALIDATE_TIMEOUT_MS
+    timeoutMs: OPENAI_VALIDATE_TIMEOUT_MS,
   });
   if (!response.ok) {
     const body = await response.text();
     logWarning("OpenAI validation HTTP error", {
       status: response.status,
       body: body.slice(0, 500),
-      model: "gpt-5.2"
+      model: "gpt-5.2",
     }, correlationId);
     throw new Error(`OpenAI validation failed: ${response.status} ${body}`);
   }
   const json = await response.json();
   const outputItems = safeArray(json?.output);
-  const contentItems = outputItems.flatMap((item)=>safeArray(item?.content));
-  const outputText = json?.output_text ?? contentItems.find((content)=>content?.type === "output_text" && typeof content.text === "string")?.text ?? contentItems.find((content)=>typeof content?.text === "string")?.text ?? "{}";
+  const contentItems = outputItems.flatMap((item) => safeArray(item?.content));
+  const outputText = json?.output_text ??
+    contentItems.find((content) =>
+      content?.type === "output_text" && typeof content.text === "string"
+    )?.text ??
+    contentItems.find((content) => typeof content?.text === "string")?.text ??
+    "{}";
   const parsed = parseModelJson(outputText, {
     proposed: extraction.proposed,
     confidence: extraction.confidence ?? null,
     needs_review: true,
-    notes: null
+    notes: null,
   });
   logInfo("OpenAI validation completed", {
-    confidence: typeof parsed.confidence === "number" ? parsed.confidence : null,
-    needs_review: typeof parsed.needs_review === "boolean" ? parsed.needs_review : true
+    confidence: typeof parsed.confidence === "number"
+      ? parsed.confidence
+      : null,
+    needs_review: typeof parsed.needs_review === "boolean"
+      ? parsed.needs_review
+      : true,
   }, correlationId);
   return {
     proposed: {
@@ -2379,17 +3233,25 @@ Proposed: ${JSON.stringify(extraction)}.`;
       state: parsed.proposed?.state ?? null,
       country: parsed.proposed?.country ?? null,
       address: parsed.proposed?.address ?? null,
-      is_roaster: typeof parsed.proposed?.is_roaster === "boolean" ? parsed.proposed.is_roaster : null
+      is_roaster: typeof parsed.proposed?.is_roaster === "boolean"
+        ? parsed.proposed.is_roaster
+        : null,
     },
-    confidence: typeof parsed.confidence === "number" ? parsed.confidence : null,
-    needs_review: typeof parsed.needs_review === "boolean" ? parsed.needs_review : true,
-    notes: parsed.notes ?? null
+    confidence: typeof parsed.confidence === "number"
+      ? parsed.confidence
+      : null,
+    needs_review: typeof parsed.needs_review === "boolean"
+      ? parsed.needs_review
+      : true,
+    notes: parsed.notes ?? null,
   };
 }
 function getValidationReasons(extraction) {
   const reasons = [];
   const proposed = extraction.proposed;
-  if (!proposed.roaster_name || !proposed.roaster_website_url || !proposed.country) {
+  if (
+    !proposed.roaster_name || !proposed.roaster_website_url || !proposed.country
+  ) {
     reasons.push("missing_required_fields");
   }
   if (extraction.conflicts.length > 0) reasons.push("conflicts");
@@ -2407,7 +3269,7 @@ async function findPotentialMatches(cluster, triage, correlationId) {
   logInfo("Finding potential roaster matches for admin review", {
     cluster_id: cluster.id,
     normalized_name: cluster.normalized_name,
-    display_name: triage.display_name
+    display_name: triage.display_name,
   }, correlationId);
   try {
     // Add timeout to RPC call using Promise.race
@@ -2415,30 +3277,39 @@ async function findPotentialMatches(cluster, triage, correlationId) {
       search_normalized_name: cluster.normalized_name,
       search_display_name: triage.display_name || cluster.display_name || "",
       max_results: 3,
-      min_confidence: 0.65
+      min_confidence: 0.65,
     });
-    const timeoutPromise = new Promise((_, reject)=>setTimeout(()=>reject(new Error("RPC timeout")), RPC_TIMEOUT_MS));
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("RPC timeout")), RPC_TIMEOUT_MS)
+    );
     const { data: matches, error } = await Promise.race([
       rpcPromise,
-      timeoutPromise
-    ]);
+      timeoutPromise,
+    ]) as any;
     if (error) {
-      logError("Failed to find potential matches", toError(error), ErrorCategory.DATABASE, ErrorSeverity.MEDIUM, {}, correlationId);
+      logError(
+        "Failed to find potential matches",
+        toError(error),
+        ErrorCategory.DATABASE,
+        ErrorSeverity.MEDIUM,
+        {},
+        correlationId,
+      );
       return [];
     }
-    const potentialMatches = (matches || []).map((m)=>({
-        roaster_id: Number(m.roaster_id),
-        roaster_name: m.roaster_name,
-        confidence: m.confidence,
-        match_method: m.match_method
-      }));
+    const potentialMatches = (matches || []).map((m) => ({
+      roaster_id: Number(m.roaster_id),
+      roaster_name: m.roaster_name,
+      confidence: m.confidence,
+      match_method: m.match_method,
+    }));
     logInfo("Potential matches found", {
       match_count: potentialMatches.length,
-      matches: potentialMatches.map((m)=>({
-          name: m.roaster_name,
-          confidence: m.confidence,
-          method: m.match_method
-        }))
+      matches: potentialMatches.map((m) => ({
+        name: m.roaster_name,
+        confidence: m.confidence,
+        method: m.match_method,
+      })),
     }, correlationId);
     return potentialMatches;
   } catch (error) {
@@ -2447,24 +3318,38 @@ async function findPotentialMatches(cluster, triage, correlationId) {
     if (errorMessage.includes("timeout")) {
       logWarning("Potential matches RPC timed out", {}, correlationId);
     } else {
-      logError("Exception finding potential matches", toError(error), ErrorCategory.DATABASE, ErrorSeverity.MEDIUM, {}, correlationId);
+      logError(
+        "Exception finding potential matches",
+        toError(error),
+        ErrorCategory.DATABASE,
+        ErrorSeverity.MEDIUM,
+        {},
+        correlationId,
+      );
     }
     return [];
   }
 }
-async function persistResult(clusterId, payload, potentialMatches, correlationId) {
+async function persistResult(
+  clusterId,
+  payload,
+  potentialMatches,
+  correlationId,
+) {
   logInfo("Persisting enrichment result", {
     cluster_id: clusterId,
     status: payload.status,
     confidence: payload.confidence,
-    potential_match_count: potentialMatches.length
+    potential_match_count: potentialMatches.length,
   }, correlationId);
   // Add potential matches to signals
   const signalsWithMatches = {
     ...payload.signals,
-    potential_matches: potentialMatches
+    potential_matches: potentialMatches,
   };
-  const { error } = await supabase.schema("service").from("roaster_enrichment_results").insert({
+  const { error } = await supabase.schema("service").from(
+    "roaster_enrichment_results",
+  ).insert({
     cluster_id: clusterId,
     status: payload.status,
     proposed: payload.proposed,
@@ -2472,18 +3357,25 @@ async function persistResult(clusterId, payload, potentialMatches, correlationId
     signals: signalsWithMatches,
     confidence: payload.confidence,
     error: payload.error,
-    potential_matches: potentialMatches
+    potential_matches: potentialMatches,
   });
   if (error) {
-    logError("Failed to persist enrichment result", toError(error), ErrorCategory.DATABASE, ErrorSeverity.HIGH, {
-      cluster_id: clusterId
-    }, correlationId);
+    logError(
+      "Failed to persist enrichment result",
+      toError(error),
+      ErrorCategory.DATABASE,
+      ErrorSeverity.HIGH,
+      {
+        cluster_id: clusterId,
+      },
+      correlationId,
+    );
     throw error;
   }
   logInfo("Enrichment result persisted", {
     cluster_id: clusterId,
     status: payload.status,
-    potential_match_count: potentialMatches.length
+    potential_match_count: potentialMatches.length,
   }, correlationId);
 }
 async function processJob(job, correlationId) {
@@ -2491,7 +3383,7 @@ async function processJob(job, correlationId) {
     job_id: job.id,
     cluster_id: job.cluster_id,
     stage: job.stage,
-    attempts: job.attempts
+    attempts: job.attempts,
   }, correlationId);
   // Stage router - dispatch to appropriate stage handler
   const stageHandlers = {
@@ -2499,19 +3391,19 @@ async function processJob(job, correlationId) {
     // Legacy evidence stage (for backwards compatibility with existing jobs)
     evidence: processEvidenceStage,
     // New micro-stages for evidence collection
-    'fetch-candidates': processFetchCandidatesStage,
-    'parse-candidates': processParseCandidatesStage,
-    'discover-links': processDiscoverLinksStage,
-    'fetch-discovered': processFetchDiscoveredStage,
-    'parse-discovered': processParseDiscoveredStage,
-    'aggregate-evidence': processAggregateEvidenceStage,
+    "fetch-candidates": processFetchCandidatesStage,
+    "parse-candidates": processParseCandidatesStage,
+    "discover-links": processDiscoverLinksStage,
+    "fetch-discovered": processFetchDiscoveredStage,
+    "parse-discovered": processParseDiscoveredStage,
+    "aggregate-evidence": processAggregateEvidenceStage,
     summary: processSummaryStage,
     extract: processExtractStage,
     // Validate micro-stages (split from monolithic validate stage)
     validate: processValidateStage,
-    'translate-location': processTranslateLocationStage,
-    'find-matches': processFindMatchesStage,
-    'persist-result': processPersistResultStage
+    "translate-location": processTranslateLocationStage,
+    "find-matches": processFindMatchesStage,
+    "persist-result": processPersistResultStage,
   };
   const handler = stageHandlers[job.stage];
   if (!handler) {
@@ -2519,24 +3411,24 @@ async function processJob(job, correlationId) {
   }
   const result = await handler(job, correlationId);
   // If handler returns nextStage, it means the stage advanced but pipeline isn't complete
-  if ('nextStage' in result) {
+  if ("nextStage" in result) {
     logInfo("Pipeline stage completed", {
       job_id: job.id,
       stage: job.stage,
-      next_stage: result.nextStage
+      next_stage: result.nextStage,
     }, correlationId);
     // Return in_progress status - main handler will reset job to queued
     return {
-      status: 'in_progress'
+      status: "in_progress",
     };
   }
   // Final stage completed
   return {
-    status: 'completed',
-    result
+    status: "completed",
+    result,
   };
 }
-serve(async (req)=>{
+serve(async (req) => {
   const correlationId = generateCorrelationId();
   const origin = req.headers.get("origin") ?? undefined;
   const cors = getCorsHeaders(origin);
@@ -2545,193 +3437,246 @@ serve(async (req)=>{
     method: req.method,
     url: req.url,
     origin: origin ?? null,
-    user_agent: req.headers.get("user-agent") ?? "unknown"
+    user_agent: req.headers.get("user-agent") ?? "unknown",
   }, correlationId);
   if (req.method === "OPTIONS") {
     return new Response("ok", {
-      headers: cors
+      headers: cors,
     });
   }
   if (req.method !== "POST") {
-    return new Response(JSON.stringify({
-      error: "Method Not Allowed"
-    }), {
-      status: 405,
-      headers: {
-        ...cors,
-        "Content-Type": "application/json"
-      }
-    });
+    return new Response(
+      JSON.stringify({
+        error: "Method Not Allowed",
+      }),
+      {
+        status: 405,
+        headers: {
+          ...cors,
+          "Content-Type": "application/json",
+        },
+      },
+    );
   }
   const systemTokenHeader = req.headers.get("x-system-token");
   if (systemTokenHeader !== cronJobSecret) {
     logWarning("Unauthorized cron job access", {
       function: FUNCTION_NAME,
-      user_agent: req.headers.get("user-agent") ?? "unknown"
+      user_agent: req.headers.get("user-agent") ?? "unknown",
     }, correlationId);
-    return new Response(JSON.stringify({
-      error: "Unauthorized"
-    }), {
-      status: 403,
-      headers: {
-        ...cors,
-        "Content-Type": "application/json"
-      }
-    });
+    return new Response(
+      JSON.stringify({
+        error: "Unauthorized",
+      }),
+      {
+        status: 403,
+        headers: {
+          ...cors,
+          "Content-Type": "application/json",
+        },
+      },
+    );
   }
   logInfo("Authorized cron request", {
-    function: FUNCTION_NAME
+    function: FUNCTION_NAME,
   }, correlationId);
   try {
     // Clean up any jobs stuck in 'running' state before processing new jobs
     const cleanedCount = await cleanupStuckJobs(correlationId);
     if (cleanedCount > 0) {
       logInfo("Stuck job cleanup completed", {
-        cleaned_count: cleanedCount
+        cleaned_count: cleanedCount,
       }, correlationId);
     }
     activeJob = await lockNextJob(correlationId);
     if (!activeJob) {
       logInfo("No queued jobs to process", {}, correlationId);
-      return new Response(JSON.stringify({
-        success: true,
-        message: "No queued jobs"
-      }), {
-        headers: {
-          ...cors,
-          "Content-Type": "application/json"
-        }
-      });
+      return new Response(
+        JSON.stringify({
+          success: true,
+          message: "No queued jobs",
+        }),
+        {
+          headers: {
+            ...cors,
+            "Content-Type": "application/json",
+          },
+        },
+      );
     }
     logInfo("Enrichment job started", {
       job_id: activeJob.id,
-      cluster_id: activeJob.cluster_id
+      cluster_id: activeJob.cluster_id,
     }, correlationId);
     const processResult = await processJob(activeJob, correlationId);
-    if (processResult.status === 'completed' && processResult.result) {
-      // Only mark as done when validate stage completes
-      await updateJobState(activeJob.id, "done", null, correlationId);
+    if (processResult.status === "completed" && processResult.result) {
+      // Final stage completed; clear lock and failure retry state.
+      await updateJobState(activeJob.id, "done", null, correlationId, {
+        attempts: 0,
+        locked_at: null,
+        locked_by: null,
+      });
       logInfo("Enrichment job completed", {
         job_id: activeJob.id,
-        status: processResult.result.status
-      }, correlationId);
-      return new Response(JSON.stringify({
-        success: true,
-        job_id: activeJob.id,
         status: processResult.result.status,
-        confidence: processResult.result.confidence
-      }), {
-        headers: {
-          ...cors,
-          "Content-Type": "application/json"
-        }
-      });
+      }, correlationId);
+      return new Response(
+        JSON.stringify({
+          success: true,
+          job_id: activeJob.id,
+          status: processResult.result.status,
+          confidence: processResult.result.confidence,
+        }),
+        {
+          headers: {
+            ...cors,
+            "Content-Type": "application/json",
+          },
+        },
+      );
     } else {
-      // Job is still in progress - reset to queued for next cron invocation
+      // Job is still in progress. Reset failure retry state because this stage
+      // completed successfully; the next stage gets its own retry budget.
       await supabase.schema("service").from("roaster_enrichment_jobs").update({
         state: "queued",
         locked_at: null,
         locked_by: null,
-        run_after: new Date().toISOString()
+        run_after: new Date().toISOString(),
+        attempts: 0,
+        last_error: null,
       }).eq("id", activeJob.id);
       logInfo("Enrichment job stage complete, waiting for next invocation", {
         job_id: activeJob.id,
-        stage: activeJob.stage
+        stage: activeJob.stage,
       }, correlationId);
-      return new Response(JSON.stringify({
-        success: true,
-        job_id: activeJob.id,
-        status: 'in_progress',
-        message: `Stage '${activeJob.stage}' complete, next invocation will continue`
-      }), {
-        headers: {
-          ...cors,
-          "Content-Type": "application/json"
-        }
-      });
+      return new Response(
+        JSON.stringify({
+          success: true,
+          job_id: activeJob.id,
+          status: "in_progress",
+          message:
+            `Stage '${activeJob.stage}' complete, next invocation will continue`,
+        }),
+        {
+          headers: {
+            ...cors,
+            "Content-Type": "application/json",
+          },
+        },
+      );
     }
   } catch (error) {
     const message = getErrorMessage(error);
-    logError("Enrichment job failed", error instanceof Error ? error : new Error(message), ErrorCategory.EXTERNAL_API, ErrorSeverity.HIGH, {
-      job_id: activeJob?.id,
-      cluster_id: activeJob?.cluster_id,
-      message
-    }, correlationId);
+    logError(
+      "Enrichment job failed",
+      error instanceof Error ? error : new Error(message),
+      ErrorCategory.EXTERNAL_API,
+      ErrorSeverity.HIGH,
+      {
+        job_id: activeJob?.id,
+        cluster_id: activeJob?.cluster_id,
+        message,
+      },
+      correlationId,
+    );
     if (activeJob) {
-      const attempts = activeJob.attempts ?? 0;
-      if (attempts >= MAX_JOB_RETRIES) {
-        await updateJobState(activeJob.id, "failed", message, correlationId);
+      const failedAttempt = (activeJob.attempts ?? 0) + 1;
+      if (failedAttempt >= MAX_JOB_RETRIES) {
+        await updateJobState(activeJob.id, "failed", message, correlationId, {
+          attempts: failedAttempt,
+          locked_at: null,
+          locked_by: null,
+        });
         try {
-          await persistResult(activeJob.cluster_id, {
-            status: "failed",
-            proposed: {
-              roaster_name: null,
-              aliases: [],
-              roaster_website_url: null,
-              roaster_logo_url: null,
-              city: null,
-              state: null,
-              country: null,
-              address: null,
-              is_roaster: null
+          await persistResult(
+            activeJob.cluster_id,
+            {
+              status: "failed",
+              proposed: {
+                roaster_name: null,
+                aliases: [],
+                roaster_website_url: null,
+                roaster_logo_url: null,
+                city: null,
+                state: null,
+                country: null,
+                address: null,
+                is_roaster: null,
+              },
+              sources: [],
+              signals: {
+                error: message,
+              },
+              confidence: 0,
+              error: message,
             },
-            sources: [],
-            signals: {
-              error: message
-            },
-            confidence: 0,
-            error: message
-          }, [], correlationId);
+            [],
+            correlationId,
+          );
         } catch (persistError) {
           logWarning("Failed to persist failed result", {
             job_id: activeJob.id,
-            message: getErrorMessage(persistError)
+            message: getErrorMessage(persistError),
           }, correlationId);
         }
       } else {
-        const delayMinutes = computeRetryDelayMinutes(attempts);
+        const delayMinutes = computeRetryDelayMinutes(failedAttempt);
         if (delayMinutes !== null) {
-          const runAfter = new Date(Date.now() + delayMinutes * 60 * 1000).toISOString();
-          const { error: retryError } = await supabase.schema("service").from("roaster_enrichment_jobs").update({
+          const runAfter = new Date(Date.now() + delayMinutes * 60 * 1000)
+            .toISOString();
+          const { error: retryError } = await supabase.schema("service").from(
+            "roaster_enrichment_jobs",
+          ).update({
             state: "queued",
             run_after: runAfter,
             locked_at: null,
             locked_by: null,
-            last_error: message
+            last_error: message,
+            attempts: failedAttempt,
           }).eq("id", activeJob.id);
           if (retryError) {
-            logError("Failed to re-queue enrichment job", toError(retryError), ErrorCategory.DATABASE, ErrorSeverity.HIGH, {
-              job_id: activeJob.id,
-              run_after: runAfter
-            }, correlationId);
+            logError(
+              "Failed to re-queue enrichment job",
+              toError(retryError),
+              ErrorCategory.DATABASE,
+              ErrorSeverity.HIGH,
+              {
+                job_id: activeJob.id,
+                run_after: runAfter,
+              },
+              correlationId,
+            );
           } else {
             logWarning("Enrichment job re-queued after failure", {
               job_id: activeJob.id,
-              attempt: attempts,
+              attempt: failedAttempt,
               run_after: runAfter,
-              delay_minutes: delayMinutes
+              delay_minutes: delayMinutes,
             }, correlationId);
           }
         } else {
           logWarning("Retry delay not configured for attempt", {
             job_id: activeJob.id,
-            attempt: attempts
+            attempt: failedAttempt,
           }, correlationId);
         }
       }
     }
-    return new Response(JSON.stringify({
-      success: false,
-      error: message,
-      job_id: activeJob?.id ?? null
-    }), {
-      status: 500,
-      headers: {
-        ...cors,
-        "Content-Type": "application/json"
-      }
-    });
-  } finally{
+    return new Response(
+      JSON.stringify({
+        success: false,
+        error: message,
+        job_id: activeJob?.id ?? null,
+      }),
+      {
+        status: 500,
+        headers: {
+          ...cors,
+          "Content-Type": "application/json",
+        },
+      },
+    );
+  } finally {
     flushLogsOnExit();
   }
 });

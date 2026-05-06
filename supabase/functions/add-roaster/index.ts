@@ -6,6 +6,25 @@ if (!supabaseUrl || !supabaseServiceRoleKey) {
   throw new Error('Required environment variables are not set');
 }
 const supabase = createClient(supabaseUrl, supabaseServiceRoleKey);
+const normalizeAliases = (value: string | null | undefined): string | null => {
+  const trimmed = value?.trim();
+  if (!trimmed) {
+    return null;
+  }
+  let parsedAliases: string[];
+  if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      parsedAliases = Array.isArray(parsed) ? parsed.map((alias)=>String(alias)) : [trimmed];
+    } catch  {
+      parsedAliases = trimmed.split(',');
+    }
+  } else {
+    parsedAliases = trimmed.split(',');
+  }
+  const normalizedAliases = parsedAliases.map((alias)=>alias.trim()).filter(Boolean);
+  return normalizedAliases.length > 0 ? normalizedAliases.join(',') : null;
+};
 Deno.serve(async (req)=>{
   if (req.method === 'OPTIONS') {
     return new Response('ok', {
@@ -49,7 +68,7 @@ Deno.serve(async (req)=>{
       }
     });
   }
-  const stringOrNull = (val)=>val === undefined || val === null || typeof val === 'string';
+  const stringOrNull = (val: unknown)=>val === undefined || val === null || typeof val === 'string';
   if (!stringOrNull(roaster_logo_url)) {
     return new Response(JSON.stringify({
       error: 'roaster_logo_url must be a string or null'
@@ -132,7 +151,7 @@ Deno.serve(async (req)=>{
     roaster_name: roaster_name.trim(),
     roaster_logo_url: roaster_logo_url?.trim() ?? null,
     roaster_website_url: roaster_website_url?.trim() ?? null,
-    aliases: aliases?.trim() ?? null,
+    aliases: normalizeAliases(aliases),
     city: city?.trim() ?? null,
     state: state?.trim() ?? null,
     country: country?.trim() ?? null,

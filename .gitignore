@@ -79,3 +79,4 @@ plans/
 .env.production.local
 supabase/seed.sql.backup
 .stfolder/syncthing-folder-180021.txt
+/review-previews

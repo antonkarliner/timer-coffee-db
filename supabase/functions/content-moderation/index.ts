@@ -10,14 +10,18 @@ const WINDOW_SECONDS = 60;
 // --- Environment Variables ---
 const openaiApiKey = Deno.env.get("OPENAI_API_KEY_NON_PERSONAL");
 const groqApiKey = Deno.env.get("GROQ_API_KEY");
+const cerebrasApiKey = Deno.env.get("CEREBRAS_API_KEY");
+const geminiServiceAccountKeyJson = Deno.env.get("GOOGLE_APPLICATION_CREDENTIALS_JSON");
+const geminiProjectId = Deno.env.get("GEMINI_PROJECT_ID") ?? "";
+const geminiRegion = Deno.env.get("GEMINI_REGION") ?? "";
 const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
 const supabaseServiceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
 if (!openaiApiKey) {
   console.error("OPENAI_API_KEY_NON_PERSONAL is not set.");
   Deno.exit(1);
 }
-if (!groqApiKey) {
-  console.error("GROQ_API_KEY is not set.");
+if (!groqApiKey && !cerebrasApiKey && !geminiServiceAccountKeyJson) {
+  console.error("No secondary moderation provider is configured. Set GROQ_API_KEY, CEREBRAS_API_KEY, or Gemini credentials.");
   Deno.exit(1);
 }
 if (!supabaseUrl) {
@@ -30,9 +34,13 @@ if (!supabaseServiceRoleKey) {
 }
 const moderator = createModerationClient({
   openaiApiKey,
-  groqApiKey
+  groqApiKey,
+  cerebrasApiKey,
+  geminiServiceAccountKeyJson,
+  geminiProjectId,
+  geminiRegion
 });
-function decodeJwtPayload(token) {
+function decodeJwtPayload(token: string): Record<string, unknown> | null {
   try {
     const parts = token.split(".");
     if (parts.length !== 3) {
@@ -46,7 +54,10 @@ function decodeJwtPayload(token) {
   }
 }
 // --- Image moderation via omni-moderation ---
-async function moderateImage(imageBase64) {
+async function moderateImage(imageBase64: string): Promise<{
+  safe: boolean;
+  reason?: string;
+}> {
   const response = await fetch("https://api.openai.com/v1/moderations", {
     method: "POST",
     headers: {
@@ -101,7 +112,8 @@ serve(async (req)=>{
       headers: cors
     });
   }
-  if (req.headers.get("content-type") !== "application/json") {
+  const contentType = req.headers.get("content-type") ?? "";
+  if (!contentType.toLowerCase().includes("application/json")) {
     return new Response("Bad Request: Content-Type must be application/json", {
       status: 400,
       headers: cors
@@ -172,10 +184,12 @@ serve(async (req)=>{
       console.log(`User ${userId} rate limit window reset. Count: 1`);
     }
   } catch (dbError) {
+    const dbErrorMessage =
+        dbError instanceof Error ? dbError.message : String(dbError);
     console.error("Database error during rate limiting:", dbError);
     return new Response(JSON.stringify({
       error: "Internal Server Error",
-      message: `Rate limiting check failed: ${dbError.message}`
+      message: `Rate limiting check failed: ${dbErrorMessage}`
     }), {
       status: 500,
       headers: {
@@ -189,7 +203,8 @@ serve(async (req)=>{
   try {
     requestPayload = await req.json();
   } catch (e) {
-    return new Response(`Bad Request: Invalid JSON payload. ${e.message}`, {
+    const errorMessage = e instanceof Error ? e.message : String(e);
+    return new Response(`Bad Request: Invalid JSON payload. ${errorMessage}`, {
       status: 400,
       headers: cors
     });
@@ -227,10 +242,11 @@ serve(async (req)=>{
       }
     });
   } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
     console.error("Error during moderation:", error);
     return new Response(JSON.stringify({
       error: "Internal Server Error",
-      message: error.message
+      message: errorMessage
     }), {
       status: 500,
       headers: {
