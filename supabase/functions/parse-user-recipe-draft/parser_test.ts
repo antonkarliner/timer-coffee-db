@@ -39,6 +39,7 @@ function createMockProvider(args: {
   failRepair?: boolean;
   failCumulativeRewrite?: boolean;
   calls: Array<{ provider: string; stage: string }>;
+  systemPrompts?: Array<{ provider: string; stage: string; systemPrompt: string }>;
 }): RecipeDraftAiProvider {
   return {
     name: args.name,
@@ -50,11 +51,17 @@ function createMockProvider(args: {
           | "normalization"
           | "repair"
           | "cumulative_rewrite";
+        systemPrompt: string;
       },
     ) {
       args.calls.push({
         provider: args.tag ?? args.name,
         stage: input.stage,
+      });
+      args.systemPrompts?.push({
+        provider: args.tag ?? args.name,
+        stage: input.stage,
+        systemPrompt: input.systemPrompt,
       });
 
       if (input.stage === "extraction") {
@@ -1162,7 +1169,7 @@ Deno.test("falls back from groq compound-mini extraction failure to groq gpt-oss
       }),
       createMockProvider({
         name: "gemini",
-        tag: "gemini/gemini-3.1-flash-lite-preview",
+        tag: "gemini/gemini-3.1-flash-lite",
         extraction: createExtraction(),
         normalized: createNormalized(),
         calls,
@@ -1231,7 +1238,7 @@ Deno.test("reuses extraction and falls back only normalization from groq compoun
       }),
       createMockProvider({
         name: "gemini",
-        tag: "gemini/gemini-3.1-flash-lite-preview",
+        tag: "gemini/gemini-3.1-flash-lite",
         extraction: createExtraction(),
         normalized: createNormalized(),
         calls,
@@ -2550,5 +2557,210 @@ Deno.test("remaps brewing method labels to supported brewing_method_id values", 
       warning.includes("normalized to supported id 'v60'")
     ),
     "Expected a warning when a display label is remapped to a supported id.",
+  );
+});
+
+Deno.test("verify mode uses conservative system prompts at every stage", async () => {
+  const calls: Array<{ provider: string; stage: string }> = [];
+  const systemPrompts: Array<
+    { provider: string; stage: string; systemPrompt: string }
+  > = [];
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        tag: "groq/compound-mini",
+        extraction: createExtraction(),
+        normalized: createNormalized(),
+        cumulativeRewrite: {
+          warnings: [],
+          steps: createNormalized().steps,
+        },
+        calls,
+        systemPrompts,
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  await parser.parseDraft({
+    text: "Mock recipe",
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      {
+        brewing_method_id: "v60",
+        brewing_method: "Hario V60",
+      },
+    ],
+    requestId: "req-verify-mode",
+    mode: "verify",
+  });
+
+  const normalizationPrompt = systemPrompts.find((p) =>
+    p.stage === "normalization"
+  );
+  assert(
+    normalizationPrompt !== undefined,
+    "Expected normalization stage to run.",
+  );
+  assert(
+    normalizationPrompt!.systemPrompt.includes(
+      "description_template must equal description_source verbatim",
+    ),
+    "Expected verify-mode normalization prompt to demand verbatim preservation.",
+  );
+  assert(
+    normalizationPrompt!.systemPrompt.includes(
+      "Preparation step (order 1) is sacred",
+    ),
+    "Expected verify-mode normalization prompt to protect the preparation step.",
+  );
+  assert(
+    !normalizationPrompt!.systemPrompt.includes(
+      "concise timer-ready brewing instructions",
+    ),
+    "Expected verify-mode normalization prompt to drop the aggressive rewrite rule.",
+  );
+
+  const cumulativePrompt = systemPrompts.find((p) =>
+    p.stage === "cumulative_rewrite"
+  );
+  if (cumulativePrompt) {
+    assert(
+      cumulativePrompt.systemPrompt.includes(
+        "Only rewrite a later water-addition brew step when its description_source is unambiguously incremental",
+      ),
+      "Expected verify-mode cumulative prompt to restrict rewrites to unambiguous incremental wording.",
+    );
+  }
+});
+
+Deno.test("extract mode (default) keeps the original aggressive prompts", async () => {
+  const calls: Array<{ provider: string; stage: string }> = [];
+  const systemPrompts: Array<
+    { provider: string; stage: string; systemPrompt: string }
+  > = [];
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        tag: "groq/compound-mini",
+        extraction: createExtraction(),
+        normalized: createNormalized(),
+        calls,
+        systemPrompts,
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  await parser.parseDraft({
+    text: "Mock recipe",
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      {
+        brewing_method_id: "v60",
+        brewing_method: "Hario V60",
+      },
+    ],
+    requestId: "req-extract-mode",
+  });
+
+  const normalizationPrompt = systemPrompts.find((p) =>
+    p.stage === "normalization"
+  );
+  assert(
+    normalizationPrompt !== undefined,
+    "Expected normalization stage to run.",
+  );
+  assert(
+    normalizationPrompt!.systemPrompt.includes(
+      "concise timer-ready brewing instructions",
+    ),
+    "Expected extract-mode normalization prompt to keep the aggressive rewrite rule.",
+  );
+  assert(
+    !normalizationPrompt!.systemPrompt.includes(
+      "description_template must equal description_source verbatim",
+    ),
+    "Expected extract-mode normalization prompt NOT to demand verbatim preservation.",
+  );
+});
+
+function createMixedContextNormalized(): NormalizedDraft {
+  return {
+    detected_input_language: "en",
+    warnings: [],
+    recipe: {
+      brewing_method_id: "v60",
+      brewing_method_confidence: "high",
+      coffee_amount: 15,
+      water_amount: 250,
+      water_temp: 93,
+    },
+    localization: {
+      name: "Mixed Context",
+      grind_size: "Medium",
+      short_description: "Tests nearest-keyword amount resolution",
+    },
+    steps: [
+      {
+        kind: "preparation",
+        description_source: "Prepare the brewer.",
+        description_template: "Prepare the brewer.",
+        duration_seconds: 0,
+      },
+      {
+        kind: "brew",
+        description_source:
+          "Pour 50gr of hot water. Then add 15g coffee and stir.",
+        description_template:
+          "Pour 50gr of hot water. Then add 15g coffee and stir.",
+        duration_seconds: 90,
+      },
+      {
+        kind: "brew",
+        description_source: "Add coffee 30g water",
+        description_template: "Add coffee 30g water",
+        duration_seconds: 30,
+      },
+    ],
+  };
+}
+
+Deno.test("assigns mixed-context amounts by nearest keyword and keeps exact ties unconverted", async () => {
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction: createExtraction(),
+        normalized: createMixedContextNormalized(),
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: "Mock recipe",
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      {
+        brewing_method_id: "v60",
+        brewing_method: "Hario V60",
+      },
+    ],
+    requestId: "req-nearest",
+  });
+
+  assertEquals(
+    result.draft.steps[1].description_template,
+    "Pour (0.2 x <final_water_amount>)gr of hot water. Then add (1 x <final_coffee_amount>)g coffee and stir.",
+    "Expected a coffee dose surrounded by water and coffee wording to scale with coffee, not water, and gr to be a scalable unit.",
+  );
+  assertEquals(
+    result.draft.steps[2].description_template,
+    "Add coffee 30g water",
+    "Expected an amount exactly equidistant from coffee and water wording to stay unconverted.",
   );
 });

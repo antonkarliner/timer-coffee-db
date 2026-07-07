@@ -1,4 +1,5 @@
 import { z } from "https://deno.land/x/zod@v3.23.8/mod.ts";
+import { GEMINI_DEFAULT_MODEL, OPENAI_DEFAULT_MODEL } from "../_shared/ai-models.ts";
 
 export type LlmProviderName = "groq" | "cerebras" | "openai" | "gemini";
 
@@ -197,6 +198,8 @@ export type RecipeDraftParserConfig = {
   providers?: RecipeDraftAiProvider[];
 };
 
+export type RecipeDraftParserMode = "extract" | "verify";
+
 export type RecipeDraftParserInput = {
   text: string;
   userId: string;
@@ -205,6 +208,7 @@ export type RecipeDraftParserInput = {
   sourceLanguageHint?: string;
   requestId: string;
   disabledProviders?: LlmProviderName[];
+  mode?: RecipeDraftParserMode;
 };
 
 export type RecipeDraftParser = {
@@ -213,7 +217,7 @@ export type RecipeDraftParser = {
   ): Promise<ParseUserRecipeDraftResponse>;
 };
 
-const DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-lite-preview";
+const DEFAULT_GEMINI_MODEL = GEMINI_DEFAULT_MODEL;
 const OPENAI_CHAT_COMPLETIONS_URL =
   "https://api.openai.com/v1/chat/completions";
 const GROQ_CHAT_COMPLETIONS_URL =
@@ -235,6 +239,9 @@ const SCALABLE_UNITS = [
   "g",
   "g.",
   "gs",
+  "gr",
+  "gr.",
+  "grs",
   "ml",
   "ml.",
   "mll",
@@ -894,11 +901,42 @@ function getCleanestPlaceholder(args: {
     : "<final_water_amount>";
 }
 
-function hasContextKeyword(
-  context: string,
-  keywords: readonly string[],
-): boolean {
-  return keywords.some((keyword) => context.includes(keyword));
+function nearestKeywordDistance(args: {
+  description: string;
+  matchStart: number;
+  matchEnd: number;
+  keywords: readonly string[];
+}): number | null {
+  const contextStart = Math.max(0, args.matchStart - 32);
+  const contextEnd = Math.min(args.description.length, args.matchEnd + 32);
+  // Search before and after the amount separately so keyword distances stay
+  // valid even though normalization can shift character offsets.
+  const before = normalizeKeywordText(
+    args.description.slice(contextStart, args.matchStart),
+  );
+  const after = normalizeKeywordText(
+    args.description.slice(args.matchEnd, contextEnd),
+  );
+
+  let best: number | null = null;
+  for (const keyword of args.keywords) {
+    let index = before.indexOf(keyword);
+    while (index >= 0) {
+      const distance = before.length - (index + keyword.length);
+      if (best === null || distance < best) {
+        best = distance;
+      }
+      index = before.indexOf(keyword, index + 1);
+    }
+    index = after.indexOf(keyword);
+    while (index >= 0) {
+      if (best === null || index < best) {
+        best = index;
+      }
+      index = after.indexOf(keyword, index + 1);
+    }
+  }
+  return best;
 }
 
 function resolveAmountPlaceholder(args: {
@@ -910,27 +948,37 @@ function resolveAmountPlaceholder(args: {
   coffeeAmount: number | null;
   waterAmount: number | null;
 }): DraftExpression["placeholder"] | null {
-  const contextStart = Math.max(0, args.matchStart - 24);
-  const contextEnd = Math.min(args.description.length, args.matchEnd + 24);
-  const normalizedContext = normalizeKeywordText(
-    args.description.slice(contextStart, contextEnd),
-  );
+  const coffeeDistance = nearestKeywordDistance({
+    description: args.description,
+    matchStart: args.matchStart,
+    matchEnd: args.matchEnd,
+    keywords: COFFEE_CONTEXT_KEYWORDS,
+  });
+  const waterDistance = nearestKeywordDistance({
+    description: args.description,
+    matchStart: args.matchStart,
+    matchEnd: args.matchEnd,
+    keywords: WATER_CONTEXT_KEYWORDS,
+  });
 
-  const hasCoffeeContext = hasContextKeyword(
-    normalizedContext,
-    COFFEE_CONTEXT_KEYWORDS,
-  );
-  const hasWaterContext = hasContextKeyword(
-    normalizedContext,
-    WATER_CONTEXT_KEYWORDS,
-  );
-
-  if (hasCoffeeContext && !hasWaterContext) {
+  if (coffeeDistance !== null && waterDistance === null) {
     return "<final_coffee_amount>";
   }
 
-  if (hasWaterContext && !hasCoffeeContext) {
+  if (waterDistance !== null && coffeeDistance === null) {
     return "<final_water_amount>";
+  }
+
+  if (coffeeDistance !== null && waterDistance !== null) {
+    if (coffeeDistance < waterDistance) {
+      return "<final_coffee_amount>";
+    }
+    if (waterDistance < coffeeDistance) {
+      return "<final_water_amount>";
+    }
+    // Coffee and water wording are exactly equidistant — leave the amount
+    // unconverted rather than guessing.
+    return null;
   }
 
   if (args.stepKind === "brew" && args.waterAmount !== null) {
@@ -1435,7 +1483,7 @@ function buildProviders(
       createOpenAiCompatibleProvider({
         name: "openai",
         apiKey: config.openAiApiKey,
-        model: "gpt-5.4-mini",
+        model: OPENAI_DEFAULT_MODEL,
         endpoint: OPENAI_CHAT_COMPLETIONS_URL,
         fetchImpl,
       }),
@@ -1562,8 +1610,8 @@ function buildExtractionUserPrompt(input: {
   ].join("\n\n");
 }
 
-function buildNormalizationSystemPrompt(): string {
-  return [
+function buildNormalizationSystemPrompt(mode: RecipeDraftParserMode): string {
+  const baseRules = [
     "You normalize extracted coffee recipes for Timer.Coffee user recipes.",
     "Return only valid JSON.",
     "Storage locale is always 'en', but do not translate source text.",
@@ -1573,13 +1621,36 @@ function buildNormalizationSystemPrompt(): string {
     "If any step description mentions temperature, normalize that mention to Celsius too.",
     "short_description must be one concise recipe-level sentence, not a mini step list.",
     "Keep setup details, hardware modifications, filter prep, rinsing, and accessory instructions in the preparation step, not short_description.",
-    "description_template must be concise timer-ready brewing instructions, not transcript prose.",
-    "Use imperative wording. Remove commentary, marketing copy, explanations, and teaching asides such as why blooming happens or why filter orientation matters.",
-    "Preparation should be at most two compact sentences. Each brew step should normally be one compact sentence under 140 characters unless essential details would be lost.",
+  ];
+
+  const descriptionRules = mode === "verify"
+    ? [
+      "description_template must equal description_source verbatim unless one of the explicit rewrite reasons below applies.",
+      "Allowed rewrite reasons: (a) the description contains an invalid or missing scalable quantity placeholder that must be added or repaired so the recipe scales; (b) a fixed numeric coffee or water amount needs to become a scalable expression. Nothing else.",
+      "Forbidden rewrites in verify mode: do not shorten, summarise, paraphrase, translate, change punctuation, expand abbreviations, add brewing-technique names (V60, Hario, Aeropress, Chemex, etc.) not already present in the input, or invent context. Marketing copy, commentary, ranges, adjectives, and teaching asides in the user's text must be kept verbatim.",
+      "Preservation rules: never drop the nouns 'water', 'coffee', 'grounds', or 'beans' (or their localised equivalents). Never collapse a numeric range like '50-100g' or '50–100g' into a single value. Never change number formatting (digits, separators, units, hyphens). Never reword 'add X of water' to 'pour X' or vice versa.",
+      "Preparation step (order 1) is sacred. If description_source is a generic placeholder such as 'Preparation', 'Prep', 'Setup', a single-word language equivalent, or empty, return it unchanged in description_template. Do not invent equipment, setup actions, or brewer names.",
+      "If unsure whether a rewrite is required, do not rewrite.",
+    ]
+    : [
+      "description_template must be concise timer-ready brewing instructions, not transcript prose.",
+      "Use imperative wording. Remove commentary, marketing copy, explanations, and teaching asides such as why blooming happens or why filter orientation matters.",
+      "Preparation should be at most two compact sentences. Each brew step should normally be one compact sentence under 140 characters unless essential details would be lost.",
+    ];
+
+  const structuralRules = [
     "The first step must be kind 'preparation' with duration_seconds 0.",
     `All later steps must be kind 'brew' with integer duration_seconds at least ${MIN_BREW_STEP_DURATION_SECONDS}.`,
     "duration_seconds is the interval until the next action or completion of that step, not an elapsed timestamp label such as 0:45 or 1:30.",
-    "For multi-pour brew steps, prefer cumulative water totals after the first pour, e.g. 'pour up to 200g' rather than 'pour another 100g'.",
+  ];
+
+  const cumulativeHint = mode === "verify"
+    ? []
+    : [
+      "For multi-pour brew steps, prefer cumulative water totals after the first pour, e.g. 'pour up to 200g' rather than 'pour another 100g'.",
+    ];
+
+  const placeholderRules = [
     "Use only these scalable quantity placeholders when helpful:",
     "(1 x <final_coffee_amount>)g",
     "(0.2 x <final_water_amount>)g",
@@ -1591,6 +1662,14 @@ function buildNormalizationSystemPrompt(): string {
     "Do not invent missing values; use null.",
     "brewing_method_id must be exactly one of the allowed ids or null, never a display label.",
     "Preserve concrete amounts and units in meaning even when converting to expressions.",
+  ];
+
+  return [
+    ...baseRules,
+    ...descriptionRules,
+    ...structuralRules,
+    ...cumulativeHint,
+    ...placeholderRules,
   ].join(" ");
 }
 
@@ -1640,8 +1719,8 @@ function buildNormalizationUserPrompt(input: {
   ].join("\n\n");
 }
 
-function buildRepairSystemPrompt(): string {
-  return [
+function buildRepairSystemPrompt(mode: RecipeDraftParserMode): string {
+  const baseRules = [
     "You repair incomplete normalized coffee recipes for Timer.Coffee user recipes.",
     "Return only valid JSON.",
     "You must return the same normalized JSON shape as the normalization stage.",
@@ -1657,13 +1736,36 @@ function buildRepairSystemPrompt(): string {
     "Never return null for recipe.water_temp or localization.grind_size — always provide an inferred value if the source text is silent.",
     "short_description must be one concise recipe-level sentence, not a mini step list.",
     "Keep setup details, hardware modifications, filter prep, rinsing, and accessory instructions in the preparation step, not short_description.",
-    "description_template must be concise timer-ready brewing instructions, not transcript prose.",
-    "Use imperative wording. Remove commentary, marketing copy, explanations, and teaching asides such as why blooming happens or why filter orientation matters.",
-    "Preparation should be at most two compact sentences. Each brew step should normally be one compact sentence under 140 characters unless essential details would be lost.",
+  ];
+
+  const descriptionRules = mode === "verify"
+    ? [
+      "description_template must equal description_source verbatim unless one of the explicit rewrite reasons below applies.",
+      "Allowed rewrite reasons: (a) the description contains an invalid or missing scalable quantity placeholder that must be added or repaired so the recipe scales; (b) a fixed numeric coffee or water amount needs to become a scalable expression. Nothing else.",
+      "Forbidden rewrites in verify mode: do not shorten, summarise, paraphrase, translate, change punctuation, expand abbreviations, add brewing-technique names (V60, Hario, Aeropress, Chemex, etc.) not already present in the input, or invent context. Marketing copy, commentary, ranges, adjectives, and teaching asides in the user's text must be kept verbatim.",
+      "Preservation rules: never drop the nouns 'water', 'coffee', 'grounds', or 'beans' (or their localised equivalents). Never collapse a numeric range like '50-100g' or '50–100g' into a single value. Never change number formatting (digits, separators, units, hyphens). Never reword 'add X of water' to 'pour X' or vice versa.",
+      "Preparation step (order 1) is sacred. If description_source is a generic placeholder such as 'Preparation', 'Prep', 'Setup', a single-word language equivalent, or empty, return it unchanged in description_template. Do not invent equipment, setup actions, or brewer names.",
+      "If unsure whether a rewrite is required, do not rewrite.",
+    ]
+    : [
+      "description_template must be concise timer-ready brewing instructions, not transcript prose.",
+      "Use imperative wording. Remove commentary, marketing copy, explanations, and teaching asides such as why blooming happens or why filter orientation matters.",
+      "Preparation should be at most two compact sentences. Each brew step should normally be one compact sentence under 140 characters unless essential details would be lost.",
+    ];
+
+  const structuralRules = [
     "The first step must be kind 'preparation' with duration_seconds 0.",
     `All later steps must be kind 'brew' with integer duration_seconds at least ${MIN_BREW_STEP_DURATION_SECONDS}.`,
     "duration_seconds is the interval until the next action or completion of that step, not an elapsed timestamp label such as 0:45 or 1:30.",
-    "For multi-pour brew steps, prefer cumulative water totals after the first pour, e.g. 'pour up to 200g' rather than 'pour another 100g'.",
+  ];
+
+  const cumulativeHint = mode === "verify"
+    ? []
+    : [
+      "For multi-pour brew steps, prefer cumulative water totals after the first pour, e.g. 'pour up to 200g' rather than 'pour another 100g'.",
+    ];
+
+  const placeholderRules = [
     "Use only these scalable quantity placeholders when helpful:",
     "(1 x <final_coffee_amount>)g",
     "(0.2 x <final_water_amount>)g",
@@ -1672,6 +1774,14 @@ function buildRepairSystemPrompt(): string {
     "Never nest scalable expressions; use either a plain numeric amount or one complete expression like (1 x <final_coffee_amount>)g.",
     "Never emit <t1>..<t8> or any other time placeholder.",
     "brewing_method_id must be exactly one of the allowed ids or null, never a display label.",
+  ];
+
+  return [
+    ...baseRules,
+    ...descriptionRules,
+    ...structuralRules,
+    ...cumulativeHint,
+    ...placeholderRules,
   ].join(" ");
 }
 
@@ -1701,28 +1811,47 @@ function buildRepairUserPrompt(input: {
   ].join("\n\n");
 }
 
-function buildCumulativeRewriteSystemPrompt(): string {
-  return [
+function buildCumulativeRewriteSystemPrompt(
+  mode: RecipeDraftParserMode,
+): string {
+  const baseRules = [
     "You rewrite coffee recipe brew-step wording for Timer.Coffee.",
     "Return only valid JSON.",
     "Preserve the original language of the step descriptions. Do not translate.",
     "Keep step count, step order, kind, duration_seconds, and description_source unchanged.",
     "Only rewrite brew-step description_template fields when needed.",
-    "For multi-pour brew recipes, the first water-addition step may stay as the amount added in that step.",
-    "For later water-addition brew steps, prefer cumulative total water after the pour, such as 'pour up to 200g' rather than 'pour another 100g'.",
-    "Treat wording such as 'pour to 200g', 'pour until 200g', 'reach 200g', or '200g total' as already cumulative; do not add it to earlier pours.",
-    "If a step already uses cumulative total wording correctly, leave it unchanged.",
+  ];
+
+  const cumulativeRules = mode === "verify"
+    ? [
+      "Only rewrite a later water-addition brew step when its description_source is unambiguously incremental (for example 'add another 100g', 'pour 100g more', 'add an additional 100g').",
+      "If wording is ambiguous, neutral, or already cumulative ('pour to 200g', 'reach 200g', '200g total'), set description_template equal to description_source verbatim.",
+      "When you do rewrite, change only the quantity-and-preposition phrase. Preserve every other word: keep the noun 'water', keep ranges, keep adjectives, keep punctuation.",
+      "Never rewrite a preparation step in this stage. Never rewrite the first water-addition step.",
+      "If unsure whether a rewrite is required, do not rewrite.",
+    ]
+    : [
+      "For multi-pour brew recipes, the first water-addition step may stay as the amount added in that step.",
+      "For later water-addition brew steps, prefer cumulative total water after the pour, such as 'pour up to 200g' rather than 'pour another 100g'.",
+      "Treat wording such as 'pour to 200g', 'pour until 200g', 'reach 200g', or '200g total' as already cumulative; do not add it to earlier pours.",
+      "If a step already uses cumulative total wording correctly, leave it unchanged.",
+    ];
+
+  const tailRules = [
     "Preserve all valid scalable quantity placeholders and keep numeric multipliers valid.",
     "Never emit <t1>..<t8> or any other time placeholder.",
-  ].join(" ");
+  ];
+
+  return [...baseRules, ...cumulativeRules, ...tailRules].join(" ");
 }
 
 function buildCumulativeRewriteUserPrompt(input: {
+  mode: RecipeDraftParserMode;
   detectedInputLanguage: string | null;
   normalized: NormalizedDraft;
   draftSteps: DraftStep[];
 }): string {
-  return [
+  const sections = [
     "Rewrite later brew steps to cumulative total water wording only when needed.",
     input.detectedInputLanguage
       ? `Detected recipe language: ${input.detectedInputLanguage}`
@@ -1747,7 +1876,15 @@ function buildCumulativeRewriteUserPrompt(input: {
     JSON.stringify(input.normalized.steps, null, 2),
     "Current rendered draft steps for reference:",
     JSON.stringify(input.draftSteps, null, 2),
-  ].join("\n\n");
+  ];
+
+  if (input.mode === "verify") {
+    sections.push(
+      "For every step where no rewrite reason applies, set description_template equal to description_source verbatim.",
+    );
+  }
+
+  return sections.join("\n\n");
 }
 
 function renderPreviewText(
@@ -3504,7 +3641,7 @@ export function createRecipeDraftParser(
           >({
             requestId: input.requestId,
             stage: "normalization",
-            systemPrompt: buildNormalizationSystemPrompt(),
+            systemPrompt: buildNormalizationSystemPrompt(input.mode ?? "extract"),
             userPrompt: buildNormalizationUserPrompt({
               extraction,
               brewingMethods: input.brewingMethods,
@@ -3568,7 +3705,7 @@ export function createRecipeDraftParser(
                 .invokeJson<NormalizedDraft>({
                   requestId: input.requestId,
                   stage: "repair",
-                  systemPrompt: buildRepairSystemPrompt(),
+                  systemPrompt: buildRepairSystemPrompt(input.mode ?? "extract"),
                   userPrompt: buildRepairUserPrompt({
                     text: input.text,
                     extraction,
@@ -3666,8 +3803,9 @@ export function createRecipeDraftParser(
               await provider.invokeJson<CumulativeRewriteResult>({
                 requestId: input.requestId,
                 stage: "cumulative_rewrite",
-                systemPrompt: buildCumulativeRewriteSystemPrompt(),
+                systemPrompt: buildCumulativeRewriteSystemPrompt(input.mode ?? "extract"),
                 userPrompt: buildCumulativeRewriteUserPrompt({
+                  mode: input.mode ?? "extract",
                   detectedInputLanguage,
                   normalized,
                   draftSteps: provisionalDraftSteps,
