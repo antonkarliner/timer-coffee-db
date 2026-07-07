@@ -2,6 +2,8 @@
 import { serve } from "https://deno.land/std@0.223.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.42.5";
 import { getCorsHeaders } from "../_shared/cors.ts";
+import { GROQ_DEFAULT_MODEL } from "../_shared/ai-models.ts";
+import { fetchWithTimeout } from "../_shared/fetch-with-timeout.ts";
 import {
   getEnvVar,
   validateAndLogEnvironment,
@@ -59,7 +61,7 @@ const OPENAI_ENDPOINT = "https://api.openai.com/v1/responses";
 const GPT_LOGO_MODEL = "gpt-5-mini";
 const GPT_PARSE_MODEL = "gpt-5-mini";
 const GPT_EXTRACT_MODEL = "gpt-5.2";
-const SEARCH_RESULT_LIMIT = 6;
+const SEARCH_RESULT_LIMIT = 10;
 const CANDIDATE_CONTEXT_LIMIT = 8;
 const SEARCH_AGGREGATOR_DOMAINS = [
   "facebook.com",
@@ -91,7 +93,7 @@ const MAX_LOGOS_TO_VERIFY = 3; // Verify a small ranked set without blowing the 
 const PARSE_BATCH_SIZE = 3; // Process 3 pages per invocation (increased from 1)
 const FETCH_BATCH_SIZE = 3; // Fetch 3 URLs per invocation (increased from 1)
 const GROQ_TRIAGE_MODELS = [
-  "meta-llama/llama-4-scout-17b-16e-instruct",
+  GROQ_DEFAULT_MODEL,
   "llama-3.3-70b-versatile",
 ];
 const ADDRESS_REGEX =
@@ -255,24 +257,6 @@ function computeBackoff(attempt, baseMs = 500, maxMs = 8000) {
   const exponential = Math.min(maxMs, baseMs * 2 ** (attempt - 1));
   const jitter = Math.random() * exponential * 0.2;
   return exponential + jitter;
-}
-async function fetchWithTimeout(url, options, timeoutMs) {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const response = await fetch(url, {
-      ...options,
-      signal: controller.signal,
-    });
-    clearTimeout(timeoutId);
-    return response;
-  } catch (error) {
-    clearTimeout(timeoutId);
-    if (error instanceof Error && error.name === "AbortError") {
-      throw new Error(`Request timeout after ${timeoutMs}ms: ${url}`);
-    }
-    throw error;
-  }
 }
 async function fetchWithRetry(
   url,
@@ -487,6 +471,73 @@ function uniqueStrings(values) {
 }
 function safeArray(value) {
   return Array.isArray(value) ? value : [];
+}
+function rawSearchResultUrl(result: any): string | null {
+  return result?.link ?? result?.url ?? null;
+}
+function searchResultKind(result: any, source: string): string {
+  return typeof result?.query_kind === "string" ? result.query_kind : source;
+}
+function searchResultScore(
+  result: any,
+  source: string,
+  domain: string | null,
+): number {
+  const evidenceScore = typeof result?.evidence_score === "number"
+    ? result.evidence_score
+    : 0;
+  const kind = searchResultKind(result, source);
+  const beanBoost = source === "bean" || kind === "roaster_bean" ? 35 : 0;
+  const officialBoost = kind === "roaster_official" ? 8 : 0;
+  const aggregatorPenalty = isAggregatorDomain(domain) ? -30 : 0;
+  return evidenceScore + beanBoost + officialBoost + aggregatorPenalty;
+}
+function compactSearchResult(result: any, source: string, candidate: any) {
+  const rawUrl = rawSearchResultUrl(result);
+  if (!rawUrl) return null;
+  const normalized = normalizeUrl(rawUrl);
+  if (!normalized) return null;
+  const domain = extractDomain(normalized);
+  return {
+    title: typeof result.title === "string" ? result.title : null,
+    url: normalized,
+    domain,
+    snippet: typeof result.snippet === "string" ? result.snippet : null,
+    display_link: typeof result.display_link === "string"
+      ? result.display_link
+      : typeof result.displayLink === "string"
+      ? result.displayLink
+      : null,
+    query: typeof result.query === "string" ? result.query : null,
+    query_kind: searchResultKind(result, source),
+    evidence_score: typeof result.evidence_score === "number"
+      ? result.evidence_score
+      : null,
+    source,
+    candidate_roaster: typeof candidate?.roaster === "string"
+      ? candidate.roaster
+      : null,
+    coffee_bean_name: typeof candidate?.coffee_bean_name === "string"
+      ? candidate.coffee_bean_name
+      : null,
+    rank_score: searchResultScore(result, source, domain),
+  };
+}
+function buildBeanSearchPromptHints(candidates: any[], limit = 6) {
+  const hints: any[] = [];
+  const seenUrls = new Set<string>();
+  for (const candidate of candidates) {
+    for (const result of safeArray(candidate.bean_search_results)) {
+      const compact = compactSearchResult(result, "bean", candidate);
+      if (!compact || seenUrls.has(compact.url)) continue;
+      seenUrls.add(compact.url);
+      hints.push(compact);
+    }
+  }
+  hints.sort((a, b) =>
+    b.rank_score - a.rank_score || a.url.length - b.url.length
+  );
+  return hints.slice(0, limit).map(({ rank_score, ...hint }) => hint);
 }
 function parseCandidateNotes(notes) {
   if (typeof notes !== "string" || !notes.trim()) return null;
@@ -1090,10 +1141,11 @@ async function processTriageStage(job, correlationId) {
     job_id: job.id,
     cluster_id: job.cluster_id,
   }, correlationId);
-  const { cluster, candidates, reenrichment } = await loadClusterContext(
-    job,
-    correlationId,
-  );
+  const { cluster, candidates, reenrichment, contribution } =
+    await loadClusterContext(
+      job,
+      correlationId,
+    );
   if (reenrichment) {
     logInfo("Re-enrichment context detected", {
       cluster_id: cluster.id,
@@ -1123,6 +1175,20 @@ async function processTriageStage(job, correlationId) {
   }));
   // Collect URLs from candidates
   const urls = collectCandidateUrls(candidates, correlationId);
+  // Plan 011: thread the user-submitted website into the evidence so it both
+  // (a) gets fetched/parsed like an official site and (b) reaches every prompt
+  // via candidate_context (a high-confidence lead, still verified downstream).
+  if (contribution) {
+    candidateContext.user_contribution = {
+      website_url: contribution.website_url ?? null,
+      instagram_url: contribution.instagram_url ?? null,
+      city: contribution.city ?? null,
+      country: contribution.country ?? null,
+    };
+    if (contribution.website_url && !urls.includes(contribution.website_url)) {
+      urls.unshift(contribution.website_url);
+    }
+  }
   // Advance to fetch-candidates stage - include cluster and URLs to avoid re-fetching
   await updateJobStage(job, "fetch-candidates", {
     triage,
@@ -2290,39 +2356,64 @@ async function cleanupStuckJobs(correlationId) {
   logInfo(`Found ${stuckJobs.length} stuck job(s)`, {
     job_ids: stuckJobs.map((j) => j.id),
   }, correlationId);
-  // Reset stuck jobs to 'queued' state
-  const jobIds = stuckJobs.map((j) => j.id);
-  const { error: updateError } = await supabase.schema("service").from(
-    "roaster_enrichment_jobs",
-  ).update({
-    state: "queued",
-    locked_at: null,
-    locked_by: null,
-    last_error:
-      `Auto-reset: job stuck in running state for >${STUCK_JOB_TIMEOUT_MINUTES} minutes`,
-    run_after: new Date().toISOString(),
-  }).in("id", jobIds);
-  if (updateError) {
-    logError(
-      "Failed to reset stuck jobs",
-      toError(updateError),
-      ErrorCategory.DATABASE,
-      ErrorSeverity.HIGH,
+  // Treat an external runtime kill like any other failed attempt. Incrementing
+  // attempts and applying backoff prevents the oldest poison job from being
+  // immediately locked again and starving every newer queued job.
+  let recoveredCount = 0;
+  for (const job of stuckJobs) {
+    const failedAttempt = (job.attempts ?? 0) + 1;
+    const retryDelayMinutes = computeRetryDelayMinutes(failedAttempt);
+    const permanentlyFailed = failedAttempt >= MAX_JOB_RETRIES ||
+      retryDelayMinutes === null;
+    const runAfter = permanentlyFailed
+      ? null
+      : new Date(Date.now() + retryDelayMinutes * 60 * 1000).toISOString();
+    const lastError =
+      `Auto-recovered: job stuck in running state for >${STUCK_JOB_TIMEOUT_MINUTES} minutes`;
+    const { data: updatedJob, error: updateError } = await supabase.schema(
+      "service",
+    ).from(
+      "roaster_enrichment_jobs",
+    ).update({
+      state: permanentlyFailed ? "failed" : "queued",
+      attempts: failedAttempt,
+      locked_at: null,
+      locked_by: null,
+      last_error: lastError,
+      ...(runAfter ? { run_after: runAfter } : {}),
+    }).eq("id", job.id).eq("state", "running").select("id").maybeSingle();
+    if (updateError) {
+      logError(
+        "Failed to recover stuck job",
+        toError(updateError),
+        ErrorCategory.DATABASE,
+        ErrorSeverity.HIGH,
+        {
+          job_id: job.id,
+          failed_attempt: failedAttempt,
+        },
+        correlationId,
+      );
+      continue;
+    }
+    if (!updatedJob) {
+      logWarning("Stuck job changed state before recovery", {
+        job_id: job.id,
+      }, correlationId);
+      continue;
+    }
+    recoveredCount += 1;
+    logWarning(
+      permanentlyFailed ? "Stuck job marked as failed" : "Stuck job re-queued",
       {
-        job_count: stuckJobs.length,
+        job_id: job.id,
+        failed_attempt: failedAttempt,
+        run_after: runAfter,
       },
       correlationId,
     );
-    return 0;
   }
-  logInfo(
-    `Successfully reset ${stuckJobs.length} stuck job(s) to queued state`,
-    {
-      job_ids: jobIds,
-    },
-    correlationId,
-  );
-  return stuckJobs.length;
+  return recoveredCount;
 }
 async function loadClusterContext(job, correlationId) {
   logInfo("Loading cluster context", {
@@ -2376,6 +2467,33 @@ async function loadClusterContext(job, correlationId) {
     cluster_id: job.cluster_id,
     candidate_count: (candidates ?? []).length,
   }, correlationId);
+  // User-submitted contribution (plan 011): an app user provided the roaster's
+  // official website to expedite review. Treat it as a high-confidence identity
+  // lead downstream (still subject to verification). Latest one wins.
+  const { data: contributionRows, error: contributionError } = await supabase
+    .schema("service")
+    .from("roaster_candidate_contributions")
+    .select(
+      "website_url, website_domain, instagram_url, city, country, created_at",
+    )
+    .eq("cluster_id", job.cluster_id)
+    .order("created_at", { ascending: false })
+    .limit(1);
+  if (contributionError) {
+    logWarning("Failed to load roaster contributions", {
+      cluster_id: job.cluster_id,
+      error: getErrorMessage(contributionError),
+    }, correlationId);
+  }
+  const contribution = contributionRows && contributionRows.length > 0
+    ? contributionRows[0]
+    : null;
+  if (contribution) {
+    logInfo("User contribution detected for cluster", {
+      cluster_id: job.cluster_id,
+      website_domain: contribution.website_domain ?? null,
+    }, correlationId);
+  }
   const reviewerNotes = typeof job.reviewer_notes === "string"
     ? job.reviewer_notes
     : null;
@@ -2439,11 +2557,12 @@ async function loadClusterContext(job, correlationId) {
     candidates: candidates ?? [],
     priorResult,
     reenrichment,
+    contribution,
   };
 }
-function collectCandidateUrls(candidates, correlationId) {
-  const urlEntries = [];
-  const seenDomains = new Set();
+function collectCandidateUrls(candidates: any[], correlationId: string) {
+  const urlEntries: any[] = [];
+  const seenDomains = new Set<string>();
   logInfo("Collecting candidate URLs", {
     candidate_count: candidates.length,
   }, correlationId);
@@ -2451,11 +2570,11 @@ function collectCandidateUrls(candidates, correlationId) {
     const googleResults = safeArray(candidate.google_search_results);
     const beanResults = safeArray(candidate.bean_search_results);
     const mergedResults = [
-      ...googleResults,
-      ...beanResults,
+      ...beanResults.map((result) => ({ result, source: "bean" })),
+      ...googleResults.map((result) => ({ result, source: "google" })),
     ];
-    for (const result of mergedResults) {
-      const rawUrl = result.link ?? result.url;
+    for (const { result, source } of mergedResults) {
+      const rawUrl = rawSearchResultUrl(result);
       if (!rawUrl) continue;
       const normalized = normalizeUrl(rawUrl);
       if (!normalized) continue;
@@ -2466,20 +2585,17 @@ function collectCandidateUrls(candidates, correlationId) {
         continue;
       }
       const domain = extractDomain(normalized);
-      const evidenceScore = typeof result.evidence_score === "number"
-        ? result.evidence_score
-        : 0;
-      const sourceBoost = result.query_kind === "roaster_bean" ? 4 : 0;
-      const aggregatorPenalty = isAggregatorDomain(domain) ? -30 : 0;
       urlEntries.push({
         url: normalized,
         domain,
-        score: evidenceScore + sourceBoost + aggregatorPenalty,
+        score: searchResultScore(result, source, domain),
+        source,
+        query_kind: searchResultKind(result, source),
       });
     }
   }
   urlEntries.sort((a, b) => b.score - a.score || a.url.length - b.url.length);
-  const urls = [];
+  const urls: string[] = [];
   for (const entry of urlEntries) {
     if (!entry.domain) continue;
     if (seenDomains.has(entry.domain)) continue;
@@ -2507,43 +2623,46 @@ function collectCandidateUrls(candidates, correlationId) {
   }
   return urls;
 }
-function buildSearchEvidenceFromCandidates(candidates, correlationId) {
-  const results = [];
-  const seenUrls = new Set();
-  const pushResult = (result, source) => {
-    if (results.length >= SEARCH_RESULT_LIMIT) return;
-    const rawUrl = result.link ?? result.url;
-    if (!rawUrl) return;
-    const normalized = normalizeUrl(rawUrl);
-    if (!normalized || seenUrls.has(normalized)) return;
-    const domain = extractDomain(normalized);
-    results.push({
-      title: typeof result.title === "string" ? result.title : null,
-      url: normalized,
-      domain,
-      snippet: typeof result.snippet === "string" ? result.snippet : null,
-      display_link: typeof result.display_link === "string"
-        ? result.display_link
-        : typeof result.displayLink === "string"
-        ? result.displayLink
-        : null,
-      query: typeof result.query === "string" ? result.query : null,
-      query_kind: typeof result.query_kind === "string"
-        ? result.query_kind
-        : null,
-      evidence_score: typeof result.evidence_score === "number"
-        ? result.evidence_score
-        : null,
-      source,
-    });
-    seenUrls.add(normalized);
-  };
+function buildSearchEvidenceFromCandidates(
+  candidates: any[],
+  correlationId: string,
+) {
+  const rankedResults: any[] = [];
   for (const candidate of candidates) {
-    const googleResults = safeArray(candidate.google_search_results);
-    const beanResults = safeArray(candidate.bean_search_results);
-    for (const result of googleResults) pushResult(result, "google");
-    for (const result of beanResults) pushResult(result, "bean");
+    for (const result of safeArray(candidate.bean_search_results)) {
+      const compact = compactSearchResult(result, "bean", candidate);
+      if (compact) rankedResults.push(compact);
+    }
+    for (const result of safeArray(candidate.google_search_results)) {
+      const compact = compactSearchResult(result, "google", candidate);
+      if (compact) rankedResults.push(compact);
+    }
+  }
+  rankedResults.sort((a, b) =>
+    b.rank_score - a.rank_score || a.url.length - b.url.length
+  );
+  const results: any[] = [];
+  const seenUrls = new Set<string>();
+  for (const rankedResult of rankedResults) {
     if (results.length >= SEARCH_RESULT_LIMIT) break;
+    if (seenUrls.has(rankedResult.url)) continue;
+    const result = {
+      title: rankedResult.title,
+      url: rankedResult.url,
+      domain: rankedResult.domain,
+      snippet: rankedResult.snippet,
+      display_link: rankedResult.display_link,
+      query: rankedResult.query,
+      query_kind: rankedResult.query_kind,
+      evidence_score: rankedResult.evidence_score,
+      source: rankedResult.source,
+      candidate_roaster: rankedResult.candidate_roaster,
+      coffee_bean_name: rankedResult.coffee_bean_name,
+    };
+    results.push({
+      ...result,
+    });
+    seenUrls.add(rankedResult.url);
   }
   if (!results.length) {
     logInfo("No stored search evidence found", {
@@ -2556,13 +2675,21 @@ function buildSearchEvidenceFromCandidates(candidates, correlationId) {
   const candidateDomains = uniqueStrings(
     results.map((result) => result.domain).filter((domain) => Boolean(domain)),
   );
+  const beanResults = results.filter((result) => result.source === "bean");
   logInfo("Search evidence built from stored results", {
     result_count: results.length,
+    bean_result_count: beanResults.length,
     official_site: officialSite,
   }, correlationId);
   return {
     source: "stored_results",
     results,
+    bean_result_count: beanResults.length,
+    top_bean_domains: uniqueStrings(
+      beanResults.map((result) => result.domain).filter((domain) =>
+        Boolean(domain)
+      ),
+    ),
     official_site: officialSite,
     candidate_domains: candidateDomains,
     queries: uniqueStrings(
@@ -2749,13 +2876,22 @@ async function callGroqJson(prompt, model, correlationId) {
     label: "groq_triage",
     timeoutMs: AI_API_TIMEOUT_MS,
   });
-  if (response.status === 429 || response.status >= 500) {
-    throw new ProviderRetryableError(
-      `Groq retryable error: ${response.status}`,
-      response.status,
-    );
-  }
   if (!response.ok) {
+    const errorText = await response.text();
+    // Retry on transient errors (429/5xx) and on a decommissioned/unavailable
+    // model, so the loop cascades to the next GROQ_TRIAGE_MODELS entry
+    // (Llama 4 Scout deactivates 2026-07-17 and returns a 4xx, not a 5xx).
+    const code = errorText.toLowerCase();
+    const modelUnavailable = response.status === 404 ||
+      code.includes("decommission") || code.includes("deactiv") ||
+      code.includes("model_not_found") || code.includes("does not exist") ||
+      code.includes("does_not_exist");
+    if (response.status === 429 || response.status >= 500 || modelUnavailable) {
+      throw new ProviderRetryableError(
+        `Groq retryable error: ${response.status}`,
+        response.status,
+      );
+    }
     throw new Error(`Groq request failed: ${response.status}`);
   }
   const json = await response.json();
@@ -2766,18 +2902,20 @@ async function callGroqJson(prompt, model, correlationId) {
   return parseModelJson(content, {});
 }
 async function triageAndNormalize(
-  cluster,
-  candidates,
-  correlationId,
-  reenrichment,
+  cluster: any,
+  candidates: any[],
+  correlationId: string,
+  reenrichment: any,
 ) {
   const candidateNames = uniqueStrings(
     candidates.map((candidate) => candidate.roaster).filter(Boolean),
   );
+  const beanSearchHints = buildBeanSearchPromptHints(candidates);
   logInfo("Starting triage and normalization", {
     cluster_id: cluster.id,
     candidate_count: candidates.length,
     candidate_name_count: candidateNames.length,
+    bean_search_hint_count: beanSearchHints.length,
     reenrichment: !!reenrichment,
   }, correlationId);
   const reenrichmentBlock = buildReenrichmentPromptBlock({
@@ -2790,8 +2928,10 @@ async function triageAndNormalize(
   const prompt =
     `Normalize the roaster name and detect aliases. Return ONLY JSON with keys:
 {"display_name": string|null, "normalized_name": string|null, "aliases": string[], "is_roaster": boolean|null, "confidence": number|null, "notes": string|null}.
+When the roaster name is generic, ambiguous, or conflicts with the candidate URL evidence, use the roaster-name + coffee-bean-name search hints below to identify the intended entity. Do not ignore bean-specific evidence that points to a different roaster/domain than a generic search result.
 Cluster display name: ${cluster.display_name ?? ""}
-Candidate names: ${candidateNames.join(" | ")}${reenrichmentBlock}`;
+Candidate names: ${candidateNames.join(" | ")}
+Bean-name search hints: ${JSON.stringify(beanSearchHints)}${reenrichmentBlock}`;
   for (const model of GROQ_TRIAGE_MODELS) {
     try {
       const result = await callGroqJson(prompt, model, correlationId);
@@ -2840,11 +2980,11 @@ Candidate names: ${candidateNames.join(" | ")}${reenrichmentBlock}`;
   throw new Error("All Groq triage models failed");
 }
 async function summarizeEvidenceWithDeepSeek(
-  bundle,
-  triage,
-  correlationId,
-  jobDeadline,
-  reenrichment,
+  bundle: any,
+  triage: any,
+  correlationId: string,
+  jobDeadline: number | null | undefined,
+  reenrichment: any,
 ) {
   // Helper to check deadline if provided
   const isNearDeadline = (bufferMs = 10000) =>
@@ -2870,6 +3010,7 @@ async function summarizeEvidenceWithDeepSeek(
   const prompt =
     `Summarize the evidence into JSON. Use ONLY the evidence provided.
 IMPORTANT: Only include logo URLs that end with .png, .jpg, .jpeg, or .webp extensions. Exclude all other image formats.
+IMPORTANT: Treat roaster-name + coffee-bean-name search results in candidate_context.search_evidence as disambiguation evidence. If bean-specific results point to a different roaster/domain than generic roaster-name results, preserve that conflict in notes and sources instead of collapsing the identity too early.
 
 Return JSON with keys:
 {"website": string|null, "logos": string[], "addresses": string[], "city": string|null, "state": string|null, "country": string|null, "socials": string[], "sources": string[], "notes": string|null}
@@ -3014,11 +3155,11 @@ Evidence: ${
   };
 }
 async function extractWithOpenAI(
-  summary,
-  triage,
-  correlationId,
-  reenrichment,
-  candidateContext,
+  summary: any,
+  triage: any,
+  correlationId: string,
+  reenrichment: any,
+  candidateContext: any,
 ) {
   logInfo("Starting GPT extraction", {
     website: summary.website,
@@ -3043,6 +3184,8 @@ CRITICAL REQUIREMENTS:
 1. When selecting roaster_logo_url, ONLY choose from the provided logos array - these have been pre-verified as actual logos.
 2. Do NOT look for logos in other parts of evidence - only use the provided logos array.
 3. If no valid logo exists in logos array, set roaster_logo_url to null.
+4. Use bean-specific search evidence from candidate_context.search_evidence to disambiguate generic or conflicting roaster names. If the bean-specific evidence points to a different roaster/domain than the proposed website, include a conflict and lower confidence; do not silently pick the generic-domain result.
+5. candidate_context.user_contribution (when present) is a website submitted by an app user who logged this roaster's beans — a high-confidence signal of the official site. Prefer it as roaster_website_url when it is consistent with the other evidence, and prefer a roaster_logo_url whose domain matches it. If it clearly contradicts strong, repeated candidate evidence (e.g. a different country), record a conflict and lower confidence instead of blindly accepting it.
 
 Evidence summary: ${JSON.stringify(summary)}
 Candidate context from check-new-roaster: ${
@@ -3133,13 +3276,13 @@ Triage: ${JSON.stringify(triage)}${reenrichmentBlock}`;
   };
 }
 async function validateWithOpenAI(
-  summary,
-  triage,
-  extraction,
-  searchEvidence,
-  correlationId,
-  reenrichment,
-  candidateContext,
+  summary: any,
+  triage: any,
+  extraction: any,
+  searchEvidence: any,
+  correlationId: string,
+  reenrichment: any,
+  candidateContext: any,
 ) {
   logInfo("Starting OpenAI validation", {
     extraction_confidence: extraction.confidence ?? null,
@@ -3160,6 +3303,8 @@ async function validateWithOpenAI(
 {"proposed": {"roaster_name": string|null, "aliases": string[], "roaster_website_url": string|null, "roaster_logo_url": string|null, "city": string|null, "state": string|null, "country": string|null, "address": string|null, "is_roaster": boolean|null}, "confidence": number|null, "needs_review": boolean, "notes": string|null}
 
 IMPORTANT: Ensure that roaster_logo_url (if present) ends with .png, .jpg, .jpeg, or .webp extension. If the proposed logo is not in this format, either find a compliant logo from the evidence or set it to null.
+IMPORTANT: Review bean-specific search evidence before accepting the proposed identity. If roaster + bean-name results contradict the proposed roaster/domain, set needs_review=true and explain the conflict instead of approving a clean identity.
+IMPORTANT: If candidate_context.user_contribution is present, it is a user-submitted official website. Honor it as roaster_website_url when it is consistent with the evidence (and prefer a domain-matching logo); only override it when other strong evidence contradicts it, in which case set needs_review=true and explain.
 
 Evidence summary: ${JSON.stringify(summary)}
 Triage: ${JSON.stringify(triage)}
