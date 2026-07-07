@@ -161,7 +161,7 @@ serve(async (req)=>{
         responseMimeType: "application/json"
       }
     };
-    const response = await fetch(`https://${geminiRegion}-aiplatform.googleapis.com/v1/projects/${geminiProjectId}/locations/${geminiRegion}/publishers/google/models/gemini-2.0-flash-lite:generateContent`, {
+    const response = await fetch(`https://${geminiRegion}-aiplatform.googleapis.com/v1/projects/${geminiProjectId}/locations/${geminiRegion}/publishers/google/models/gemini-2.5-flash-lite:generateContent`, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${accessToken}`,

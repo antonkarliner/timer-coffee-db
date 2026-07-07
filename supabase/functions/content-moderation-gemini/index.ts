@@ -107,7 +107,7 @@ async function importPrivateKey(pem) {
   }
 }
 // --- Gemini API Interaction ---
-const GEMINI_MODEL = "gemini-2.0-flash-lite"; // Updated model
+const GEMINI_MODEL = "gemini-2.5-flash-lite";
 async function callGeminiApi(accessToken, requestBody) {
   const apiUrl = `https://${geminiRegion}-aiplatform.googleapis.com/v1/projects/${geminiProjectId}/locations/${geminiRegion}/publishers/google/models/${GEMINI_MODEL}:generateContent`;
   const response = await fetch(apiUrl, {
