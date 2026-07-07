@@ -54,7 +54,6 @@ timer-coffee-db/
 │   │   ├── roaster-enrichment-worker/
 │   │   ├── parse-coffee-label/
 │   │   ├── parse-coffee-label-gemini/
-│   │   ├── parse-coffee-label-groq/
 │   │   ├── content-moderation/
 │   │   ├── content-moderation-gemini/
 │   │   ├── translate-openai/

@@ -1,8 +1,11 @@
 import { serve } from "https://deno.land/std@0.223.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.42.5";
 import { getCorsHeaders } from "../_shared/cors.ts";
+import { GROQ_DEFAULT_MODEL, OPENAI_DEFAULT_MODEL, GEMINI_DEFAULT_MODEL, CEREBRAS_DEFAULT_MODEL } from "../_shared/ai-models.ts";
 // --- Provider credentials ---
+const cerebrasApiKey = Deno.env.get('CEREBRAS_API_KEY');
 const groqApiKey = Deno.env.get('GROQ_API_KEY');
+const openaiApiKey = Deno.env.get('OPENAI_API_KEY_NON_PERSONAL');
 const serviceAccountKey = Deno.env.get('GOOGLE_APPLICATION_CREDENTIALS_JSON');
 const geminiProjectId = Deno.env.get('GEMINI_PROJECT_ID') ?? '';
 const geminiRegion = Deno.env.get('GEMINI_REGION') ?? '';
@@ -19,10 +22,27 @@ function getErrorMessage(error) {
   if (error && typeof error === 'object' && 'message' in error) return String(error.message);
   return 'Unknown error occurred';
 }
-// Returns true for transient Groq errors that warrant a Gemini fallback
-function isGroqRetriableError(status) {
+// Pulls a provider error code/type out of a JSON error body (falls back to a
+// snippet of the raw body) so we can detect model-unavailable responses.
+function extractProviderErrorCode(body) {
+  try {
+    const parsed = JSON.parse(body);
+    return String(parsed?.error?.code ?? parsed?.error?.type ?? '');
+  } catch {
+    return typeof body === 'string' ? body.slice(0, 200) : '';
+  }
+}
+// Returns true for provider errors that warrant cascading to the next provider:
+// transient/network/parse errors, rate limits, and model-unavailable errors
+// (e.g. a decommissioned model — Llama 4 Scout deactivates 2026-07-17).
+function isRetriableProviderError(status, errorCode) {
   if (status === undefined) return true; // network/timeout/JSON parse errors
-  return status === 429 || status === 408 || status >= 500;
+  if (status === 429 || status === 408 || status >= 500) return true;
+  if (status === 404) return true; // model/endpoint not found
+  const code = (errorCode ?? '').toLowerCase();
+  return code.includes('decommission') || code.includes('deactiv') ||
+    code.includes('model_not_found') || code.includes('does_not_exist') ||
+    code.includes('does not exist');
 }
 function logInfoEvent(requestId, event, details = {}) {
   console.log(`[parse-coffee-label] ${event}`, {
@@ -120,6 +140,67 @@ function importGeminiPrivateKey(pem) {
     "sign"
   ]);
 }
+// --- Roast date validation helpers ---
+function parseRoastDate(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return null;
+  // Require strict YYYY-MM-DD shape to avoid Date() accepting odd inputs.
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(trimmed);
+  if (!match) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+  const d = new Date(Date.UTC(year, month - 1, day));
+  if (d.getUTCFullYear() !== year || d.getUTCMonth() !== month - 1 || d.getUTCDate() !== day) {
+    return null; // rejects e.g. 2026-02-29
+  }
+  return d;
+}
+function todayUtc() {
+  const now = new Date();
+  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+}
+function sixMonthsBefore(d) {
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() - 6, d.getUTCDate()));
+}
+function classifyRoastDate(d, today) {
+  if (d === null) return 'invalid';
+  if (d.getTime() > today.getTime()) return 'future';
+  if (d.getTime() < sixMonthsBefore(today).getTime()) return 'too_old';
+  return 'ok';
+}
+function formatUtcDate(d) {
+  const y = d.getUTCFullYear().toString().padStart(4, '0');
+  const m = (d.getUTCMonth() + 1).toString().padStart(2, '0');
+  const day = d.getUTCDate().toString().padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+function getStrictRoastDatePrompt(ocrText, originalRoastDate, classification, locale) {
+  const today = formatUtcDate(todayUtc());
+  const reason = classification === 'future'
+    ? `it is AFTER today's date (${today}), which is impossible for a roast date`
+    : `it is more than 6 months before today (${today}), which is unusual and often indicates a misread best-by / expiration date rather than a true roast date`;
+  let prompt = `You previously extracted a roast date from a coffee bag image, but the value "${originalRoastDate}" was rejected because ${reason}.
+
+Re-examine the image(s) and return ONLY the roast date. Rules:
+- Today's date is ${today}. The roast date MUST be on or before today; never return a date after ${today}.
+- Printed dates on coffee bags are usually one of: roast date, best-by / expiration date (typically 12-24 months AFTER the roast date), or harvest date. Never confuse these.
+- If the only printed date is a best-by or expiration date, return null.
+- If the roast date you identify is more than 6 months before today (${today}), only return it if you are confident the label clearly labels it as a roast date (e.g. "Roasted on", "Roast date", "Tostado el"); otherwise return null.
+- If you cannot identify a true roast date with confidence, return null.
+- Respond with valid JSON only, no code blocks, no backticks, in this exact shape:
+  { "roastDate": "YYYY-MM-DD" }
+  or
+  { "roastDate": null }
+- Locale for any text fields is ${locale}, but only the roastDate field is needed.`;
+  if (ocrText && ocrText.trim().length > 0) {
+    prompt = `${prompt}\n\nAdditional OCR context from mobile device: ${ocrText}`;
+  }
+  return prompt;
+}
 serve(async (req)=>{
   const requestId = crypto.randomUUID();
   const requestOrigin = req.headers.get("origin");
@@ -206,9 +287,70 @@ serve(async (req)=>{
       throw new Error(`${provider} returned an invalid JSON response`);
     }
   }
+  // --- Cerebras processing (primary) ---
+  const processWithCerebras = async (base64Images, systemPrompt)=>{
+    const userContent = [
+      {
+        type: "text",
+        text: `locale = ${locale}`
+      }
+    ];
+    if (base64Images && base64Images.length > 0) {
+      base64Images.forEach((base64)=>{
+        userContent.push({
+          type: "image_url",
+          image_url: {
+            url: `data:image/jpeg;base64,${base64}`
+          }
+        });
+      });
+    } else if (ocrText && ocrText.trim().length > 0) {
+      userContent.push({
+        type: "text",
+        text: `OCR context from mobile device: ${ocrText}`
+      });
+    }
+    const response = await fetch('https://api.cerebras.ai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${cerebrasApiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: CEREBRAS_DEFAULT_MODEL,
+        messages: [
+          {
+            role: "system",
+            content: systemPrompt
+          },
+          {
+            role: "user",
+            content: userContent
+          }
+        ],
+        temperature: 1,
+        top_p: 0.95,
+        max_completion_tokens: 1024,
+        stream: false
+      })
+    });
+    if (!response.ok) {
+      const errorText = await response.text();
+      logWarnEvent(requestId, 'cerebras_http_error', {
+        status: response.status,
+        responseBodyLength: errorText.length
+      });
+      const err = new Error(`Cerebras API request failed with status ${response.status}`);
+      err.status = response.status;
+      err.code = extractProviderErrorCode(errorText);
+      throw err;
+    }
+    const jsonResponse = await response.json();
+    const content = jsonResponse.choices[0].message.content;
+    return parseModelResponse(content, 'Cerebras');
+  };
   // --- Groq processing ---
-  const processWithGroq = async (base64Images)=>{
-    const systemPrompt = getSystemPrompt(ocrText);
+  const processWithGroq = async (base64Images, systemPrompt)=>{
     const userContent = [
       {
         type: "text",
@@ -237,7 +379,7 @@ serve(async (req)=>{
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
-        model: "meta-llama/llama-4-scout-17b-16e-instruct",
+        model: GROQ_DEFAULT_MODEL,
         messages: [
           {
             role: "system",
@@ -262,15 +404,74 @@ serve(async (req)=>{
       });
       const err = new Error(`Groq API request failed with status ${response.status}`);
       err.status = response.status;
+      err.code = extractProviderErrorCode(errorText);
       throw err;
     }
     const jsonResponse = await response.json();
     const content = jsonResponse.choices[0].message.content;
     return parseModelResponse(content, 'Groq');
   };
+  // --- OpenAI processing ---
+  const processWithOpenAI = async (base64Images, systemPrompt)=>{
+    const userContent = [
+      {
+        type: "text",
+        text: `locale = ${locale}`
+      }
+    ];
+    if (base64Images && base64Images.length > 0) {
+      base64Images.forEach((base64)=>{
+        userContent.push({
+          type: "image_url",
+          image_url: {
+            url: `data:image/jpeg;base64,${base64}`
+          }
+        });
+      });
+    } else if (ocrText && ocrText.trim().length > 0) {
+      userContent.push({
+        type: "text",
+        text: `OCR context from mobile device: ${ocrText}`
+      });
+    }
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${openaiApiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: OPENAI_DEFAULT_MODEL,
+        messages: [
+          {
+            role: "system",
+            content: systemPrompt
+          },
+          {
+            role: "user",
+            content: userContent
+          }
+        ],
+        max_completion_tokens: 4096
+      })
+    });
+    if (!response.ok) {
+      const errorText = await response.text();
+      logWarnEvent(requestId, 'openai_http_error', {
+        status: response.status,
+        responseBodyLength: errorText.length
+      });
+      const err = new Error(`OpenAI API request failed with status ${response.status}`);
+      err.status = response.status;
+      err.code = extractProviderErrorCode(errorText);
+      throw err;
+    }
+    const jsonResponse = await response.json();
+    const content = jsonResponse.choices[0].message.content;
+    return parseModelResponse(content, 'OpenAI');
+  };
   // --- Gemini processing (fallback) ---
-  const processWithGemini = async (base64Images)=>{
-    const systemPrompt = getSystemPrompt(ocrText);
+  const processWithGemini = async (base64Images, systemPrompt)=>{
     const accessToken = await getGeminiAccessToken();
     const parts = [
       {
@@ -306,7 +507,7 @@ serve(async (req)=>{
         responseMimeType: "application/json"
       }
     };
-    const response = await fetch(`https://${geminiRegion}-aiplatform.googleapis.com/v1/projects/${geminiProjectId}/locations/${geminiRegion}/publishers/google/models/gemini-2.5-flash-lite:generateContent`, {
+    const response = await fetch(`https://${geminiRegion}-aiplatform.googleapis.com/v1/projects/${geminiProjectId}/locations/${geminiRegion}/publishers/google/models/${GEMINI_DEFAULT_MODEL}:generateContent`, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${accessToken}`,
@@ -328,7 +529,7 @@ serve(async (req)=>{
   };
   try {
     const proUser = await isProUser(userId);
-    const tokenLimit = proUser ? 500 : 10;
+    const tokenLimit = proUser ? 500 : 20;
     const tokensUsedThisMonth = await getMonthlyTokensUsed(userId);
     const tokensToUse = imagesBase64 ? imagesBase64.length : 1;
     if (tokensUsedThisMonth + tokensToUse > tokenLimit) {
@@ -363,29 +564,98 @@ serve(async (req)=>{
       });
     }
     const images = hasImages ? imagesBase64.slice(0, 2) : null;
+    const primaryPrompt = getSystemPrompt(ocrText);
+    // Ordered provider chain: Cerebras (primary) → Groq → OpenAI → Gemini. Each
+    // tier runs only if its credential is configured; on a retriable error
+    // (incl. a decommissioned model) we cascade to the next configured tier.
+    const providerChain = [
+      { key: 'cerebras', configured: !!cerebrasApiKey, run: processWithCerebras },
+      { key: 'groq', configured: !!groqApiKey, run: processWithGroq },
+      { key: 'openai', configured: !!openaiApiKey, run: processWithOpenAI },
+      { key: 'gemini', configured: !!serviceAccountKey, run: processWithGemini }
+    ].filter((p)=>p.configured);
+    if (providerChain.length === 0) {
+      throw new Error('No AI provider configured (set one of CEREBRAS_API_KEY, GROQ_API_KEY, OPENAI_API_KEY_NON_PERSONAL, GOOGLE_APPLICATION_CREDENTIALS_JSON)');
+    }
     let result;
-    let provider = 'groq';
-    if (groqApiKey) {
+    let used = providerChain[0];
+    for(let i = 0; i < providerChain.length; i++){
+      const candidate = providerChain[i];
+      const isLast = i === providerChain.length - 1;
       try {
-        result = await processWithGroq(images);
-      } catch (groqError) {
-        const status = groqError.status;
-        if (isGroqRetriableError(status) && serviceAccountKey) {
-          logWarnEvent(requestId, 'groq_fallback_to_gemini', {
-            status: status ?? 'network_or_parse_error'
+        result = await candidate.run(images, primaryPrompt);
+        used = candidate;
+        break;
+      } catch (providerError) {
+        if (!isLast && isRetriableProviderError(providerError.status, providerError.code)) {
+          logWarnEvent(requestId, 'provider_fallback', {
+            from: candidate.key,
+            to: providerChain[i + 1].key,
+            status: providerError.status ?? 'network_or_parse_error',
+            code: providerError.code
           });
-          provider = 'gemini';
-          result = await processWithGemini(images);
-        } else {
-          throw groqError;
+          continue;
         }
+        throw providerError;
       }
-    } else if (serviceAccountKey) {
-      logInfoEvent(requestId, 'gemini_direct');
-      provider = 'gemini';
-      result = await processWithGemini(images);
-    } else {
-      throw new Error('No AI provider configured (missing GROQ_API_KEY and GOOGLE_APPLICATION_CREDENTIALS_JSON)');
+    }
+    const provider = used.key;
+    // --- Roast date re-check ---
+    // Skip if the result is the error envelope or has no roastDate field at all.
+    if (result && typeof result === 'object' && !Array.isArray(result) && !result.error && 'roastDate' in result) {
+      const today = todayUtc();
+      const originalRoastDate = result.roastDate;
+      const parsed = parseRoastDate(originalRoastDate);
+      const classification = classifyRoastDate(parsed, today);
+      if (originalRoastDate !== null && originalRoastDate !== undefined && parsed === null) {
+        // Unparseable string the model returned; coerce to null without re-checking.
+        result.roastDate = null;
+      } else if (classification === 'future' || classification === 'too_old') {
+        logInfoEvent(requestId, 'roast_date_recheck_triggered', {
+          provider,
+          classification,
+          originalRoastDate
+        });
+        const strictPrompt = getStrictRoastDatePrompt(ocrText, originalRoastDate, classification, locale);
+        let recheckRoastDate = null;
+        let recheckParsed = null;
+        let recheckClassification = 'invalid';
+        try {
+          const recheckResult = await used.run(images, strictPrompt);
+          if (recheckResult && typeof recheckResult === 'object' && !Array.isArray(recheckResult) && 'roastDate' in recheckResult) {
+            recheckRoastDate = recheckResult.roastDate ?? null;
+            recheckParsed = parseRoastDate(recheckRoastDate);
+            recheckClassification = classifyRoastDate(recheckParsed, today);
+          }
+        } catch (recheckError) {
+          logErrorEvent(requestId, 'roast_date_recheck_failed', recheckError, {
+            provider,
+            classification,
+            originalRoastDate
+          });
+        }
+        let finalRoastDate;
+        if (classification === 'future') {
+          // Accept the re-check only if it returned a valid non-future date.
+          finalRoastDate = recheckParsed !== null && recheckClassification !== 'future'
+            ? recheckRoastDate
+            : null;
+        } else {
+          // too_old: keep first-pass date unless re-check returned a valid date (old or fresh).
+          finalRoastDate = recheckParsed !== null && recheckClassification !== 'future'
+            ? recheckRoastDate
+            : originalRoastDate;
+        }
+        result.roastDate = finalRoastDate;
+        logInfoEvent(requestId, 'roast_date_recheck_result', {
+          provider,
+          classification,
+          originalRoastDate,
+          recheckRoastDate,
+          recheckClassification,
+          finalRoastDate
+        });
+      }
     }
     logInfoEvent(requestId, 'parse_succeeded', {
       provider,
