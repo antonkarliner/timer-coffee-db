@@ -6,10 +6,11 @@
 import OpenAI from "https://deno.land/x/openai@v4.38.3/mod.ts";
 import { getEnvVar } from "./env-validation.ts";
 import { logWarning, logError, ErrorCategory, ErrorSeverity } from "./monitoring.ts";
+import { OPENAI_MODELS } from "./ai-models.ts";
 
 // Configuration
 const OPENAI_API_KEY = getEnvVar('OPENAI_API_KEY_NON_PERSONAL');
-const OPENAI_MODEL = 'gpt-5.2';
+const OPENAI_MODEL = OPENAI_MODELS.BIG;
 const MAX_RETRIES = 3;
 const TIMEOUT_MS = 30000;
 
@@ -26,6 +27,10 @@ export interface TranslationResult {
  * Batch translation result map
  */
 export type BatchTranslationResult = Map<string, TranslationResult>;
+
+type NonStreamingChatCompletion = {
+  choices: Array<{ message?: { content?: string | null } }>;
+};
 
 /**
  * Validate OpenAI configuration
@@ -75,7 +80,10 @@ export async function translateText(
   // Simple retry loop (no exponential backoff)
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
-      const completion = await client.chat.completions.create({
+      // The pinned v4 client predates the GPT-5 reasoning_effort type, but the
+      // Chat Completions API accepts this field. Keep the runtime property while
+      // constraining the rest of the request to the SDK's request type.
+      const requestBody = {
         messages: [
           {
             role: "system",
@@ -94,9 +102,15 @@ Translate the following text to ${targetLocale} with these requirements:
           }
         ],
         model: OPENAI_MODEL,
+        reasoning_effort: "none",
         temperature: 0.3,
-        max_tokens: 500,
-      });
+        max_completion_tokens: 500,
+      } as Parameters<typeof client.chat.completions.create>[0] & {
+        reasoning_effort: "none";
+      };
+      const completion = await client.chat.completions.create(
+        requestBody,
+      ) as NonStreamingChatCompletion;
 
       const translatedText = completion.choices[0]?.message?.content?.trim();
       
@@ -126,7 +140,68 @@ Translate the following text to ${targetLocale} with these requirements:
 }
 
 /**
- * Translate notification content to multiple locales
+ * Result of parsing a batched-translation model response.
+ */
+export interface BatchTranslationParseResult {
+  /** Locale -> translated title/body, for locales successfully parsed out of the response. */
+  translations: Map<string, { title: string; body: string }>;
+  /** Locales that were requested but missing or invalid in the response. */
+  missing: string[];
+}
+
+/**
+ * Pure parsing/validation logic for the batched-translation model response.
+ * Extracted so it can be unit tested without a live OpenAI client.
+ *
+ * Expected shape: {"translations": {"<locale>": {"title": string, "body": string}, ...}}
+ * Any requested locale that is absent, or whose title/body is not a non-empty
+ * string, is reported in `missing` instead of `translations`.
+ *
+ * @param content Raw chat-completion message content (expected to be JSON)
+ * @param locales Locales that were requested
+ */
+export function parseBatchTranslationResponse(
+  content: string,
+  locales: string[]
+): BatchTranslationParseResult {
+  const translations = new Map<string, { title: string; body: string }>();
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    return { translations, missing: [...locales] };
+  }
+
+  const translationsObj = (parsed as Record<string, unknown> | null)?.["translations"];
+  if (!translationsObj || typeof translationsObj !== 'object') {
+    return { translations, missing: [...locales] };
+  }
+
+  const missing: string[] = [];
+  for (const locale of locales) {
+    const entry = (translationsObj as Record<string, unknown>)[locale] as
+      | { title?: unknown; body?: unknown }
+      | undefined;
+    const title = entry?.title;
+    const body = entry?.body;
+
+    if (
+      entry &&
+      typeof title === 'string' && title.trim().length > 0 &&
+      typeof body === 'string' && body.trim().length > 0
+    ) {
+      translations.set(locale, { title, body });
+    } else {
+      missing.push(locale);
+    }
+  }
+
+  return { translations, missing };
+}
+
+/**
+ * Translate notification content to multiple locales in a single chat-completion call.
  * @param locales Array of target locales (e.g., ['es', 'fr', 'de'])
  * @param title Notification title to translate
  * @param body Notification body to translate
@@ -143,45 +218,104 @@ export async function translateNotificationBatch(
 ): Promise<BatchTranslationResult> {
   const results = new Map<string, TranslationResult>();
 
-  // Translate all locales concurrently (no batching)
-  const translationPromises = locales.map(async (locale) => {
-    try {
-      const [translatedTitle, translatedBody] = await Promise.all([
-        translateText(title, locale, 'notification title', correlationId),
-        translateText(body, locale, 'notification body', correlationId),
-      ]);
+  if (locales.length === 0) {
+    return results;
+  }
 
-      return {
-        locale,
-        result: {
-          title: translatedTitle,
-          body: translatedBody,
-          data: { ...data },
+  let missingLocales = [...locales];
+
+  try {
+    const client = createOpenAIClient();
+    const maxTokens = Math.min(220 * locales.length + 100, 8000);
+
+    const requestBody = {
+      messages: [
+        {
+          role: "system",
+          content: `You are a professional translator for mobile push notifications. Translate concisely and preserve the original meaning and tone. Preserve technical terms and brand names (e.g. "Timer.Coffee") unchanged. Do not add explanations or notes. Respond ONLY with a JSON object of this exact shape: {"translations": {"<locale>": {"title": string, "body": string}, ...}}, with exactly one entry for every requested locale.`
         },
-      };
-    } catch (error) {
-      logError(`Failed to translate to ${locale}`, error as Error, ErrorCategory.EXTERNAL_API, ErrorSeverity.MEDIUM, {
-        correlationId,
+        {
+          role: "user",
+          content: JSON.stringify({ locales, title, body })
+        }
+      ],
+      model: OPENAI_MODEL,
+      reasoning_effort: "none",
+      temperature: 0.3,
+      max_completion_tokens: maxTokens,
+      response_format: { type: "json_object" },
+    } as Parameters<typeof client.chat.completions.create>[0] & {
+      reasoning_effort: "none";
+    };
+    const completion = await client.chat.completions.create(
+      requestBody,
+    ) as NonStreamingChatCompletion;
+
+    const content = completion.choices[0]?.message?.content ?? "";
+    const { translations, missing } = parseBatchTranslationResponse(content, locales);
+
+    for (const [locale, translated] of translations) {
+      results.set(locale, {
+        title: translated.title,
+        body: translated.body,
+        data: { ...data },
       });
-      
-      // Fallback to original text
-      return {
-        locale,
-        result: {
-          title,
-          body,
-          data: { ...data },
-        },
-      };
     }
-  });
+    missingLocales = missing;
 
-  // Wait for all translations to complete
-  const translationResults = await Promise.all(translationPromises);
+    if (missing.length > 0) {
+      logWarning(`Batched translation response missing locales, falling back per-locale`, {
+        correlationId,
+        missing,
+      });
+    }
+  } catch (error) {
+    logError(`Batched translation failed, falling back to per-locale translation`, error as Error, ErrorCategory.EXTERNAL_API, ErrorSeverity.MEDIUM, {
+      correlationId,
+    });
+    missingLocales = [...locales];
+  }
 
-  // Build the results map
-  for (const { locale, result } of translationResults) {
-    results.set(locale, result);
+  if (missingLocales.length > 0) {
+    // Fallback to the existing per-locale path (which itself falls back to
+    // the original text on failure) for whichever locales the batched call
+    // didn't produce.
+    const fallbackPromises = missingLocales.map(async (locale) => {
+      try {
+        const [translatedTitle, translatedBody] = await Promise.all([
+          translateText(title, locale, 'notification title', correlationId),
+          translateText(body, locale, 'notification body', correlationId),
+        ]);
+
+        return {
+          locale,
+          result: {
+            title: translatedTitle,
+            body: translatedBody,
+            data: { ...data },
+          },
+        };
+      } catch (error) {
+        logError(`Failed to translate to ${locale}`, error as Error, ErrorCategory.EXTERNAL_API, ErrorSeverity.MEDIUM, {
+          correlationId,
+        });
+
+        // Fallback to original text
+        return {
+          locale,
+          result: {
+            title,
+            body,
+            data: { ...data },
+          },
+        };
+      }
+    });
+
+    const fallbackResults = await Promise.all(fallbackPromises);
+    for (const { locale, result } of fallbackResults) {
+      results.set(locale, result);
+    }
   }
 
   return results;
