@@ -7,6 +7,14 @@ import OpenAI from "https://deno.land/x/openai@v4.38.3/mod.ts";
 import { getEnvVar } from "./env-validation.ts";
 import { logWarning, logError, ErrorCategory, ErrorSeverity } from "./monitoring.ts";
 import { OPENAI_MODELS } from "./ai-models.ts";
+import {
+  type BatchTranslationParseResult,
+  parseBatchTranslationResponse,
+} from "./translation-batch-parse.ts";
+
+// Re-exported so existing importers of this module keep working.
+export { parseBatchTranslationResponse };
+export type { BatchTranslationParseResult };
 
 // Configuration
 const OPENAI_API_KEY = getEnvVar('OPENAI_API_KEY_NON_PERSONAL');
@@ -137,67 +145,6 @@ Translate the following text to ${targetLocale} with these requirements:
   }
 
   return text; // Fallback
-}
-
-/**
- * Result of parsing a batched-translation model response.
- */
-export interface BatchTranslationParseResult {
-  /** Locale -> translated title/body, for locales successfully parsed out of the response. */
-  translations: Map<string, { title: string; body: string }>;
-  /** Locales that were requested but missing or invalid in the response. */
-  missing: string[];
-}
-
-/**
- * Pure parsing/validation logic for the batched-translation model response.
- * Extracted so it can be unit tested without a live OpenAI client.
- *
- * Expected shape: {"translations": {"<locale>": {"title": string, "body": string}, ...}}
- * Any requested locale that is absent, or whose title/body is not a non-empty
- * string, is reported in `missing` instead of `translations`.
- *
- * @param content Raw chat-completion message content (expected to be JSON)
- * @param locales Locales that were requested
- */
-export function parseBatchTranslationResponse(
-  content: string,
-  locales: string[]
-): BatchTranslationParseResult {
-  const translations = new Map<string, { title: string; body: string }>();
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(content);
-  } catch {
-    return { translations, missing: [...locales] };
-  }
-
-  const translationsObj = (parsed as Record<string, unknown> | null)?.["translations"];
-  if (!translationsObj || typeof translationsObj !== 'object') {
-    return { translations, missing: [...locales] };
-  }
-
-  const missing: string[] = [];
-  for (const locale of locales) {
-    const entry = (translationsObj as Record<string, unknown>)[locale] as
-      | { title?: unknown; body?: unknown }
-      | undefined;
-    const title = entry?.title;
-    const body = entry?.body;
-
-    if (
-      entry &&
-      typeof title === 'string' && title.trim().length > 0 &&
-      typeof body === 'string' && body.trim().length > 0
-    ) {
-      translations.set(locale, { title, body });
-    } else {
-      missing.push(locale);
-    }
-  }
-
-  return { translations, missing };
 }
 
 /**

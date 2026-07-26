@@ -1,4 +1,4 @@
-import { parseBatchTranslationResponse } from "./translation-service.ts";
+import { parseBatchTranslationResponse } from "./translation-batch-parse.ts";
 
 function assert(condition: boolean, message: string): void {
   if (!condition) {
