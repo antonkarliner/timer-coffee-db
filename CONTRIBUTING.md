@@ -88,7 +88,13 @@ Copy `.env.example` to `.env.local`. The file documents every variable. Key grou
 ### OpenAI
 | Variable | Purpose |
 |----------|---------|
-| `OPENAI_API_KEY` | Required for label parsing, translations, embeddings, and moderation |
+| `OPENAI_API_KEY_NON_PERSONAL` | Current coffee-label, recipe-draft, translation, moderation, roaster-enrichment, bean-processing, and collection-translation workloads |
+| `OPENAI_API_KEY` | Roaster similarity and embedding maintenance |
+| `OPENAI_MODEL_BIG` | High-capability generative tier (default `gpt-5.6-sol`) |
+| `OPENAI_MODEL_MEDIUM` | Balanced generative tier (default `gpt-5.6-terra`) |
+| `OPENAI_MODEL_SMALL` | Efficient generative tier (default `gpt-5.6-luna`) |
+| `OPENAI_MODEL_EMBEDDING` | Specialized embedding model (default `text-embedding-3-small`) |
+| `OPENAI_MODEL_MODERATION` | Specialized moderation model (default `omni-moderation-latest`) |
 
 ### Other AI Services
 | Variable | Purpose |

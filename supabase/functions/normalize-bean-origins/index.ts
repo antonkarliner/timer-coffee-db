@@ -19,7 +19,7 @@ import { serve } from "https://deno.land/std@0.223.0/http/server.ts";
 import OpenAI from "https://esm.sh/openai";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.42.5";
 import { getCorsHeaders } from "../_shared/cors.ts";
-import { OPENAI_DEFAULT_MODEL } from "../_shared/ai-models.ts";
+import { OPENAI_MODELS } from "../_shared/ai-models.ts";
 
 const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
 const supabaseServiceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
@@ -32,7 +32,7 @@ if (!openaiApiKey) {
   throw new Error("OPENAI_API_KEY_NON_PERSONAL is required.");
 }
 
-const MODEL = OPENAI_DEFAULT_MODEL;
+const MODEL = OPENAI_MODELS.MEDIUM;
 const MAX_PER_LLM_CALL = 40;
 
 const supabase = createClient(supabaseUrl, supabaseServiceRoleKey, {
@@ -75,6 +75,7 @@ async function classify(origins: string[]): Promise<Map<number, string[]>> {
   const out = new Map<number, string[]>();
   const completion = await openai.chat.completions.create({
     model: MODEL,
+    reasoning_effort: "none",
     response_format: { type: "json_object" },
     messages: [
       { role: "system", content: SYSTEM_PROMPT },

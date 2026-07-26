@@ -1,4 +1,5 @@
 import { createGeminiModerationClient } from "./moderation-gemini.ts";
+import { OPENAI_SPECIALIZED_MODELS } from "./ai-models.ts";
 
 export type ModerationResult = { safe: boolean; reason?: string };
 
@@ -98,7 +99,7 @@ export function createModerationClient(config: ModerationConfig) {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: "omni-moderation-latest",
+        model: OPENAI_SPECIALIZED_MODELS.MODERATION,
         input: [{ type: "text", text }],
       }),
     });

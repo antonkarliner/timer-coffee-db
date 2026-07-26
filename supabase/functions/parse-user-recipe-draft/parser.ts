@@ -1,5 +1,5 @@
 import { z } from "https://deno.land/x/zod@v3.23.8/mod.ts";
-import { GEMINI_DEFAULT_MODEL, OPENAI_DEFAULT_MODEL } from "../_shared/ai-models.ts";
+import { GEMINI_DEFAULT_MODEL, OPENAI_MODELS } from "../_shared/ai-models.ts";
 
 export type LlmProviderName = "groq" | "cerebras" | "openai" | "gemini";
 
@@ -1257,6 +1257,9 @@ function createOpenAiCompatibleProvider(args: {
           temperature: 0.1,
           max_completion_tokens: 2500,
           stream: false,
+          ...(args.name === "openai"
+            ? { reasoning_effort: "none" as const }
+            : {}),
         }),
       });
 
@@ -1483,7 +1486,7 @@ function buildProviders(
       createOpenAiCompatibleProvider({
         name: "openai",
         apiKey: config.openAiApiKey,
-        model: OPENAI_DEFAULT_MODEL,
+        model: OPENAI_MODELS.MEDIUM,
         endpoint: OPENAI_CHAT_COMPLETIONS_URL,
         fetchImpl,
       }),

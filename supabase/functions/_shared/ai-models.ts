@@ -1,22 +1,97 @@
 /**
  * Centralized AI model identifiers shared across edge functions.
  *
- * Keep model strings here so a version bump (or provider swap) happens in one
- * place instead of being duplicated across functions. Names are intentionally
- * version-agnostic (PROVIDER_DEFAULT_MODEL) so swapping the underlying model is
- * a one-line change here.
+ * OpenAI API consumers select a capability tier here. Runtime overrides come
+ * from the model environment variables read only by this module; reviewed
+ * defaults keep local development and new deployments deterministic.
  */
 
-// Groq default model — currently Llama 4 Scout (vision-capable). Used for
-// coffee-label parsing and as the primary roaster-enrichment triage model.
-// NOTE: Llama 4 Scout is scheduled for deactivation on 2026-07-17; swap the
-// value below before then (the parse-coffee-label fallback chain degrades
-// gracefully if it disappears, but other callers rely on this directly).
-export const GROQ_DEFAULT_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct";
+// Groq default model — currently Qwen 3.6 27B (vision-capable: max 5 images,
+// ≤4 MB base64 per request). Used for coffee-label parsing and as the primary
+// roaster-enrichment triage model. Replaced Llama 4 Scout ahead of its
+// 2026-07-17 deactivation, per Groq's recommended migration.
+export const GROQ_DEFAULT_MODEL = "qwen/qwen3.6-27b";
 
-// OpenAI default model (api.openai.com). General-purpose small model used for
-// vision parsing and translations.
-export const OPENAI_DEFAULT_MODEL = "gpt-5.4-mini";
+export type OpenAiModelTier = "BIG" | "MEDIUM" | "SMALL";
+
+export type OpenAiModelEnvReader = (name: string) => string | undefined;
+
+export interface OpenAiModelSettings {
+  readonly models: Readonly<Record<OpenAiModelTier, string>>;
+  readonly embedding: string;
+  readonly moderation: string;
+}
+
+const OPENAI_MODEL_DEFAULTS = Object.freeze({
+  BIG: "gpt-5.6-sol",
+  MEDIUM: "gpt-5.6-terra",
+  SMALL: "gpt-5.6-luna",
+  EMBEDDING: "text-embedding-3-small",
+  MODERATION: "omni-moderation-latest",
+});
+
+function readModelOverride(
+  readEnv: OpenAiModelEnvReader,
+  name: string,
+  fallback: string,
+): string {
+  const configured = readEnv(name)?.trim();
+  return configured || fallback;
+}
+
+/**
+ * Resolves all OpenAI API model configuration from an injectable environment
+ * reader. Keeping this pure makes defaults and overrides testable without
+ * mutating the process environment.
+ */
+export function resolveOpenAiModelSettings(
+  readEnv: OpenAiModelEnvReader,
+): Readonly<OpenAiModelSettings> {
+  const models = Object.freeze({
+    BIG: readModelOverride(
+      readEnv,
+      "OPENAI_MODEL_BIG",
+      OPENAI_MODEL_DEFAULTS.BIG,
+    ),
+    MEDIUM: readModelOverride(
+      readEnv,
+      "OPENAI_MODEL_MEDIUM",
+      OPENAI_MODEL_DEFAULTS.MEDIUM,
+    ),
+    SMALL: readModelOverride(
+      readEnv,
+      "OPENAI_MODEL_SMALL",
+      OPENAI_MODEL_DEFAULTS.SMALL,
+    ),
+  });
+
+  return Object.freeze({
+    models,
+    embedding: readModelOverride(
+      readEnv,
+      "OPENAI_MODEL_EMBEDDING",
+      OPENAI_MODEL_DEFAULTS.EMBEDDING,
+    ),
+    moderation: readModelOverride(
+      readEnv,
+      "OPENAI_MODEL_MODERATION",
+      OPENAI_MODEL_DEFAULTS.MODERATION,
+    ),
+  });
+}
+
+const openAiModelSettings = resolveOpenAiModelSettings((name) =>
+  Deno.env.get(name)
+);
+
+/** Generative OpenAI models. Consumers select a capability tier, not a model ID. */
+export const OPENAI_MODELS = openAiModelSettings.models;
+
+/** Specialized OpenAI model identifiers that do not belong to a generative tier. */
+export const OPENAI_SPECIALIZED_MODELS = Object.freeze({
+  EMBEDDING: openAiModelSettings.embedding,
+  MODERATION: openAiModelSettings.moderation,
+});
 
 // Google Gemini (Vertex AI) default model. GA model, shutdown 2027-05-07.
 export const GEMINI_DEFAULT_MODEL = "gemini-3.1-flash-lite";

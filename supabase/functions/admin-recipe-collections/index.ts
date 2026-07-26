@@ -4,12 +4,12 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2.42.5";
 import { getCorsHeaders } from "../_shared/cors.ts";
 import { createSecureResponse } from "../_shared/security-headers.ts";
 import { buildCollectionTranslationMessages } from "./translation-prompt.ts";
-import { OPENAI_DEFAULT_MODEL } from "../_shared/ai-models.ts";
+import { OPENAI_MODELS } from "../_shared/ai-models.ts";
 
 const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
 const supabaseServiceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
 const openaiApiKey = Deno.env.get("OPENAI_API_KEY_NON_PERSONAL") ?? "";
-const OPENAI_MODEL = Deno.env.get("OPENAI_TRANSLATION_MODEL") ?? OPENAI_DEFAULT_MODEL;
+const OPENAI_MODEL = OPENAI_MODELS.MEDIUM;
 
 if (!supabaseUrl || !supabaseServiceRoleKey) {
   throw new Error("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required.");
@@ -598,6 +598,7 @@ async function translateCollection(payload: Required<TranslationPayload>) {
 
   const completion = await openai.chat.completions.create({
     model: OPENAI_MODEL,
+    reasoning_effort: "none",
     response_format: { type: "json_object" },
     messages: buildCollectionTranslationMessages(payload, targetLocales),
   });

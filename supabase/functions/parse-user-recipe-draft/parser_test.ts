@@ -1162,7 +1162,7 @@ Deno.test("falls back from groq compound-mini extraction failure to groq gpt-oss
       }),
       createMockProvider({
         name: "openai",
-        tag: "openai/gpt-5.4-mini",
+        tag: "openai/gpt-5.6-terra",
         extraction: createExtraction(),
         normalized: createNormalized(),
         calls,
@@ -1231,7 +1231,7 @@ Deno.test("reuses extraction and falls back only normalization from groq compoun
       }),
       createMockProvider({
         name: "openai",
-        tag: "openai/gpt-5.4-mini",
+        tag: "openai/gpt-5.6-terra",
         extraction: createExtraction(),
         normalized: createNormalized(),
         calls,
@@ -1298,7 +1298,7 @@ Deno.test("falls through to openai when both groq models fail", async () => {
       }),
       createMockProvider({
         name: "openai",
-        tag: "openai/gpt-5.4-mini",
+        tag: "openai/gpt-5.6-terra",
         extraction: createExtraction(),
         normalized: createNormalized(),
         calls,
@@ -1333,7 +1333,7 @@ Deno.test("falls through to openai when both groq models fail", async () => {
   );
   assertEquals(
     result.provider_model_used,
-    "openai/gpt-5.4-mini",
+    "openai/gpt-5.6-terra",
     "Expected provider_model_used to identify the exact final model.",
   );
   assertEquals(
@@ -1341,8 +1341,8 @@ Deno.test("falls through to openai when both groq models fail", async () => {
     [
       { provider: "groq/compound-mini", stage: "extraction" },
       { provider: "groq/openai/gpt-oss-20b", stage: "extraction" },
-      { provider: "openai/gpt-5.4-mini", stage: "extraction" },
-      { provider: "openai/gpt-5.4-mini", stage: "normalization" },
+      { provider: "openai/gpt-5.6-terra", stage: "extraction" },
+      { provider: "openai/gpt-5.6-terra", stage: "normalization" },
     ],
     "Expected fallback order groq compound-mini -> groq gpt-oss-20b -> openai mini.",
   );
@@ -1366,7 +1366,7 @@ Deno.test("falls through to cerebras when groq models and openai fail", async ()
       }),
       createMockProvider({
         name: "openai",
-        tag: "openai/gpt-5.4-mini",
+        tag: "openai/gpt-5.6-terra",
         failExtraction: true,
         calls,
       }),
@@ -1408,7 +1408,7 @@ Deno.test("falls through to cerebras when groq models and openai fail", async ()
     [
       { provider: "groq/compound-mini", stage: "extraction" },
       { provider: "groq/openai/gpt-oss-20b", stage: "extraction" },
-      { provider: "openai/gpt-5.4-mini", stage: "extraction" },
+      { provider: "openai/gpt-5.6-terra", stage: "extraction" },
       {
         provider: "cerebras/qwen-3-235b-a22b-instruct-2507",
         stage: "extraction",

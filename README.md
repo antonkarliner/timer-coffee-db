@@ -19,7 +19,7 @@ Open-source backend for the [Timer.Coffee](https://timer.coffee) app — coffee 
 |-------|-----------|
 | Runtime | Deno (TypeScript) |
 | Infrastructure | Supabase (PostgreSQL 15, auth, storage, edge functions) |
-| AI | OpenAI (`text-embedding-3-small`, GPT-4o), Google Gemini, Groq |
+| AI | OpenAI (GPT-5.6 tiers, embeddings, moderation), Google Gemini, Groq |
 | Notifications | Firebase Cloud Messaging (FCM) |
 | Scheduling | pg_cron inside PostgreSQL |
 
@@ -83,7 +83,8 @@ Copy `.env.example` to `.env.local` for local development. The file documents al
 Key variable groups:
 
 - **Supabase** — `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`
-- **OpenAI** — `OPENAI_API_KEY`
+- **OpenAI keys** — `OPENAI_API_KEY_NON_PERSONAL`, `OPENAI_API_KEY`
+- **OpenAI models** — `OPENAI_MODEL_BIG`, `OPENAI_MODEL_MEDIUM`, `OPENAI_MODEL_SMALL`, plus specialized embedding and moderation model variables
 - **Google / Gemini** — `GOOGLE_APPLICATION_CREDENTIALS_JSON`, `GEMINI_PROJECT_ID`
 - **Firebase FCM** — `FIREBASE_SERVICE_ACCOUNT`, `FCM_PROJECT_ID`
 - **App stores** — `APPSTORE_ISSUER_ID`, `APPSTORE_KEY_ID`, `GOOGLE_PLAY_SERVICE_ACCOUNT`
