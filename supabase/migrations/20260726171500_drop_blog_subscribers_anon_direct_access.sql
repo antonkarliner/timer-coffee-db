@@ -1,0 +1,50 @@
+-- ============================================================================
+-- MIGRATION B of 2 — BREAKING UNTIL THE LANDING SITE IS DEPLOYED.
+-- ============================================================================
+-- DO NOT APPLY THIS FILE until timer-coffee-landing-2 has been deployed with
+-- the changes that switch src/pages/api/confirm.ts, unsubscribe.ts,
+-- subscribe.ts, and notify-subscribers.ts off direct
+-- `.from('blog_subscribers')` calls made with the anon key, and onto:
+--   - public.add_subscriber(...)          (already existed; now also returns
+--     `confirmed`, see 20260726170000_blog_subscribers_secure_rpc_functions.sql)
+--   - public.confirm_subscription(p_token)
+--   - public.unsubscribe_subscriber(p_token)
+--   - a service-role client for notify-subscribers.ts (server-only webhook
+--     guarded by SANITY_WEBHOOK_SECRET; it needs to read all confirmed
+--     subscribers, which cannot be scoped to a single token/anon caller)
+--
+-- Those functions were created as PREREQUISITE Migration A
+-- (20260726170000_blog_subscribers_secure_rpc_functions.sql), which is
+-- additive and was applied immediately since it does not change any
+-- existing behavior.
+--
+-- This migration (B) drops the two RLS policies that are the actual
+-- production data-exposure bug:
+--   - "Allow anon select access" (SELECT, {anon}, qual = true) lets anyone
+--     holding the publishable key — shipped in the website's client bundle —
+--     read every row of public.blog_subscribers: every subscriber's email
+--     and token.
+--   - "Allow anon update by token" (UPDATE, {anon}, qual = true,
+--     with_check = true) is misleadingly named: it does not check any token
+--     at the database level. PostgREST cannot see the client's
+--     `.eq('token', ...)` filter as part of RLS, so with qual = true any
+--     anon caller can UPDATE any row (e.g. flip any subscriber's `confirmed`
+--     off, or on, regardless of who holds that row's token).
+--
+-- Until the landing deploy above ships, the production site's
+-- subscribe/confirm/unsubscribe flows depend on these two policies for
+-- their direct table reads/writes. Dropping them now — before the code that
+-- calls the new RPC functions instead is live — would break those flows in
+-- production. Apply this migration ONLY after confirming the landing site
+-- deploy is live, using:
+--
+--   cd /Users/antonkarliner/GitHub/timer-coffee-db && echo "Y" | /opt/homebrew/bin/supabase db push
+--
+-- After this migration, anon has zero direct access to
+-- public.blog_subscribers (matching the INSERT policy "Block direct anon
+-- insert", with_check = false, which was already correct), and all access
+-- goes through the SECURITY DEFINER functions from Migration A.
+-- ============================================================================
+
+drop policy "Allow anon select access" on public.blog_subscribers;
+drop policy "Allow anon update by token" on public.blog_subscribers;
