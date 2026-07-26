@@ -2,7 +2,8 @@ import { serve } from "https://deno.land/std@0.223.0/http/server.ts";
 import OpenAI from "https://esm.sh/openai";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.42.5";
 import { getCorsHeaders } from "../_shared/cors.ts";
-import { OPENAI_DEFAULT_MODEL } from "../_shared/ai-models.ts";
+import { OPENAI_MODELS } from "../_shared/ai-models.ts";
+import { baseLang } from "./locale-utils.ts";
 
 const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
 const supabaseServiceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
@@ -15,7 +16,7 @@ if (!openaiApiKey) {
   throw new Error("OPENAI_API_KEY_NON_PERSONAL is required.");
 }
 
-const MODEL = OPENAI_DEFAULT_MODEL;
+const MODEL = OPENAI_MODELS.MEDIUM;
 
 const supabase = createClient(supabaseUrl, supabaseServiceRoleKey, {
   auth: { persistSession: false, detectSessionInUrl: false },
@@ -111,7 +112,7 @@ async function translateOne(
   if (
     text &&
     review.detected_source_locale &&
-    review.detected_source_locale.toLowerCase() === targetLocale.toLowerCase()
+    baseLang(review.detected_source_locale) === baseLang(targetLocale)
   ) {
     return { status: "same_language", source_locale: review.detected_source_locale };
   }
@@ -121,6 +122,9 @@ async function translateOne(
     `The user message is JSON {"review":<string>,"bean_name":<string>} (either may be empty). ` +
     `Detect the source language of the review text (or the bean name if the review is empty) ` +
     `as a BCP-47 code. ` +
+    `Return the base language subtag only (e.g. "en", not "en-US"). Treat regional ` +
+    `variants as the same language: if the source and "${targetLocale}" share the same ` +
+    `base language, respond with {"lang":"<detected-source>","same":true}. ` +
     `If the detected source language equals "${targetLocale}", respond with ` +
     `JSON {"lang":"<detected-source>","same":true} and do not translate. ` +
     `Otherwise respond with JSON {"lang":"<detected-source>",` +
@@ -134,6 +138,7 @@ async function translateOne(
   try {
     const completion = await openai.chat.completions.create({
       model: MODEL,
+      reasoning_effort: "none",
       response_format: { type: "json_object" },
       messages: [
         { role: "system", content: systemPrompt },
@@ -154,7 +159,7 @@ async function translateOne(
     return { status: "error", error: "OpenAI returned no source language." };
   }
 
-  if (parsed.same === true) {
+  if (parsed.same === true || baseLang(sourceLocale) === baseLang(targetLocale)) {
     if (text) {
       await supabase
         .from("bean_reviews")
