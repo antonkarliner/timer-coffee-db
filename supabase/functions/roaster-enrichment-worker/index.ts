@@ -2,8 +2,16 @@
 import { serve } from "https://deno.land/std@0.223.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.42.5";
 import { getCorsHeaders } from "../_shared/cors.ts";
-import { GROQ_DEFAULT_MODEL } from "../_shared/ai-models.ts";
+import {
+  GROQ_DEFAULT_MODEL,
+  OPENAI_MODELS,
+} from "../_shared/ai-models.ts";
 import { fetchWithTimeout } from "../_shared/fetch-with-timeout.ts";
+import {
+  boundEvidencePayload,
+  parseBatchedLogoResults,
+  stripHtmlForLlm,
+} from "../_shared/enrichment-prompt-utils.ts";
 import {
   getEnvVar,
   validateAndLogEnvironment,
@@ -55,12 +63,10 @@ const AI_API_TIMEOUT_MS = 10000; // 10s max for AI API calls
 const OPENAI_VALIDATE_TIMEOUT_MS = 20000; // 20s for OpenAI validation
 const OPENAI_EXTRACT_TIMEOUT_MS = 20000; // 20s for OpenAI extraction
 const LOGO_VERIFY_TIMEOUT_MS = 8000; // 8s max for logo verification
+const LOGO_BATCH_VERIFY_TIMEOUT_MS = 15000; // 15s max for batched logo verification
 const RPC_TIMEOUT_MS = 3000; // 3s max for RPC calls
 const FETCH_TIMEOUT_MS = 8000; // 8s max for external page fetches
 const OPENAI_ENDPOINT = "https://api.openai.com/v1/responses";
-const GPT_LOGO_MODEL = "gpt-5-mini";
-const GPT_PARSE_MODEL = "gpt-5-mini";
-const GPT_EXTRACT_MODEL = "gpt-5.2";
 const SEARCH_RESULT_LIMIT = 10;
 const CANDIDATE_CONTEXT_LIMIT = 8;
 const SEARCH_AGGREGATOR_DOMAINS = [
@@ -98,6 +104,36 @@ const GROQ_TRIAGE_MODELS = [
 ];
 const ADDRESS_REGEX =
   /\b\d{1,5}\s+[\w\.,'\-\s]{3,120},?\s+[\p{L}\s\.-]{2,80},?\s+[\p{L}\.\-\s]{2,80}\b/giu;
+// Shared proposed-roaster JSON schema fragment, reused verbatim by the
+// extract and validate prompts so their static prefixes stay byte-identical
+// across calls (enables provider prompt-prefix caching at the 5-min cron
+// cadence). See plans/001-roaster-enrichment-prompt-optimization.md item 5.
+const PROPOSED_SCHEMA_JSON =
+  `{"roaster_name": string|null, "aliases": string[], "roaster_website_url": string|null, "roaster_logo_url": string|null, "city": string|null, "state": string|null, "country": string|null, "address": string|null, "is_roaster": boolean|null}`;
+const EXTRACT_PROMPT_STATIC =
+  `You are extracting roaster fields from evidence. Return ONLY JSON with keys:
+{"proposed": ${PROPOSED_SCHEMA_JSON}, "confidence": number|null, "conflicts": string[], "notes": string|null}
+
+CRITICAL REQUIREMENTS:
+1. When selecting roaster_logo_url, ONLY choose from the provided logos array - these have been pre-verified as actual logos.
+2. Do NOT look for logos in other parts of evidence - only use the provided logos array.
+3. If no valid logo exists in logos array, set roaster_logo_url to null.
+4. Use bean-specific search evidence from candidate_context.search_evidence to disambiguate generic or conflicting roaster names. If the bean-specific evidence points to a different roaster/domain than the proposed website, include a conflict and lower confidence; do not silently pick the generic-domain result.
+5. candidate_context.user_contribution (when present) is a website submitted by an app user who logged this roaster's beans — a high-confidence signal of the official site. Prefer it as roaster_website_url when it is consistent with the other evidence, and prefer a roaster_logo_url whose domain matches it. If it clearly contradicts strong, repeated candidate evidence (e.g. a different country), record a conflict and lower confidence instead of blindly accepting it.`;
+const VALIDATE_PROMPT_STATIC =
+  `Validate and refine the proposed roaster data. Return ONLY JSON with keys:
+{"proposed": ${PROPOSED_SCHEMA_JSON}, "confidence": number|null, "needs_review": boolean, "notes": string|null}
+
+IMPORTANT: Ensure that roaster_logo_url (if present) ends with .png, .jpg, .jpeg, or .webp extension. If the proposed logo is not in this format, either find a compliant logo from the evidence or set it to null.
+IMPORTANT: Review bean-specific search evidence before accepting the proposed identity. If roaster + bean-name results contradict the proposed roaster/domain, set needs_review=true and explain the conflict instead of approving a clean identity.
+IMPORTANT: If candidate_context.user_contribution is present, it is a user-submitted official website. Honor it as roaster_website_url when it is consistent with the evidence (and prefer a domain-matching logo); only override it when other strong evidence contradicts it, in which case set needs_review=true and explain.`;
+const SUMMARY_PROMPT_STATIC =
+  `Summarize the evidence into JSON. Use ONLY the evidence provided.
+IMPORTANT: Only include logo URLs that end with .png, .jpg, .jpeg, or .webp extensions. Exclude all other image formats.
+IMPORTANT: Treat roaster-name + coffee-bean-name search results in candidate_context.search_evidence as disambiguation evidence. If bean-specific results point to a different roaster/domain than generic roaster-name results, preserve that conflict in notes and sources instead of collapsing the identity too early.
+
+Return JSON with keys:
+{"website": string|null, "logos": string[], "addresses": string[], "city": string|null, "state": string|null, "country": string|null, "socials": string[], "sources": string[], "notes": string|null}`;
 class ProviderRetryableError extends Error {
   status;
   constructor(message, status) {
@@ -137,7 +173,7 @@ async function verifyLogoWithOpenAI(imageUrl, roasterName, correlationId) {
   logInfo("Verifying logo with GPT", {
     imageUrl,
     roasterName,
-    model: GPT_LOGO_MODEL,
+    model: OPENAI_MODELS.MEDIUM,
   }, correlationId);
   const prompt =
     `You are a logo verification expert. Analyze this image and determine if it is a company logo.
@@ -160,9 +196,9 @@ Logo characteristics to look for:
 - NOT: product packaging with logos (the packaging itself, not the logo)
 - NOT: store interiors or product displays`;
   const requestBody = {
-    model: GPT_LOGO_MODEL,
+    model: OPENAI_MODELS.MEDIUM,
     reasoning: {
-      effort: "minimal",
+      effort: "none",
     },
     text: {
       format: {
@@ -205,7 +241,7 @@ Logo characteristics to look for:
         imageUrl,
         status: response.status,
         body: errorBody.slice(0, 500),
-        model: GPT_LOGO_MODEL,
+        model: OPENAI_MODELS.MEDIUM,
       }, correlationId);
       return {
         isLogo: false,
@@ -242,6 +278,104 @@ Logo characteristics to look for:
       confidence: 0,
       reason: `Verification failed: ${errorMessage.slice(0, 50)}`,
     };
+  }
+}
+async function verifyLogosBatchWithOpenAI(
+  imageUrls: string[],
+  roasterName: string,
+  correlationId: string,
+) {
+  logInfo("Verifying logos with GPT (batch)", {
+    imageCount: imageUrls.length,
+    roasterName,
+    model: OPENAI_MODELS.MEDIUM,
+  }, correlationId);
+  const n = imageUrls.length;
+  const prompt =
+    `You are a logo verification expert. You will receive ${n} images, numbered 0..${
+      n - 1
+    } in order. For each image, determine if it is a company logo.
+
+Expected brand name: ${roasterName}
+
+Logo characteristics to look for:
+- Distinctive brand mark or symbol
+- Text matching brand name
+- Simple, recognizable design
+- NOT: product photos, promotional graphics, people, scenery
+- NOT: product packaging with logos (the packaging itself, not the logo)
+- NOT: store interiors or product displays
+
+Return ONLY JSON: {"results":[{"index":0,"isLogo":true/false,"confidence":0.0-1.0,"reason":"<20 words"}, ...]} with exactly one entry per image.`;
+  const requestBody = {
+    model: OPENAI_MODELS.MEDIUM,
+    reasoning: {
+      effort: "none",
+    },
+    text: {
+      format: {
+        type: "json_object",
+      },
+    },
+    input: [
+      {
+        role: "user",
+        content: [
+          {
+            type: "input_text",
+            text: prompt,
+          },
+          ...imageUrls.map((imageUrl: string) => ({
+            type: "input_image",
+            image_url: imageUrl,
+          })),
+        ],
+      },
+    ],
+  };
+  try {
+    const response = await fetchWithRetry(OPENAI_ENDPOINT, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${openaiApiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(requestBody),
+    }, {
+      correlationId,
+      label: "gpt_logo_verify_batch",
+      timeoutMs: LOGO_BATCH_VERIFY_TIMEOUT_MS,
+      maxAttempts: 1,
+    });
+    if (!response.ok) {
+      const errorBody = await response.text();
+      logWarning("Batched logo verification HTTP error", {
+        imageCount: n,
+        status: response.status,
+        body: errorBody.slice(0, 500),
+        model: OPENAI_MODELS.MEDIUM,
+      }, correlationId);
+      return null;
+    }
+    const json = await response.json();
+    const outputText = extractOpenAiOutputText(json);
+    const parsed = parseModelJson(outputText, null);
+    const results = parseBatchedLogoResults(parsed, n);
+    if (!results) {
+      logWarning("Batched logo verification response unparsable", {
+        imageCount: n,
+        outputText: outputText?.slice?.(0, 500),
+      }, correlationId);
+      return null;
+    }
+    return results;
+  } catch (error) {
+    const errorMessage = getErrorMessage(error);
+    logWarning("Batched logo verification failed", {
+      imageCount: n,
+      error: errorMessage,
+    }, correlationId);
+    return null;
   }
 }
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -830,39 +964,48 @@ function extractAddresses(html) {
   );
   return uniqueStrings(matches.map((value) => value.trim())).slice(0, 6);
 }
+const PARSE_LLM_HTML_CHAR_CAP = 6000;
 async function parsePageWithLLM(url, html, correlationId) {
   logInfo("Parsing page with LLM", {
     url,
-    model: GPT_PARSE_MODEL,
+    model: OPENAI_MODELS.MEDIUM,
   }, correlationId);
   const manualParsed = parsePageEvidence(url, html);
+  // Manual (regex-based) parsing already fills title/jsonLd/og-tags/logos
+  // deterministically and for free. Only fall through to the LLM when it
+  // couldn't find enough — its marginal value is free-text addresses/names.
+  if (
+    manualParsed.title &&
+    (manualParsed.logos.length > 0 || manualParsed.addresses.length > 0)
+  ) {
+    logInfo("Skipping LLM page parse, manual parse sufficient", {
+      url,
+      logo_count: manualParsed.logos.length,
+      address_count: manualParsed.addresses.length,
+    }, correlationId);
+    return manualParsed;
+  }
+  const strippedHtml = stripHtmlForLlm(html).slice(0, PARSE_LLM_HTML_CHAR_CAP);
   const prompt =
-    `Parse this HTML page and extract structured information about a coffee roaster.
+    `Parse this web page content and extract structured information about a coffee roaster.
 Return ONLY JSON with this exact structure:
 {
   "title": string|null,
-  "jsonLd": unknown[],
-  "ogLogo": string|null,
-  "ogImage": string|null,
-  "logos": string[],
   "addresses": string[],
   "names": string[]
 }
 
 Important instructions:
-1. Extract the page title from <title> tag
-2. Extract JSON-LD from <script type="application/ld+json"> tags
-3. Extract og:logo and og:image from meta tags
-4. Find all logo URLs (must end with .png, .jpg, .jpeg, or .webp)
-5. Find all physical addresses
-6. Find all company/roaster names
+1. Extract the page title (from a <title> tag or the most prominent heading)
+2. Find all physical addresses
+3. Find all company/roaster names
 
-HTML content: ${html.slice(0, 10000)}`; // Limit to first 10KB
+Page content (HTML tags stripped, meta tags kept): ${strippedHtml}`;
   try {
     const requestBody = {
-      model: GPT_PARSE_MODEL,
+      model: OPENAI_MODELS.MEDIUM,
       reasoning: {
-        effort: "minimal",
+        effort: "none",
       },
       text: {
         format: {
@@ -889,7 +1032,7 @@ HTML content: ${html.slice(0, 10000)}`; // Limit to first 10KB
         url,
         status: response.status,
         body: errorBody.slice(0, 500),
-        model: GPT_PARSE_MODEL,
+        model: OPENAI_MODELS.MEDIUM,
       }, correlationId);
       throw new Error(`GPT parsing failed: ${response.status}`);
     }
@@ -902,26 +1045,9 @@ HTML content: ${html.slice(0, 10000)}`; // Limit to first 10KB
         ? result.title
         : manualParsed.title,
       jsonLd: manualParsed.jsonLd,
-      ogLogo: typeof result.ogLogo === "string"
-        ? result.ogLogo
-        : manualParsed.ogLogo,
-      ogImage: typeof result.ogImage === "string"
-        ? result.ogImage
-        : manualParsed.ogImage,
-      logos: filterLogosByExtension(uniqueStrings([
-        ...safeArray(result.logos),
-        ...manualParsed.logos,
-        ...typeof result.ogLogo === "string"
-          ? [
-            result.ogLogo,
-          ]
-          : [],
-        ...typeof result.ogImage === "string"
-          ? [
-            result.ogImage,
-          ]
-          : [],
-      ])),
+      ogLogo: manualParsed.ogLogo,
+      ogImage: manualParsed.ogImage,
+      logos: manualParsed.logos,
       addresses: uniqueStrings([
         ...safeArray(result.addresses),
         ...manualParsed.addresses,
@@ -1998,7 +2124,10 @@ async function translateLocationToEnglish(city, country, correlationId) {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          model: "gpt-5.2",
+          model: OPENAI_MODELS.MEDIUM,
+          reasoning: {
+            effort: "none",
+          },
           text: {
             format: {
               type: "json_object",
@@ -2082,6 +2211,26 @@ async function processValidateStage(job, correlationId) {
   // Run validation if needed
   let validation = undefined;
   const requiresValidation = needsValidation(extraction) || !!reenrichment;
+  // SHADOW-ONLY: compute the plan's stricter would-be gating rule and log it
+  // for comparison. Does NOT change whether validateWithOpenAI actually runs.
+  const extractionConfidence = extraction.confidence ?? 0;
+  const conflictCount = extraction.conflicts?.length ?? 0;
+  const shadowWouldRunValidation = extractionConfidence < 0.8 ||
+    conflictCount > 0 || !!reenrichment;
+  logInfo("Validation gating shadow decision", {
+    job_id: job.id,
+    current_requires_validation: requiresValidation,
+    shadow_would_run_validation: shadowWouldRunValidation,
+    extraction_confidence: extractionConfidence,
+    conflict_count: conflictCount,
+    reenrichment: !!reenrichment,
+  }, correlationId);
+  const validationGatingShadow = {
+    would_run: shadowWouldRunValidation,
+    extraction_confidence: extractionConfidence,
+    conflict_count: conflictCount,
+    reenrichment: !!reenrichment,
+  };
   if (requiresValidation) {
     const searchEvidence = candidateContext?.search_evidence ??
       buildSearchEvidenceFromCandidates(
@@ -2113,6 +2262,7 @@ async function processValidateStage(job, correlationId) {
     candidate_context: candidateContext ?? null,
     validation,
     requires_validation: requiresValidation,
+    validation_gating_shadow: validationGatingShadow,
   }, correlationId);
   logInfo("Validate stage completed, advanced to translate-location", {
     job_id: job.id,
@@ -2137,6 +2287,7 @@ async function processTranslateLocationStage(job, correlationId) {
     candidate_context: candidateContext,
     validation,
     requires_validation,
+    validation_gating_shadow: validationGatingShadow,
   } = stageData;
   // Determine final proposed fields
   const finalProposed = validation?.proposed ?? {
@@ -2175,6 +2326,7 @@ async function processTranslateLocationStage(job, correlationId) {
     candidate_context: candidateContext ?? null,
     validation,
     requires_validation,
+    validation_gating_shadow: validationGatingShadow,
     final_proposed: finalProposed,
     final_confidence: finalConfidence,
     status,
@@ -2203,6 +2355,7 @@ async function processFindMatchesStage(job, correlationId) {
     candidate_context: candidateContext,
     validation,
     requires_validation,
+    validation_gating_shadow: validationGatingShadow,
     final_proposed,
     final_confidence,
     status,
@@ -2227,6 +2380,7 @@ async function processFindMatchesStage(job, correlationId) {
     candidate_context: candidateContext ?? null,
     validation,
     requires_validation,
+    validation_gating_shadow: validationGatingShadow,
     final_proposed,
     final_confidence,
     status,
@@ -2252,6 +2406,7 @@ async function processPersistResultStage(job, correlationId) {
     urls,
     validation,
     candidate_context: candidateContext,
+    validation_gating_shadow: validationGatingShadow,
     final_proposed,
     final_confidence,
     status,
@@ -2263,8 +2418,8 @@ async function processPersistResultStage(job, correlationId) {
     models: {
       triage: triage.model,
       evidence: "deepseek-chat",
-      extraction: GPT_EXTRACT_MODEL,
-      validation: validation ? "gpt-5.2" : null,
+      extraction: OPENAI_MODELS.BIG,
+      validation: validation ? OPENAI_MODELS.BIG : null,
     },
     triage,
     extraction: {
@@ -2277,6 +2432,7 @@ async function processPersistResultStage(job, correlationId) {
         notes: validation.notes,
       }
       : null,
+    validation_gating_shadow: validationGatingShadow ?? null,
     candidate_context: candidateContext
       ? {
         initial_locations: candidateContext.initial_locations ?? [],
@@ -3007,26 +3163,30 @@ async function summarizeEvidenceWithDeepSeek(
     priorConfidence: null,
     includePriorPayload: false,
   });
-  const prompt =
-    `Summarize the evidence into JSON. Use ONLY the evidence provided.
-IMPORTANT: Only include logo URLs that end with .png, .jpg, .jpeg, or .webp extensions. Exclude all other image formats.
-IMPORTANT: Treat roaster-name + coffee-bean-name search results in candidate_context.search_evidence as disambiguation evidence. If bean-specific results point to a different roaster/domain than generic roaster-name results, preserve that conflict in notes and sources instead of collapsing the identity too early.
+  const boundedEvidence = boundEvidencePayload({
+    urls: bundle.urls,
+    pages: bundle.pages,
+    candidate_context: bundle.candidate_context ?? null,
+  });
+  if (boundedEvidence.truncated) {
+    logWarning("Evidence payload truncated for DeepSeek prompt", {
+      original_chars: boundedEvidence.originalChars,
+      final_chars: boundedEvidence.finalChars,
+      page_count: boundedEvidence.payload.pages.length,
+    }, correlationId);
+  }
+  // Static instruction/schema block first (byte-identical every call, so
+  // provider prefix caching applies), then all dynamic JSON, with the
+  // reenrichment block appended last.
+  const prompt = `${SUMMARY_PROMPT_STATIC}
 
-Return JSON with keys:
-{"website": string|null, "logos": string[], "addresses": string[], "city": string|null, "state": string|null, "country": string|null, "socials": string[], "sources": string[], "notes": string|null}
 Triage: ${
-      JSON.stringify({
-        display_name: triage.display_name,
-        aliases: triage.aliases,
-      })
-    }
-Evidence: ${
-      JSON.stringify({
-        urls: bundle.urls,
-        pages: bundle.pages,
-        candidate_context: bundle.candidate_context ?? null,
-      })
-    }${reenrichmentBlock}`;
+    JSON.stringify({
+      display_name: triage.display_name,
+      aliases: triage.aliases,
+    })
+  }
+Evidence: ${JSON.stringify(boundedEvidence.payload)}${reenrichmentBlock}`;
   const response = await fetchWithRetry(DEEPSEEK_ENDPOINT, {
     method: "POST",
     headers: {
@@ -3077,8 +3237,10 @@ Evidence: ${
     roasterName,
     parsed.website ?? null,
   );
-  // Verify each logo candidate with GPT before returning (limit to prevent timeouts)
-  const verifiedLogos = [];
+  // Verify logo candidates with GPT before returning (limit to prevent timeouts).
+  // Prefer a single batched call; fall back to per-logo calls if the batch
+  // is unavailable or unparsable.
+  const verifiedLogos: string[] = [];
   const logosToVerify = rankedLogos.slice(0, MAX_LOGOS_TO_VERIFY);
   if (rankedLogos.length > MAX_LOGOS_TO_VERIFY) {
     logInfo("Limiting logo verification to prevent timeout", {
@@ -3086,21 +3248,10 @@ Evidence: ${
       verifying: MAX_LOGOS_TO_VERIFY,
     }, correlationId);
   }
-  for (const logoUrl of logosToVerify) {
-    // Skip logo verification if running low on time
-    if (isNearDeadline(15000)) {
-      logWarning(
-        "Skipping remaining logo verification due to deadline",
-        {},
-        correlationId,
-      );
-      break;
-    }
-    const verification = await verifyLogoWithOpenAI(
-      logoUrl,
-      roasterName,
-      correlationId,
-    );
+  const recordLogoVerification = (
+    logoUrl: string,
+    verification: { isLogo: boolean; confidence: number; reason: string },
+  ) => {
     if (verification.isLogo && verification.confidence >= 0.7) {
       verifiedLogos.push(logoUrl);
       logInfo("Logo verified", {
@@ -3114,6 +3265,49 @@ Evidence: ${
         confidence: verification.confidence,
         reason: verification.reason,
       }, correlationId);
+    }
+  };
+  if (logosToVerify.length > 0) {
+    if (isNearDeadline(20000)) {
+      logWarning(
+        "Skipping all logo verification due to deadline",
+        { logo_count: logosToVerify.length },
+        correlationId,
+      );
+    } else {
+      const batchResults = await verifyLogosBatchWithOpenAI(
+        logosToVerify,
+        roasterName,
+        correlationId,
+      );
+      if (batchResults) {
+        for (let i = 0; i < logosToVerify.length; i += 1) {
+          recordLogoVerification(logosToVerify[i], batchResults[i]);
+        }
+      } else {
+        logWarning(
+          "Batched logo verification unavailable, falling back to per-logo verification",
+          { logo_count: logosToVerify.length },
+          correlationId,
+        );
+        for (const logoUrl of logosToVerify) {
+          // Skip logo verification if running low on time
+          if (isNearDeadline(15000)) {
+            logWarning(
+              "Skipping remaining logo verification due to deadline",
+              {},
+              correlationId,
+            );
+            break;
+          }
+          const verification = await verifyLogoWithOpenAI(
+            logoUrl,
+            roasterName,
+            correlationId,
+          );
+          recordLogoVerification(logoUrl, verification);
+        }
+      }
     }
   }
   // Add fallback note if no logos passed verification
@@ -3166,7 +3360,7 @@ async function extractWithOpenAI(
     logo_count: summary.logos.length,
     address_count: summary.addresses.length,
     source_count: summary.sources.length,
-    model: GPT_EXTRACT_MODEL,
+    model: OPENAI_MODELS.BIG,
     reenrichment: !!reenrichment,
   }, correlationId);
   const reenrichmentBlock = buildReenrichmentPromptBlock({
@@ -3176,24 +3370,18 @@ async function extractWithOpenAI(
     priorConfidence: reenrichment?.prior_confidence ?? null,
     includePriorPayload: true,
   });
-  const prompt =
-    `You are extracting roaster fields from evidence. Return ONLY JSON with keys:
-{"proposed": {"roaster_name": string|null, "aliases": string[], "roaster_website_url": string|null, "roaster_logo_url": string|null, "city": string|null, "state": string|null, "country": string|null, "address": string|null, "is_roaster": boolean|null}, "confidence": number|null, "conflicts": string[], "notes": string|null}
-
-CRITICAL REQUIREMENTS:
-1. When selecting roaster_logo_url, ONLY choose from the provided logos array - these have been pre-verified as actual logos.
-2. Do NOT look for logos in other parts of evidence - only use the provided logos array.
-3. If no valid logo exists in logos array, set roaster_logo_url to null.
-4. Use bean-specific search evidence from candidate_context.search_evidence to disambiguate generic or conflicting roaster names. If the bean-specific evidence points to a different roaster/domain than the proposed website, include a conflict and lower confidence; do not silently pick the generic-domain result.
-5. candidate_context.user_contribution (when present) is a website submitted by an app user who logged this roaster's beans — a high-confidence signal of the official site. Prefer it as roaster_website_url when it is consistent with the other evidence, and prefer a roaster_logo_url whose domain matches it. If it clearly contradicts strong, repeated candidate evidence (e.g. a different country), record a conflict and lower confidence instead of blindly accepting it.
+  // Static instruction/schema block first (byte-identical every call, so
+  // provider prefix caching applies), then all dynamic JSON, with the
+  // reenrichment block appended last.
+  const prompt = `${EXTRACT_PROMPT_STATIC}
 
 Evidence summary: ${JSON.stringify(summary)}
 Candidate context from check-new-roaster: ${
-      candidateContext ? JSON.stringify(candidateContext) : "null"
-    }
+    candidateContext ? JSON.stringify(candidateContext) : "null"
+  }
 Triage: ${JSON.stringify(triage)}${reenrichmentBlock}`;
   const requestBody = {
-    model: GPT_EXTRACT_MODEL,
+    model: OPENAI_MODELS.BIG,
     reasoning: {
       effort: "none",
     },
@@ -3221,7 +3409,7 @@ Triage: ${JSON.stringify(triage)}${reenrichmentBlock}`;
     logWarning("GPT extraction HTTP error", {
       status: response.status,
       body: body.slice(0, 500),
-      model: GPT_EXTRACT_MODEL,
+      model: OPENAI_MODELS.BIG,
     }, correlationId);
     throw new Error(`GPT extraction failed: ${response.status} ${body}`);
   }
@@ -3298,20 +3486,17 @@ async function validateWithOpenAI(
     priorConfidence: reenrichment?.prior_confidence ?? null,
     includePriorPayload: true,
   });
-  const prompt =
-    `Validate and refine the proposed roaster data. Return ONLY JSON with keys:
-{"proposed": {"roaster_name": string|null, "aliases": string[], "roaster_website_url": string|null, "roaster_logo_url": string|null, "city": string|null, "state": string|null, "country": string|null, "address": string|null, "is_roaster": boolean|null}, "confidence": number|null, "needs_review": boolean, "notes": string|null}
-
-IMPORTANT: Ensure that roaster_logo_url (if present) ends with .png, .jpg, .jpeg, or .webp extension. If the proposed logo is not in this format, either find a compliant logo from the evidence or set it to null.
-IMPORTANT: Review bean-specific search evidence before accepting the proposed identity. If roaster + bean-name results contradict the proposed roaster/domain, set needs_review=true and explain the conflict instead of approving a clean identity.
-IMPORTANT: If candidate_context.user_contribution is present, it is a user-submitted official website. Honor it as roaster_website_url when it is consistent with the evidence (and prefer a domain-matching logo); only override it when other strong evidence contradicts it, in which case set needs_review=true and explain.
+  // Static instruction/schema block first (byte-identical every call, so
+  // provider prefix caching applies), then all dynamic JSON, with the
+  // reenrichment block appended last.
+  const prompt = `${VALIDATE_PROMPT_STATIC}
 
 Evidence summary: ${JSON.stringify(summary)}
 Triage: ${JSON.stringify(triage)}
 Search evidence: ${searchEvidence ? JSON.stringify(searchEvidence) : "null"}
 Candidate context from check-new-roaster: ${
-      candidateContext ? JSON.stringify(candidateContext) : "null"
-    }
+    candidateContext ? JSON.stringify(candidateContext) : "null"
+  }
 Proposed: ${JSON.stringify(extraction)}.${reenrichmentBlock}`;
   const response = await fetchWithRetry(OPENAI_ENDPOINT, {
     method: "POST",
@@ -3320,7 +3505,7 @@ Proposed: ${JSON.stringify(extraction)}.${reenrichmentBlock}`;
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      model: "gpt-5.2",
+      model: OPENAI_MODELS.BIG,
       reasoning: {
         effort: "none",
       },
@@ -3341,7 +3526,7 @@ Proposed: ${JSON.stringify(extraction)}.${reenrichmentBlock}`;
     logWarning("OpenAI validation HTTP error", {
       status: response.status,
       body: body.slice(0, 500),
-      model: "gpt-5.2",
+      model: OPENAI_MODELS.BIG,
     }, correlationId);
     throw new Error(`OpenAI validation failed: ${response.status} ${body}`);
   }
