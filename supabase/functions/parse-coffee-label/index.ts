@@ -1,7 +1,21 @@
 import { serve } from "https://deno.land/std@0.223.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.42.5";
 import { getCorsHeaders } from "../_shared/cors.ts";
-import { GROQ_DEFAULT_MODEL, OPENAI_DEFAULT_MODEL, GEMINI_DEFAULT_MODEL, CEREBRAS_DEFAULT_MODEL } from "../_shared/ai-models.ts";
+import {
+  CEREBRAS_DEFAULT_MODEL,
+  GEMINI_DEFAULT_MODEL,
+  GROQ_DEFAULT_MODEL,
+  OPENAI_MODELS,
+} from "../_shared/ai-models.ts";
+import {
+  buildSystemPrompt,
+  isPlausibleLabelResult,
+  LABEL_RESPONSE_SCHEMA,
+  normalizeResult,
+  type ProviderResponseSchema,
+  ROAST_DATE_RESPONSE_SCHEMA,
+  shouldFallbackProviderError,
+} from "./label-utils.ts";
 // --- Provider credentials ---
 const cerebrasApiKey = Deno.env.get('CEREBRAS_API_KEY');
 const groqApiKey = Deno.env.get('GROQ_API_KEY');
@@ -22,27 +36,40 @@ function getErrorMessage(error) {
   if (error && typeof error === 'object' && 'message' in error) return String(error.message);
   return 'Unknown error occurred';
 }
-// Pulls a provider error code/type out of a JSON error body (falls back to a
-// snippet of the raw body) so we can detect model-unavailable responses.
+// Pulls a provider error code/type out of a JSON error body. Never return the
+// raw body: provider responses can contain request details that do not belong
+// in logs.
 function extractProviderErrorCode(body) {
   try {
     const parsed = JSON.parse(body);
     return String(parsed?.error?.code ?? parsed?.error?.type ?? '');
   } catch {
-    return typeof body === 'string' ? body.slice(0, 200) : '';
+    return '';
   }
 }
-// Returns true for provider errors that warrant cascading to the next provider:
-// transient/network/parse errors, rate limits, and model-unavailable errors
-// (e.g. a decommissioned model — Llama 4 Scout deactivates 2026-07-17).
-function isRetriableProviderError(status, errorCode) {
-  if (status === undefined) return true; // network/timeout/JSON parse errors
-  if (status === 429 || status === 408 || status >= 500) return true;
-  if (status === 404) return true; // model/endpoint not found
-  const code = (errorCode ?? '').toLowerCase();
-  return code.includes('decommission') || code.includes('deactiv') ||
-    code.includes('model_not_found') || code.includes('does_not_exist') ||
-    code.includes('does not exist');
+class ProviderHttpError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly code?: string,
+  ) {
+    super(message);
+    this.name = "ProviderHttpError";
+  }
+}
+function getProviderErrorMetadata(error: unknown): {
+  status?: number;
+  code?: string;
+} {
+  if (!error || typeof error !== "object") return {};
+  return {
+    status: "status" in error && typeof error.status === "number"
+      ? error.status
+      : undefined,
+    code: "code" in error && typeof error.code === "string"
+      ? error.code
+      : undefined,
+  };
 }
 function logInfoEvent(requestId, event, details = {}) {
   console.log(`[parse-coffee-label] ${event}`, {
@@ -224,33 +251,11 @@ serve(async (req)=>{
     locale: typeof locale === 'string' ? locale : null,
     hasUserId: typeof userId === 'string' && userId.length > 0
   });
-  const currentYear = new Date().getFullYear();
-  const getSystemPrompt = (ocrText)=>{
-    let basePrompt = `Extract the following fields from the image and respond in JSON format as a single JSON object (do not return an array). If there are multiple images, combine the info into one response. Translate suitable fields to ${locale}. Only respond with valid JSON. No code blocks, no backticks. If there are upper case values, convert them to capitalized case. Use the following JSON structure:
-  {
-    "roaster": "roaster",
-    "name": "name",
-    "origin": "origin (country of origin, translated to ${locale})",
-    "farm": "farm",
-    "farmer": "farmer",
-    "variety": "variety",
-    "processingMethod": "Processing Method (translated to ${locale})",
-    "elevation": "elevation (number only)",
-    "harvestDate": "always null, assume that there's no harvest data in the image)",
-    "roastDate": "roast date (YYYY-MM-DD, assume the current year is ${currentYear} if not explicitly provided)",
-    "region": "region (region of country of origin, translated to ${locale})",
-    "roastLevel": "roast level (translated to ${locale})",
-    "cuppingScore": "cupping score",
-    "tastingNotes": "tasting notes (translated to ${locale}, separated by comma, Capitalized. No untranslated notes.)",
-    "packageWeightGrams": "number, up to 2 decimal places, min. value 0.1"
-  }
-  If no coffee labels are detected in any images, return:
-  { "error": "No coffee labels detected" }`;
-    if (ocrText && ocrText.trim().length > 0) {
-      basePrompt = `${basePrompt}\n\nAdditional OCR context from mobile device: ${ocrText}`;
-    }
-    return basePrompt;
-  };
+  const getSystemPrompt = (ocrText)=>buildSystemPrompt({
+      locale,
+      today: formatUtcDate(todayUtc()),
+      ocrText
+    });
   async function isProUser(userId) {
     const { data, error } = await supabase.from('pro_users').select('user_id').eq('user_id', userId);
     if (error) {
@@ -268,17 +273,6 @@ serve(async (req)=>{
     }
     return data.reduce((acc, row)=>acc + row.tokens_used, 0);
   }
-  function normalizeResult(parsedContent) {
-    const result = Array.isArray(parsedContent) ? parsedContent[0] : parsedContent;
-    if (result && typeof result === 'object') {
-      Object.keys(result).forEach((key)=>{
-        if (result[key] === "Unknown") {
-          result[key] = null;
-        }
-      });
-    }
-    return result;
-  }
   function parseModelResponse(content, provider) {
     try {
       return normalizeResult(JSON.parse(content));
@@ -288,7 +282,7 @@ serve(async (req)=>{
     }
   }
   // --- Cerebras processing (primary) ---
-  const processWithCerebras = async (base64Images, systemPrompt)=>{
+  const processWithCerebras = async (base64Images, systemPrompt, _responseSchema: ProviderResponseSchema)=>{
     const userContent = [
       {
         type: "text",
@@ -331,26 +325,34 @@ serve(async (req)=>{
         temperature: 1,
         top_p: 0.95,
         max_completion_tokens: 1024,
-        stream: false
+        stream: false,
+        // json_schema support is model-dependent on Cerebras; json_object is
+        // the safe minimum enforcement.
+        response_format: {
+          type: "json_object"
+        }
       })
     });
     if (!response.ok) {
       const errorText = await response.text();
+      const errorCode = extractProviderErrorCode(errorText);
       logWarnEvent(requestId, 'cerebras_http_error', {
         status: response.status,
+        code: errorCode || null,
         responseBodyLength: errorText.length
       });
-      const err = new Error(`Cerebras API request failed with status ${response.status}`);
-      err.status = response.status;
-      err.code = extractProviderErrorCode(errorText);
-      throw err;
+      throw new ProviderHttpError(
+        `Cerebras API request failed with status ${response.status}`,
+        response.status,
+        errorCode || undefined,
+      );
     }
     const jsonResponse = await response.json();
     const content = jsonResponse.choices[0].message.content;
     return parseModelResponse(content, 'Cerebras');
   };
   // --- Groq processing ---
-  const processWithGroq = async (base64Images, systemPrompt)=>{
+  const processWithGroq = async (base64Images, systemPrompt, _responseSchema: ProviderResponseSchema)=>{
     const userContent = [
       {
         type: "text",
@@ -393,26 +395,34 @@ serve(async (req)=>{
         temperature: 1,
         max_completion_tokens: 1024,
         top_p: 1,
-        stream: false
+        stream: false,
+        // json_schema support is model-dependent on Groq; json_object is the
+        // safe minimum enforcement.
+        response_format: {
+          type: "json_object"
+        }
       })
     });
     if (!response.ok) {
       const errorText = await response.text();
+      const errorCode = extractProviderErrorCode(errorText);
       logWarnEvent(requestId, 'groq_http_error', {
         status: response.status,
+        code: errorCode || null,
         responseBodyLength: errorText.length
       });
-      const err = new Error(`Groq API request failed with status ${response.status}`);
-      err.status = response.status;
-      err.code = extractProviderErrorCode(errorText);
-      throw err;
+      throw new ProviderHttpError(
+        `Groq API request failed with status ${response.status}`,
+        response.status,
+        errorCode || undefined,
+      );
     }
     const jsonResponse = await response.json();
     const content = jsonResponse.choices[0].message.content;
     return parseModelResponse(content, 'Groq');
   };
   // --- OpenAI processing ---
-  const processWithOpenAI = async (base64Images, systemPrompt)=>{
+  const processWithOpenAI = async (base64Images, systemPrompt, responseSchema: ProviderResponseSchema)=>{
     const userContent = [
       {
         type: "text",
@@ -441,7 +451,8 @@ serve(async (req)=>{
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
-        model: OPENAI_DEFAULT_MODEL,
+        model: OPENAI_MODELS.MEDIUM,
+        reasoning_effort: "none",
         messages: [
           {
             role: "system",
@@ -452,26 +463,39 @@ serve(async (req)=>{
             content: userContent
           }
         ],
-        max_completion_tokens: 4096
+        max_completion_tokens: 4096,
+        // Not strict: true — the error-sentinel union (`{ "error": ... }` vs.
+        // the full field set) makes strict's "all properties required"
+        // behavior the wrong fit here.
+        response_format: {
+          type: "json_schema",
+          json_schema: {
+            name: responseSchema.name,
+            schema: responseSchema.openai
+          }
+        }
       })
     });
     if (!response.ok) {
       const errorText = await response.text();
+      const errorCode = extractProviderErrorCode(errorText);
       logWarnEvent(requestId, 'openai_http_error', {
         status: response.status,
+        code: errorCode || null,
         responseBodyLength: errorText.length
       });
-      const err = new Error(`OpenAI API request failed with status ${response.status}`);
-      err.status = response.status;
-      err.code = extractProviderErrorCode(errorText);
-      throw err;
+      throw new ProviderHttpError(
+        `OpenAI API request failed with status ${response.status}`,
+        response.status,
+        errorCode || undefined,
+      );
     }
     const jsonResponse = await response.json();
     const content = jsonResponse.choices[0].message.content;
     return parseModelResponse(content, 'OpenAI');
   };
   // --- Gemini processing (fallback) ---
-  const processWithGemini = async (base64Images, systemPrompt)=>{
+  const processWithGemini = async (base64Images, systemPrompt, responseSchema: ProviderResponseSchema)=>{
     const accessToken = await getGeminiAccessToken();
     const parts = [
       {
@@ -504,7 +528,8 @@ serve(async (req)=>{
         }
       ],
       generationConfig: {
-        responseMimeType: "application/json"
+        responseMimeType: "application/json",
+        responseSchema: responseSchema.gemini
       }
     };
     const response = await fetch(`https://${geminiRegion}-aiplatform.googleapis.com/v1/projects/${geminiProjectId}/locations/${geminiRegion}/publishers/google/models/${GEMINI_DEFAULT_MODEL}:generateContent`, {
@@ -517,11 +542,17 @@ serve(async (req)=>{
     });
     if (!response.ok) {
       const errorText = await response.text();
+      const errorCode = extractProviderErrorCode(errorText);
       logWarnEvent(requestId, 'gemini_http_error', {
         status: response.status,
+        code: errorCode || null,
         responseBodyLength: errorText.length
       });
-      throw new Error(`Gemini API request failed with status ${response.status}`);
+      throw new ProviderHttpError(
+        `Gemini API request failed with status ${response.status}`,
+        response.status,
+        errorCode || undefined,
+      );
     }
     const jsonResponse = await response.json();
     const content = jsonResponse.candidates[0].content.parts[0].text;
@@ -577,22 +608,33 @@ serve(async (req)=>{
     if (providerChain.length === 0) {
       throw new Error('No AI provider configured (set one of CEREBRAS_API_KEY, GROQ_API_KEY, OPENAI_API_KEY_NON_PERSONAL, GOOGLE_APPLICATION_CREDENTIALS_JSON)');
     }
-    let result;
+    // deno-lint-ignore no-explicit-any
+    let result: any;
     let used = providerChain[0];
     for(let i = 0; i < providerChain.length; i++){
       const candidate = providerChain[i];
       const isLast = i === providerChain.length - 1;
       try {
-        result = await candidate.run(images, primaryPrompt);
+        result = await candidate.run(images, primaryPrompt, LABEL_RESPONSE_SCHEMA);
+        if (!isPlausibleLabelResult(result)) {
+          logWarnEvent(requestId, 'implausible_model_result', {
+            provider: candidate.key,
+            keys: result && typeof result === 'object'
+              ? Object.keys(result).slice(0, 8)
+              : typeof result
+          });
+          throw new Error(`${candidate.key} returned a result without recognized label fields`);
+        }
         used = candidate;
         break;
       } catch (providerError) {
-        if (!isLast && isRetriableProviderError(providerError.status, providerError.code)) {
+        const { status, code } = getProviderErrorMetadata(providerError);
+        if (!isLast && shouldFallbackProviderError(status)) {
           logWarnEvent(requestId, 'provider_fallback', {
             from: candidate.key,
             to: providerChain[i + 1].key,
-            status: providerError.status ?? 'network_or_parse_error',
-            code: providerError.code
+            status: status ?? 'network_or_parse_error',
+            code
           });
           continue;
         }
@@ -621,7 +663,7 @@ serve(async (req)=>{
         let recheckParsed = null;
         let recheckClassification = 'invalid';
         try {
-          const recheckResult = await used.run(images, strictPrompt);
+          const recheckResult = await used.run(images, strictPrompt, ROAST_DATE_RESPONSE_SCHEMA);
           if (recheckResult && typeof recheckResult === 'object' && !Array.isArray(recheckResult) && 'roastDate' in recheckResult) {
             recheckRoastDate = recheckResult.roastDate ?? null;
             recheckParsed = parseRoastDate(recheckRoastDate);
