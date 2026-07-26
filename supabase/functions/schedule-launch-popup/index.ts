@@ -1,55 +1,143 @@
 import { serve } from "https://deno.land/std@0.208.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-const supabaseUrl = Deno.env.get("SUPABASE_URL");
-const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-const supabase = createClient(supabaseUrl, supabaseKey, {
-  auth: {
-    persistSession: false
-  }
-});
-const json = (body, status = 200)=>new Response(JSON.stringify(body), {
+import { getCorsHeaders } from "../_shared/cors.ts";
+import { getEnvVar } from "../_shared/env-validation.ts";
+import {
+  ErrorCategory,
+  ErrorSeverity,
+  generateCorrelationId,
+  logError,
+  logInfo,
+  logWarning,
+} from "../_shared/monitoring.ts";
+import { authorizeServiceRole } from "../_shared/service-role-auth.ts";
+import { createSecureResponse } from "../_shared/security-headers.ts";
+
+function jsonResponse(
+  body: unknown,
+  status: number,
+  cors: Record<string, string>,
+): Response {
+  return createSecureResponse(JSON.stringify(body), {
     status,
     headers: {
-      "Content-Type": "application/json"
-    }
+      ...cors,
+      "Content-Type": "application/json",
+    },
   });
-serve(async (req)=>{
-  if (req.method !== "POST") return json({
-    error: "Method not allowed"
-  }, 405);
-  let body;
+}
+
+serve(async (req) => {
+  const requestId = generateCorrelationId();
+  const cors = getCorsHeaders(req.headers.get("origin") || undefined);
+
+  if (req.method === "OPTIONS") {
+    return createSecureResponse("ok", { headers: cors });
+  }
+  if (req.method !== "POST") {
+    return jsonResponse({ error: "Method not allowed" }, 405, cors);
+  }
+
+  let supabaseUrl: string;
+  let serviceRoleKey: string;
+  try {
+    supabaseUrl = getEnvVar("SUPABASE_URL");
+    serviceRoleKey = getEnvVar("SUPABASE_SERVICE_ROLE_KEY");
+  } catch {
+    logError(
+      "Schedule launch-popup environment validation failed",
+      new Error("Required environment configuration is unavailable."),
+      ErrorCategory.CONFIGURATION,
+      ErrorSeverity.CRITICAL,
+      { request_id: requestId, phase: "environment_validation" },
+      requestId,
+    );
+    return jsonResponse(
+      { error: "Service configuration is unavailable." },
+      500,
+      cors,
+    );
+  }
+
+  const authorization = authorizeServiceRole(
+    req.headers.get("authorization"),
+    serviceRoleKey,
+  );
+  if (!authorization.authorized) {
+    logWarning("Schedule launch-popup authorization rejected", {
+      request_id: requestId,
+      phase: "authorization",
+      status: authorization.status,
+    }, requestId);
+    return jsonResponse(
+      { error: authorization.error },
+      authorization.status,
+      cors,
+    );
+  }
+
+  let body: {
+    content?: string;
+    locale?: string;
+    platform?: string;
+    publication_time?: string;
+  };
   try {
     body = await req.json();
-  } catch  {
-    return json({
-      error: "Invalid JSON"
-    }, 400);
+  } catch {
+    return jsonResponse({ error: "Invalid JSON" }, 400, cors);
   }
-  const { content, locale, publication_time } = body;
+
+  const { content, locale, platform, publication_time } = body;
   if (!content || !locale || !publication_time) {
-    return json({
-      error: "Missing required fields"
-    }, 400);
+    return jsonResponse({ error: "Missing required fields" }, 400, cors);
   }
+
   const runAt = new Date(publication_time);
-  if (isNaN(runAt.valueOf())) return json({
-    error: "Invalid publication_time"
-  }, 400);
-  console.log("Scheduling popup for:", runAt.toISOString());
+  if (isNaN(runAt.valueOf())) {
+    return jsonResponse({ error: "Invalid publication_time" }, 400, cors);
+  }
+
+  const platformValue = platform &&
+      ["ios", "android", "web", "all", "internal_canary"].includes(platform)
+    ? platform
+    : "all";
+  const supabase = createClient(supabaseUrl, serviceRoleKey, {
+    auth: { persistSession: false, detectSessionInUrl: false },
+  });
+
+  logInfo("Scheduling launch popup", {
+    request_id: requestId,
+    phase: "enqueue_popup",
+    locale,
+    platform: platformValue,
+    publication_time: runAt.toISOString(),
+  }, requestId);
+
   const { data, error } = await supabase.rpc("enqueue_popup", {
     _content: content,
     _locale: locale,
-    _run_at: runAt.toISOString()
+    _platform: platformValue,
+    _run_at: runAt.toISOString(),
   });
   if (error) {
-    console.error("Error from enqueue_popup:", error);
-    return json({
-      error: error.message,
-      details: error.details
-    }, 500);
+    logError(
+      "Schedule launch-popup RPC failed",
+      new Error("enqueue_popup RPC failed."),
+      ErrorCategory.DATABASE,
+      ErrorSeverity.HIGH,
+      { request_id: requestId, phase: "enqueue_popup" },
+      requestId,
+    );
+    return jsonResponse(
+      {
+        error: error.message,
+        details: error.details,
+      },
+      500,
+      cors,
+    );
   }
-  return json({
-    success: true,
-    msg_id: data
-  });
+
+  return jsonResponse({ success: true, msg_id: data }, 200, cors);
 });

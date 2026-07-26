@@ -176,6 +176,12 @@ verify_jwt = false
 [functions.admin-recipe-collections]
 verify_jwt = true
 
+[functions.schedule-launch-popup]
+verify_jwt = true
+
+[functions.admin-launch-popup]
+verify_jwt = true
+
 [functions.content-moderation]
 verify_jwt = true
 
