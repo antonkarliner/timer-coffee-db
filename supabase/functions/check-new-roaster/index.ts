@@ -38,6 +38,7 @@
 //    • Sends roaster name, bean name, similar candidates, and location
 //  ────────────────────────────────────────────────────────────────
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.42.5";
+import { OPENAI_SPECIALIZED_MODELS } from "../_shared/ai-models.ts";
 /* ── env ───────────────────────────────────────────────────────── */ const supabaseUrl =
   Deno.env.get("SUPABASE_URL");
 const supabaseServiceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
@@ -324,12 +325,13 @@ const GEMINI_ENDPOINT =
   const token = await getVertexToken();
   const prompt =
     `Provide the street address, latitude and longitude of the coffee ` +
-    `roaster named "${roaster}". If you cannot find coordinates, set them ` +
-    `to null.\n\nReturn **ONLY raw JSON with no markdown fences** in exactly this shape:` +
-    ` {"address": string, "lat": number|null, "lng": number|null}`;
+    `roaster named "${roaster}". If you cannot find a reliable street ` +
+    `address, set "address" to null. If you cannot find coordinates, set ` +
+    `them to null.\n\nReturn **ONLY raw JSON with no markdown fences** in exactly this shape:` +
+    ` {"address": string|null, "lat": number|null, "lng": number|null}`;
   const body = buildGeminiBody(prompt, {
     useSearch: true,
-    temperature: 1.1,
+    temperature: 0.2,
   });
   const res = await fetch(GEMINI_ENDPOINT, {
     method: "POST",
@@ -845,7 +847,7 @@ async function geocodeFromSearch(links, n = 3) {
       },
       body: JSON.stringify({
         input: text,
-        model: "text-embedding-3-small",
+        model: OPENAI_SPECIALIZED_MODELS.EMBEDDING,
         dimensions: 384,
       }),
     });
