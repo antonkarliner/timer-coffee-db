@@ -50,14 +50,15 @@ def generate_embedding(roaster: dict) -> bool:
     """Call the edge function to generate an embedding for a roaster."""
     payload = {
         "roaster_id": roaster["id"],
-        "roaster_name": roaster["roaster_name"],
-        "aliases": roaster.get("aliases"),
     }
 
     try:
         response = requests.post(
             EDGE_FUNCTION_URL,
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                "Content-Type": "application/json",
+            },
             json=payload,
             timeout=30,
         )

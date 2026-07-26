@@ -59,8 +59,6 @@ async function getRoastersNeedingEmbeddings(batchSize: number): Promise<Roaster[
 async function generateEmbedding(roaster: Roaster): Promise<boolean> {
   const payload = {
     roaster_id: roaster.id,
-    roaster_name: roaster.roaster_name,
-    aliases: roaster.aliases,
   };
 
   try {
@@ -68,7 +66,10 @@ async function generateEmbedding(roaster: Roaster): Promise<boolean> {
       `${supabaseUrl}/functions/v1/generate-roaster-embedding`,
       {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Authorization": `Bearer ${supabaseServiceRoleKey}`,
+          "Content-Type": "application/json",
+        },
         body: JSON.stringify(payload),
       }
     );

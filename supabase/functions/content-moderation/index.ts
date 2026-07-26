@@ -1,8 +1,9 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.42.5";
 import { serve } from "https://deno.land/std@0.223.0/http/server.ts";
-import { decode } from "https://deno.land/std@0.203.0/encoding/base64url.ts";
 import { getCorsHeaders } from "../_shared/cors.ts";
+import { OPENAI_SPECIALIZED_MODELS } from "../_shared/ai-models.ts";
 import { createModerationClient } from "../_shared/moderation.ts";
+import { resolveVerifiedUser } from "./auth.ts";
 // --- Rate Limiting Configuration ---
 const FUNCTION_NAME = "content-moderation";
 const MAX_REQUESTS = 3;
@@ -40,19 +41,12 @@ const moderator = createModerationClient({
   geminiProjectId,
   geminiRegion
 });
-function decodeJwtPayload(token: string): Record<string, unknown> | null {
-  try {
-    const parts = token.split(".");
-    if (parts.length !== 3) {
-      console.error("Invalid JWT structure");
-      return null;
-    }
-    return JSON.parse(new TextDecoder().decode(decode(parts[1])));
-  } catch (e) {
-    console.error("Error decoding JWT payload:", e);
-    return null;
+const supabaseAdmin = createClient(supabaseUrl, supabaseServiceRoleKey, {
+  auth: {
+    persistSession: false,
+    detectSessionInUrl: false
   }
-}
+});
 // --- Image moderation via omni-moderation ---
 async function moderateImage(imageBase64: string): Promise<{
   safe: boolean;
@@ -65,7 +59,7 @@ async function moderateImage(imageBase64: string): Promise<{
       "Content-Type": "application/json"
     },
     body: JSON.stringify({
-      model: "omni-moderation-latest",
+      model: OPENAI_SPECIALIZED_MODELS.MODERATION,
       input: [
         {
           type: "image_url",
@@ -119,32 +113,26 @@ serve(async (req)=>{
       headers: cors
     });
   }
-  // --- JWT / User ID extraction ---
-  const authHeader = req.headers.get("Authorization");
-  let userId = null;
-  if (authHeader && authHeader.startsWith("Bearer ")) {
-    const token = authHeader.substring(7);
-    const payload = decodeJwtPayload(token);
-    if (payload?.sub) {
-      userId = payload.sub;
-    } else {
-      console.warn("Could not extract user ID from JWT.");
-    }
-  } else {
+  // --- Verified user identity ---
+  const authResult = await resolveVerifiedUser(
+    req.headers.get("Authorization"),
+    supabaseAdmin.auth,
+  );
+  if (!authResult.ok && authResult.reason === "missing_or_invalid_header") {
     return new Response("Unauthorized: Missing or invalid Authorization header", {
       status: 401,
       headers: cors
     });
   }
-  if (!userId) {
+  if (!authResult.ok) {
     return new Response("Unauthorized: User ID could not be determined", {
       status: 401,
       headers: cors
     });
   }
+  const userId = authResult.userId;
   // --- Database Rate Limiting ---
   try {
-    const supabaseAdmin = createClient(supabaseUrl, supabaseServiceRoleKey);
     const now = new Date();
     const windowStartTime = new Date(now.getTime() - WINDOW_SECONDS * 1000);
     const { data: limitRecord, error: fetchError } = await supabaseAdmin.schema("service").from("moderation_rate_limits").select("request_count, window_start_time").eq("user_id", userId).eq("function_name", FUNCTION_NAME).maybeSingle();

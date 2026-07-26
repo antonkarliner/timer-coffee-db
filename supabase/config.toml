@@ -175,3 +175,14 @@ verify_jwt = false
 
 [functions.admin-recipe-collections]
 verify_jwt = true
+
+[functions.content-moderation]
+verify_jwt = true
+
+[functions.submit-yearly-wish]
+verify_jwt = true
+
+[functions.generate-roaster-embedding]
+# Custom service-role bearer validation runs inside the function so this also
+# supports non-JWT `sb_secret_...` service-role keys.
+verify_jwt = false

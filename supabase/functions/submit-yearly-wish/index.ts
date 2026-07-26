@@ -1,8 +1,8 @@
 import { serve } from "https://deno.land/std@0.223.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.42.5";
-import { decode } from "https://deno.land/std@0.203.0/encoding/base64url.ts";
 import { getCorsHeaders } from "../_shared/cors.ts";
 import { createModerationClient } from "../_shared/moderation.ts";
+import { resolveVerifiedUser } from "./auth.ts";
 const FUNCTION_NAME = "submit_yearly_wish";
 const MAX_REQUESTS = 3;
 const WINDOW_SECONDS = 60;
@@ -44,20 +44,6 @@ const moderator = createModerationClient({
   geminiProjectId: geminiProjectId,
   geminiRegion: geminiRegion
 });
-function decodeJwtPayload(token: string): Record<string, unknown> | null {
-  try {
-    const parts = token.split(".");
-    if (parts.length !== 3) {
-      console.error("Invalid JWT structure");
-      return null;
-    }
-    const payload = JSON.parse(new TextDecoder().decode(decode(parts[1])));
-    return payload;
-  } catch (e) {
-    console.error("Error decoding JWT payload:", e);
-    return null;
-  }
-}
 function jsonResponse(body: unknown, status: number, cors: HeadersInit) {
   return new Response(JSON.stringify(body), {
     status,
@@ -87,26 +73,23 @@ serve(async (req)=>{
       message: "Content-Type must be application/json"
     }, 400, cors);
   }
-  const authHeader = req.headers.get("Authorization");
-  let userId = null;
-  if (authHeader && authHeader.startsWith("Bearer ")) {
-    const token = authHeader.substring(7);
-    const payload = decodeJwtPayload(token);
-    if (payload?.sub) {
-      userId = payload.sub;
-    }
-  } else {
+  const authResult = await resolveVerifiedUser(
+    req.headers.get("Authorization"),
+    supabaseAdmin.auth,
+  );
+  if (!authResult.ok && authResult.reason === "missing_or_invalid_header") {
     return jsonResponse({
       error: "Unauthorized",
       message: "Missing or invalid Authorization header"
     }, 401, cors);
   }
-  if (!userId) {
+  if (!authResult.ok) {
     return jsonResponse({
       error: "Unauthorized",
       message: "User ID could not be determined"
     }, 401, cors);
   }
+  const userId = authResult.userId;
   try {
     const now = new Date();
     const windowStartTime = new Date(now.getTime() - WINDOW_SECONDS * 1000);
