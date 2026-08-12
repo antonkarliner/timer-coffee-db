@@ -12,7 +12,14 @@ export type RecipeDraftLabAccessResult =
     allowed: false;
   };
 
-type QueryResult<T> = Promise<{
+// PromiseLike, not Promise: supabase-js's `maybeSingle()` returns a
+// PostgrestBuilder, which is thenable but lacks `catch`, `finally` and
+// `Symbol.toStringTag`. Requiring a full Promise here made the real client
+// structurally unassignable to SupabaseAccessClient, so both consumer
+// entrypoints (parse-user-recipe-draft, check-recipe-draft-lab-access)
+// failed `deno check` while working correctly at runtime — `await` and
+// `Promise.all` only need `then`.
+type QueryResult<T> = PromiseLike<{
   data: T | null;
   error: {
     message: string;

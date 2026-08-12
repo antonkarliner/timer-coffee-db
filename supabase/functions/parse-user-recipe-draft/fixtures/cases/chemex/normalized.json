@@ -1,0 +1,81 @@
+{
+  "detected_input_language": "en",
+  "warnings": [],
+  "recipe": {
+    "brewing_method_id": "chemex",
+    "brewing_method_confidence": "high",
+    "coffee_amount": 30,
+    "water_amount": 500,
+    "water_temp": 96
+  },
+  "localization": {
+    "name": "Chemex 60g/L Half Liter",
+    "grind_size": "Medium-coarse",
+    "short_description": "Commentary-heavy Chemex transcript with filter-weight trivia"
+  },
+  "steps": [
+    {
+      "kind": "preparation",
+      "description_source": "Quick aside on filters -- a Chemex filter is noticeably heavier than a normal V60 filter, it actually weighs about 4.5 grams dry versus around 1.5 grams for a Hario paper, which is part of why the Chemex cup comes out so clean. Fold the filter, rinse it with hot water, and dose in 30 grams of coffee.",
+      "description_template": "Quick aside on filters -- a Chemex filter is noticeably heavier than a normal V60 filter, it actually weighs about 4.5 grams dry versus around 1.5 grams for a Hario paper, which is part of why the Chemex cup comes out so clean. Fold the filter, rinse it with hot water, and dose in 30 grams of coffee.",
+      "duration_seconds": 0,
+      "elapsed_seconds": null,
+      "starts_timer": false,
+      "duration_is_stated": false,
+      "scalable_amounts": [
+        {
+          "value": 30,
+          "unit": "g"
+        }
+      ],
+      "step_role": "preparation"
+    },
+    {
+      "kind": "brew",
+      "description_source": "In terms of the bloom, do exactly as the V60: 60 to 90 grams of bloom water, and let that bloom for at least 45 seconds.",
+      "description_template": "In terms of the bloom, do exactly as the V60: 60 to 90 grams of bloom water, and let that bloom for at least 45 seconds.",
+      "duration_seconds": 45,
+      "elapsed_seconds": null,
+      "starts_timer": true,
+      "duration_is_stated": true,
+      "scalable_amounts": [
+        {
+          "value": 60,
+          "unit": "g"
+        },
+        {
+          "value": 90,
+          "unit": "g"
+        }
+      ],
+      "step_role": "bloom"
+    },
+    {
+      "kind": "brew",
+      "description_source": "Once the bloom settles, start pouring in slow concentric circles, pretty controlled, maybe 3 grams a second, avoiding the filter walls, until you reach the full 500 grams. You're gonna have four to five minute brew times brewing half a liter with the Chemex.",
+      "description_template": "Once the bloom settles, start pouring in slow concentric circles, pretty controlled, maybe 3 grams a second, avoiding the filter walls, until you reach the full 500 grams. You're gonna have four to five minute brew times brewing half a liter with the Chemex.",
+      "duration_seconds": 60,
+      "elapsed_seconds": null,
+      "starts_timer": false,
+      "duration_is_stated": false,
+      "scalable_amounts": [
+        {
+          "value": 500,
+          "unit": "g"
+        }
+      ],
+      "step_role": "pour"
+    },
+    {
+      "kind": "brew",
+      "description_source": "At the end, give it a little stir and a swirl to help the drawdown and keep a flat bed, then just let it finish draining completely.",
+      "description_template": "At the end, give it a little stir and a swirl to help the drawdown and keep a flat bed, then just let it finish draining completely.",
+      "duration_seconds": 30,
+      "elapsed_seconds": null,
+      "starts_timer": false,
+      "duration_is_stated": false,
+      "scalable_amounts": [],
+      "step_role": "drawdown"
+    }
+  ]
+}

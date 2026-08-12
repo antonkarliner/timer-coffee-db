@@ -1,0 +1,85 @@
+{
+  "detected_input_language": "en",
+  "likely_brewing_method": "Kalita Wave",
+  "name": "Kalita Wave 25:400",
+  "short_description": "A dose-multiple pour schedule finishing at 400g water",
+  "grind_size": "Medium-fine",
+  "water_temp_celsius": 93,
+  "coffee_amount_grams": 25,
+  "water_amount": 400,
+  "preparation": "Dose in 25 grams of coffee, medium-fine grind, and give the filter a rinse first with water around 93 degrees Celsius. We're using a Gabi Dripmaster underneath today -- just a heads up, that thing's got a 120 milliliter reservoir built in, so keep an eye on it if you're brewing anything bigger.",
+  "steps": [
+    {
+      "title": null,
+      "raw_text": "Dose in 25 grams of coffee, medium-fine grind, and give the filter a rinse first with water around 93 degrees Celsius. We're using a Gabi Dripmaster underneath today -- just a heads up, that thing's got a 120 milliliter reservoir built in, so keep an eye on it if you're brewing anything bigger.",
+      "duration_seconds": 0,
+      "elapsed_seconds": null,
+      "starts_timer": false,
+      "duration_is_stated": false,
+      "scalable_amounts": [
+        {
+          "value": 25,
+          "unit": "g"
+        }
+      ],
+      "step_role": "preparation"
+    },
+    {
+      "title": null,
+      "raw_text": "Start your timer and bloom up to three times the dose, so about 75 grams, nice and even, and let it sit for a bit.",
+      "duration_seconds": 67,
+      "elapsed_seconds": null,
+      "starts_timer": true,
+      "duration_is_stated": false,
+      "scalable_amounts": [
+        {
+          "value": 75,
+          "unit": "g"
+        }
+      ],
+      "step_role": "bloom"
+    },
+    {
+      "title": null,
+      "raw_text": "Once that settles, start your second pour, pouring in slow circles -- you'll pass through five times the dose, around 125 grams, on your way -- and keep going up to eight times the dose, 200 grams even.",
+      "duration_seconds": 10,
+      "elapsed_seconds": null,
+      "starts_timer": false,
+      "duration_is_stated": false,
+      "scalable_amounts": [
+        {
+          "value": 200,
+          "unit": "g"
+        }
+      ],
+      "step_role": "pour"
+    },
+    {
+      "title": null,
+      "raw_text": "Then keep pouring in slow circles, roughly 5 grams a second, until you reach the full 400 grams.",
+      "duration_seconds": 67,
+      "elapsed_seconds": null,
+      "starts_timer": false,
+      "duration_is_stated": false,
+      "scalable_amounts": [
+        {
+          "value": 400,
+          "unit": "g"
+        }
+      ],
+      "step_role": "pour"
+    },
+    {
+      "title": null,
+      "raw_text": "From there just let it draw down completely.",
+      "duration_seconds": 66,
+      "elapsed_seconds": null,
+      "starts_timer": false,
+      "duration_is_stated": false,
+      "scalable_amounts": [],
+      "step_role": "drawdown"
+    }
+  ],
+  "notes": [],
+  "total_brew_time_seconds": 210
+}

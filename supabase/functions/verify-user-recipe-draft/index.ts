@@ -1,3 +1,8 @@
+// This function shares supabase/functions/parse-user-recipe-draft/parser.ts
+// with parse-user-recipe-draft. Supabase bundles each function separately
+// at deploy time, so the two silently desynchronise if only one is
+// redeployed — deploy them as a pair. See plans/010 for the incident this
+// caused and plans/README.md's Notes for the standing rule.
 import { serve } from "https://deno.land/std@0.223.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.42.5";
 import { getCorsHeaders } from "../_shared/cors.ts";
@@ -19,12 +24,19 @@ if (!supabaseUrl || !supabaseServiceRoleKey) {
   throw new Error("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required.");
 }
 
-if (
-  !groqApiKey && !cerebrasApiKey && !openAiApiKey &&
-  !geminiServiceAccountKeyJson
-) {
+// Phase E consolidated the shared parser's default provider cascade to
+// OpenAI (medium, then big) with Gemini as an outage fallback; Groq and
+// Cerebras are no longer built. A Groq- or Cerebras-only deployment would
+// therefore pass a looser guard here and then fail inside
+// createRecipeDraftParser with "No AI providers configured", so this guard
+// must check for what the parser can actually use.
+const hasCompleteGeminiConfig = Boolean(
+  geminiServiceAccountKeyJson && geminiProjectId && geminiRegion,
+);
+
+if (!openAiApiKey && !hasCompleteGeminiConfig) {
   throw new Error(
-    "At least one AI provider must be configured for verify-user-recipe-draft.",
+    "verify-user-recipe-draft requires OPENAI_API_KEY_NON_PERSONAL, or a complete Gemini configuration (GOOGLE_APPLICATION_CREDENTIALS_JSON, GEMINI_PROJECT_ID and GEMINI_REGION).",
   );
 }
 

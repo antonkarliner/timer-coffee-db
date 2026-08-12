@@ -1,3 +1,8 @@
+// parser.ts in this directory is also imported by
+// supabase/functions/verify-user-recipe-draft. Supabase bundles each
+// function separately at deploy time, so the two silently desynchronise if
+// only one is redeployed — deploy them as a pair. See plans/010 for the
+// incident this caused and plans/README.md's Notes for the standing rule.
 import { serve } from "https://deno.land/std@0.223.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.42.5";
 import { getCorsHeaders } from "../_shared/cors.ts";
@@ -8,8 +13,6 @@ import { createRecipeDraftParser } from "./parser.ts";
 
 const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
 const supabaseServiceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
-const groqApiKey = Deno.env.get("GROQ_API_KEY") ?? "";
-const cerebrasApiKey = Deno.env.get("CEREBRAS_API_KEY") ?? "";
 const openAiApiKey = Deno.env.get("OPENAI_API_KEY_NON_PERSONAL") ?? "";
 const geminiServiceAccountKeyJson =
   Deno.env.get("GOOGLE_APPLICATION_CREDENTIALS_JSON") ?? "";
@@ -20,12 +23,23 @@ if (!supabaseUrl || !supabaseServiceRoleKey) {
   throw new Error("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required.");
 }
 
-if (
-  !groqApiKey && !cerebrasApiKey && !openAiApiKey &&
-  !geminiServiceAccountKeyJson
-) {
+// Phase E: this function's default provider list (see parser.ts
+// buildProviders) no longer falls back to Groq or Cerebras — it is
+// openai@MEDIUM, openai@BIG, then Gemini as a provider-outage fallback
+// only. GROQ_API_KEY/CEREBRAS_API_KEY env reads were removed from this
+// file because they are now dead here: createRecipeDraftParser's default
+// path never reads config.groqApiKey/config.cerebrasApiKey, so a
+// deployment configured with only a Groq key would previously have passed
+// this guard and then died inside createRecipeDraftParser with "No AI
+// providers configured". The guard below requires what is actually usable
+// instead: an OpenAI key, or a complete Gemini configuration.
+const hasCompleteGeminiConfig = Boolean(
+  geminiServiceAccountKeyJson && geminiProjectId && geminiRegion,
+);
+
+if (!openAiApiKey && !hasCompleteGeminiConfig) {
   throw new Error(
-    "At least one AI provider must be configured for parse-user-recipe-draft.",
+    "parse-user-recipe-draft requires OPENAI_API_KEY_NON_PERSONAL, or a complete Gemini configuration (GOOGLE_APPLICATION_CREDENTIALS_JSON, GEMINI_PROJECT_ID, and GEMINI_REGION). Groq/Cerebras keys alone are no longer sufficient — this function's default provider list no longer falls back to them.",
   );
 }
 
@@ -37,8 +51,6 @@ const supabase = createClient(supabaseUrl, supabaseServiceRoleKey, {
 });
 
 const parser = createRecipeDraftParser({
-  groqApiKey,
-  cerebrasApiKey,
   openAiApiKey,
   geminiServiceAccountKeyJson,
   geminiProjectId,
@@ -99,6 +111,44 @@ const handler = createParseUserRecipeDraftHandler({
       provider_used: providerUsed,
       provider_model_used: providerModelUsed,
     });
+  },
+  async captureStages(
+    {
+      userId,
+      requestText,
+      requestMode,
+      requestBrewingMethodId,
+      requestSourceLanguageHint,
+      providerUsed,
+      providerModelUsed,
+      providerTrail,
+      stageOutputs,
+      response,
+    },
+  ) {
+    const { data, error } = await supabase
+      .schema("service")
+      .from("parse_user_recipe_draft_captures")
+      .insert({
+        user_id: userId,
+        request_text: requestText,
+        request_mode: requestMode,
+        request_brewing_method_id: requestBrewingMethodId,
+        request_source_language_hint: requestSourceLanguageHint,
+        provider_used: providerUsed,
+        provider_model_used: providerModelUsed,
+        provider_trail: providerTrail,
+        stage_outputs: stageOutputs,
+        response,
+      })
+      .select("id")
+      .single();
+
+    if (error) {
+      throw new Error(`Failed to capture parse stage output: ${error.message}`);
+    }
+
+    return data.id as string;
   },
   getCorsHeaders,
   createResponse(body, init) {

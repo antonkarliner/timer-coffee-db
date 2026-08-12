@@ -6,10 +6,24 @@ import {
   type ParseUserRecipeDraftRequest,
   parseUserRecipeDraftRequestSchema,
   type ParseUserRecipeDraftResponse,
+  type ProviderTrailEntry,
   type RecipeDraftParser,
+  type StageOutputs,
 } from "./parser.ts";
 
 const OPENAI_DAILY_TOKEN_BUDGET = 10_000_000;
+
+// Every stage key must always be present on a capture row even when a stage
+// never ran (e.g. cumulative_rewrite skipped, or repair never triggered) —
+// this is the fallback used only if parseDraft somehow returned
+// stage_outputs: null while capture_stages was true, which should not
+// happen but keeps the capture insert well-typed either way.
+const EMPTY_STAGE_OUTPUTS: StageOutputs = {
+  extraction: [],
+  normalization: [],
+  repair: [],
+  cumulative_rewrite: [],
+};
 
 type AuthenticatedUser = {
   id: string;
@@ -28,6 +42,22 @@ export type ParseUserRecipeDraftHandlerDeps = {
     providerUsed: string;
     providerModelUsed: string;
   }): Promise<void>;
+  // Opt-in per-stage diagnostic capture (capture_stages: true on the
+  // request). Unlike logInvocation this is AWAITED — the response carries
+  // the new row's id as capture_id — but a throw here must never cost the
+  // caller a successful parse; see the try/catch around its call below.
+  captureStages(data: {
+    userId: string;
+    requestText: string;
+    requestMode: string;
+    requestBrewingMethodId: string | null;
+    requestSourceLanguageHint: string | null;
+    providerUsed: string | null;
+    providerModelUsed: string | null;
+    providerTrail: ProviderTrailEntry[] | null;
+    stageOutputs: StageOutputs;
+    response: Record<string, unknown>;
+  }): Promise<string>;
   getCorsHeaders(origin?: string): Record<string, string>;
   createResponse(
     body: string,
@@ -157,6 +187,7 @@ export function createParseUserRecipeDraftHandler(
 
       const disabledProviders: LlmProviderName[] =
         openAiDailyTokens >= OPENAI_DAILY_TOKEN_BUDGET ? ["openai"] : [];
+      const requestId = crypto.randomUUID();
 
       const result: ParseUserRecipeDraftResponse = await deps.parser.parseDraft(
         {
@@ -165,8 +196,10 @@ export function createParseUserRecipeDraftHandler(
           brewingMethods,
           brewingMethodHint: parsedBody.brewing_method_id,
           sourceLanguageHint: parsedBody.source_language_hint,
-          requestId: crypto.randomUUID(),
+          requestId,
           disabledProviders,
+          mode: parsedBody.mode,
+          captureStages: parsedBody.capture_stages,
         },
       );
 
@@ -178,7 +211,47 @@ export function createParseUserRecipeDraftHandler(
         providerModelUsed: result.provider_model_used,
       }).catch(() => {});
 
-      return jsonResponse(deps, cors, 200, result);
+      // stage_outputs is internal-only (see its comment on
+      // ParseUserRecipeDraftResponse) — it is used below to build the
+      // capture row and then MUST NOT reach the HTTP response body, only
+      // capture_id does. Destructuring it out here, rather than deleting it
+      // from `result` in place, keeps that guarantee independent of
+      // whichever fields get added to the response object next.
+      const { stage_outputs, ...publicResult } = result;
+
+      let captureId: string | null = null;
+      if (parsedBody.capture_stages) {
+        try {
+          captureId = await deps.captureStages({
+            userId: user.id,
+            requestText: parsedBody.text,
+            requestMode: parsedBody.mode ?? "extract",
+            requestBrewingMethodId: parsedBody.brewing_method_id ?? null,
+            requestSourceLanguageHint: parsedBody.source_language_hint ??
+              null,
+            providerUsed: result.provider_used,
+            providerModelUsed: result.provider_model_used,
+            providerTrail: result.provider_trail ?? null,
+            stageOutputs: stage_outputs ?? EMPTY_STAGE_OUTPUTS,
+            response: publicResult,
+          });
+        } catch (error) {
+          // A capture failure must never cost the user a successful parse:
+          // log it, fall back to capture_id: null, and still return 200
+          // with the parse result below.
+          console.error(
+            `[parse-user-recipe-draft] capture_failed requestId=${requestId} error=${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+          captureId = null;
+        }
+      }
+
+      return jsonResponse(deps, cors, 200, {
+        ...publicResult,
+        capture_id: captureId,
+      });
     } catch (error) {
       return jsonResponse(deps, cors, 502, {
         error: "Provider Error",

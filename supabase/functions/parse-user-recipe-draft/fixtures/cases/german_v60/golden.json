@@ -1,0 +1,304 @@
+{
+  "detected_input_language": "de",
+  "provider_used": "groq",
+  "provider_model_used": "groq/fixture",
+  "provider_trail": [
+    {
+      "stage": "extraction",
+      "provider": "groq",
+      "model": "groq/fixture",
+      "attempts": 1
+    },
+    {
+      "stage": "normalization",
+      "provider": "groq",
+      "model": "groq/fixture",
+      "attempts": 1
+    }
+  ],
+  "capture_id": null,
+  "stage_outputs": null,
+  "tokens_used": 0,
+  "openai_tokens_used": 0,
+  "warnings": [
+    "Cumulative water wording could not be safely rewritten for a brew step; the incremental amount was kept instead.",
+    "Elapsed-time brew steps were converted to step durations.",
+    "Derived brew step durations were split deterministically from the stated total brew time.",
+    "Amount provenance could not be verified: the extraction stage did not report extracted_amounts, so this draft's coffee/water amounts are unconfirmed against the submitted text."
+  ],
+  "validation": {
+    "is_publishable": true,
+    "issues": []
+  },
+  "extraction": {
+    "detected_input_language": "de",
+    "likely_brewing_method": "V60",
+    "name": "V60 Rezept fuer Zuhause",
+    "short_description": "Deutsches Rezept mit Dosis-, Wassermengen- und Bruehzeit-Bereichen",
+    "grind_size": "Mittelfein",
+    "water_temp_celsius": 92,
+    "coffee_amount_grams": 22,
+    "water_amount": 325,
+    "preparation": "Zuerst den Filter falten, in den Dripper einsetzen und mit ca. 92 Grad heissem Wasser vorspuelen, damit kein Papiergeschmack ins Rezept kommt. Den Kaffee mittelfein mahlen und in den Filter geben.",
+    "steps": [
+      {
+        "title": null,
+        "raw_text": "Zuerst den Filter falten, in den Dripper einsetzen und mit ca. 92 Grad heissem Wasser vorspuelen, damit kein Papiergeschmack ins Rezept kommt. Den Kaffee mittelfein mahlen und in den Filter geben.",
+        "duration_seconds": 0,
+        "elapsed_seconds": null,
+        "starts_timer": false,
+        "duration_is_stated": false,
+        "scalable_amounts": [],
+        "step_role": "preparation"
+      },
+      {
+        "title": null,
+        "raw_text": "Nun mit 25g Wasser aufgiessen, das ist der Bloom, und 30 Sekunden quellen lassen.",
+        "duration_seconds": 30,
+        "elapsed_seconds": null,
+        "starts_timer": true,
+        "duration_is_stated": true,
+        "scalable_amounts": [
+          {
+            "value": 25,
+            "unit": "g"
+          }
+        ],
+        "step_role": "bloom"
+      },
+      {
+        "title": null,
+        "raw_text": "Bei 30 Sekunden langsam im Kreis bis 175g giessen.",
+        "duration_seconds": 30,
+        "elapsed_seconds": 30,
+        "starts_timer": false,
+        "duration_is_stated": false,
+        "scalable_amounts": [
+          {
+            "value": 175,
+            "unit": "g"
+          }
+        ],
+        "step_role": "pour"
+      },
+      {
+        "title": null,
+        "raw_text": "Nach einer Minute auf 300g auffuellen.",
+        "duration_seconds": 25,
+        "elapsed_seconds": 60,
+        "starts_timer": false,
+        "duration_is_stated": false,
+        "scalable_amounts": [
+          {
+            "value": 300,
+            "unit": "g"
+          }
+        ],
+        "step_role": "pour"
+      },
+      {
+        "title": null,
+        "raw_text": "Vollstaendig durchlaufen lassen.",
+        "duration_seconds": 5,
+        "elapsed_seconds": null,
+        "starts_timer": false,
+        "duration_is_stated": false,
+        "scalable_amounts": [],
+        "step_role": "drawdown"
+      }
+    ],
+    "notes": [],
+    "total_brew_time_seconds": 180
+  },
+  "draft": {
+    "recipe": {
+      "brewing_method_id": "v60",
+      "coffee_amount": 22,
+      "water_amount": 325,
+      "water_temp": 92,
+      "brew_time_seconds": 180,
+      "vendor_id": "usr-800792ab-c2ef-49f3-8d6a-c5dceaf71459"
+    },
+    "localization": {
+      "locale": "en",
+      "name": "V60 Rezept fuer Zuhause",
+      "grind_size": "Mittelfein",
+      "short_description": "Deutsches Rezept mit Dosis-, Wassermengen- und Bruehzeit-Bereichen"
+    },
+    "steps": [
+      {
+        "step_order": 1,
+        "kind": "preparation",
+        "description_source": "Zuerst den Filter falten, in den Dripper einsetzen und mit ca. 92 Grad heissem Wasser vorspuelen, damit kein Papiergeschmack ins Rezept kommt. Den Kaffee mittelfein mahlen und in den Filter geben.",
+        "description_template": "Zuerst den Filter falten, in den Dripper einsetzen und mit ca. 92 Grad heissem Wasser vorspuelen, damit kein Papiergeschmack ins Rezept kommt. Den Kaffee mittelfein mahlen und in den Filter geben.",
+        "preview_text": "Zuerst den Filter falten, in den Dripper einsetzen und mit ca. 92 Grad heissem Wasser vorspuelen, damit kein Papiergeschmack ins Rezept kommt. Den Kaffee mittelfein mahlen und in den Filter geben.",
+        "duration_seconds": 0,
+        "elapsed_seconds": null,
+        "starts_timer": false,
+        "duration_is_stated": false,
+        "scalable_amounts": [],
+        "step_role": "preparation",
+        "expressions": []
+      },
+      {
+        "step_order": 2,
+        "kind": "brew",
+        "description_source": "Nun mit 25g Wasser aufgiessen, das ist der Bloom, und 30 Sekunden quellen lassen.",
+        "description_template": "Nun mit (0.0769231 x <final_water_amount>)g Wasser aufgiessen, das ist der Bloom, und 30 Sekunden quellen lassen.",
+        "preview_text": "Nun mit 25g Wasser aufgiessen, das ist der Bloom, und 30 Sekunden quellen lassen.",
+        "duration_seconds": 30,
+        "elapsed_seconds": 0,
+        "starts_timer": true,
+        "duration_is_stated": true,
+        "scalable_amounts": [
+          {
+            "value": 25,
+            "unit": "g"
+          }
+        ],
+        "step_role": "bloom",
+        "expressions": [
+          {
+            "placeholder": "<final_water_amount>",
+            "multiplier": 0.0769231,
+            "unit": "g",
+            "preview_value": 25
+          }
+        ]
+      },
+      {
+        "step_order": 3,
+        "kind": "brew",
+        "description_source": "Bei 30 Sekunden langsam im Kreis bis 175g giessen.",
+        "description_template": "Bei 30 Sekunden langsam im Kreis bis (0.538462 x <final_water_amount>)g giessen.",
+        "preview_text": "Bei 30 Sekunden langsam im Kreis bis 175g giessen.",
+        "duration_seconds": 30,
+        "elapsed_seconds": 30,
+        "starts_timer": false,
+        "duration_is_stated": false,
+        "scalable_amounts": [
+          {
+            "value": 175,
+            "unit": "g"
+          }
+        ],
+        "step_role": "pour",
+        "expressions": [
+          {
+            "placeholder": "<final_water_amount>",
+            "multiplier": 0.538462,
+            "unit": "g",
+            "preview_value": 175
+          }
+        ]
+      },
+      {
+        "step_order": 4,
+        "kind": "brew",
+        "description_source": "Nach einer Minute auf 300g auffuellen.",
+        "description_template": "Nach einer Minute auf (0.923077 x <final_water_amount>)g auffuellen.",
+        "preview_text": "Nach einer Minute auf 300g auffuellen.",
+        "duration_seconds": 10,
+        "elapsed_seconds": 60,
+        "starts_timer": false,
+        "duration_is_stated": false,
+        "scalable_amounts": [
+          {
+            "value": 300,
+            "unit": "g"
+          }
+        ],
+        "step_role": "pour",
+        "expressions": [
+          {
+            "placeholder": "<final_water_amount>",
+            "multiplier": 0.923077,
+            "unit": "g",
+            "preview_value": 300
+          }
+        ]
+      },
+      {
+        "step_order": 5,
+        "kind": "brew",
+        "description_source": "Vollstaendig durchlaufen lassen.",
+        "description_template": "Vollstaendig durchlaufen lassen.",
+        "preview_text": "Vollstaendig durchlaufen lassen.",
+        "duration_seconds": 110,
+        "elapsed_seconds": null,
+        "starts_timer": false,
+        "duration_is_stated": false,
+        "scalable_amounts": [],
+        "step_role": "drawdown",
+        "expressions": []
+      }
+    ]
+  },
+  "publish_projection": {
+    "user_recipe": {
+      "id": "usr-800792ab-c2ef-49f3-8d6a-c5dceaf71459-1776000000000",
+      "brewing_method_id": "v60",
+      "coffee_amount": 22,
+      "water_amount": 325,
+      "water_temp": 92,
+      "brew_time": 180,
+      "vendor_id": "usr-800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+      "last_modified": "2026-04-12T13:20:00.000Z",
+      "import_id": null,
+      "is_imported": false,
+      "ispublic": false,
+      "is_deleted": false,
+      "needs_moderation_review": false
+    },
+    "user_recipe_localization": {
+      "id": "<random-uuid>",
+      "recipe_id": "usr-800792ab-c2ef-49f3-8d6a-c5dceaf71459-1776000000000",
+      "locale": "en",
+      "name": "V60 Rezept fuer Zuhause",
+      "grind_size": "Mittelfein",
+      "short_description": "Deutsches Rezept mit Dosis-, Wassermengen- und Bruehzeit-Bereichen"
+    },
+    "user_steps": [
+      {
+        "id": "<random-uuid>",
+        "recipe_id": "usr-800792ab-c2ef-49f3-8d6a-c5dceaf71459-1776000000000",
+        "step_order": 1,
+        "description": "Zuerst den Filter falten, in den Dripper einsetzen und mit ca. 92 Grad heissem Wasser vorspuelen, damit kein Papiergeschmack ins Rezept kommt. Den Kaffee mittelfein mahlen und in den Filter geben.",
+        "time": "0",
+        "locale": "en"
+      },
+      {
+        "id": "<random-uuid>",
+        "recipe_id": "usr-800792ab-c2ef-49f3-8d6a-c5dceaf71459-1776000000000",
+        "step_order": 2,
+        "description": "Nun mit (0.0769231 x <final_water_amount>)g Wasser aufgiessen, das ist der Bloom, und 30 Sekunden quellen lassen.",
+        "time": "30",
+        "locale": "en"
+      },
+      {
+        "id": "<random-uuid>",
+        "recipe_id": "usr-800792ab-c2ef-49f3-8d6a-c5dceaf71459-1776000000000",
+        "step_order": 3,
+        "description": "Bei 30 Sekunden langsam im Kreis bis (0.538462 x <final_water_amount>)g giessen.",
+        "time": "30",
+        "locale": "en"
+      },
+      {
+        "id": "<random-uuid>",
+        "recipe_id": "usr-800792ab-c2ef-49f3-8d6a-c5dceaf71459-1776000000000",
+        "step_order": 4,
+        "description": "Nach einer Minute auf (0.923077 x <final_water_amount>)g auffuellen.",
+        "time": "10",
+        "locale": "en"
+      },
+      {
+        "id": "<random-uuid>",
+        "recipe_id": "usr-800792ab-c2ef-49f3-8d6a-c5dceaf71459-1776000000000",
+        "step_order": 5,
+        "description": "Vollstaendig durchlaufen lassen.",
+        "time": "110",
+        "locale": "en"
+      }
+    ]
+  }
+}

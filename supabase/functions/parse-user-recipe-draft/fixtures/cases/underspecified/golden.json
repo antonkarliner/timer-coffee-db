@@ -1,0 +1,166 @@
+{
+  "detected_input_language": "en",
+  "provider_used": "groq",
+  "provider_model_used": "groq/fixture",
+  "provider_trail": [
+    {
+      "stage": "extraction",
+      "provider": "groq",
+      "model": "groq/fixture",
+      "attempts": 1
+    },
+    {
+      "stage": "normalization",
+      "provider": "groq",
+      "model": "groq/fixture",
+      "attempts": 1
+    },
+    {
+      "stage": "repair",
+      "provider": "groq",
+      "model": "groq/fixture",
+      "attempts": 2
+    }
+  ],
+  "capture_id": null,
+  "stage_outputs": null,
+  "tokens_used": 0,
+  "openai_tokens_used": 0,
+  "warnings": [
+    "Coffee amount is not stated in the source and was left empty.",
+    "Water amount is not stated in the source and was left empty.",
+    "Brewing method could not be confidently determined from the source and was left empty."
+  ],
+  "validation": {
+    "is_publishable": false,
+    "issues": [
+      {
+        "code": "missing_coffee_amount",
+        "field": "recipe.coffee_amount",
+        "message": "Coffee amount is required to publish a user recipe."
+      },
+      {
+        "code": "missing_water_amount",
+        "field": "recipe.water_amount",
+        "message": "Water amount is required to publish a user recipe."
+      },
+      {
+        "code": "missing_water_temp",
+        "field": "recipe.water_temp",
+        "message": "Water temperature is required to publish a user recipe."
+      },
+      {
+        "code": "missing_brewing_method",
+        "field": "recipe.brewing_method_id",
+        "message": "Brewing method could not be resolved confidently."
+      }
+    ]
+  },
+  "extraction": {
+    "detected_input_language": "en",
+    "likely_brewing_method": null,
+    "name": "Eyeball It Pour Over",
+    "short_description": "No measurements stated -- coffee, water, and method are all left to feel",
+    "grind_size": "Medium",
+    "water_temp_celsius": null,
+    "coffee_amount_grams": null,
+    "water_amount": null,
+    "preparation": "Honestly, I never really measure anything, I just kind of eyeball it every time, so don't come at me for exact numbers here. Grind it somewhere in the middle, not too fine, not too coarse, whatever feels right for your grinder.",
+    "steps": [
+      {
+        "title": null,
+        "raw_text": "Honestly, I never really measure anything, I just kind of eyeball it every time, so don't come at me for exact numbers here. Grind it somewhere in the middle, not too fine, not too coarse, whatever feels right for your grinder.",
+        "duration_seconds": 0,
+        "elapsed_seconds": null,
+        "starts_timer": false,
+        "duration_is_stated": false,
+        "scalable_amounts": [],
+        "step_role": "preparation"
+      },
+      {
+        "title": null,
+        "raw_text": "Get your water hot, pour a splash over the grounds to wet everything, wait a bit for it to settle, and then just keep pouring in stages until it looks about right to you.",
+        "duration_seconds": 30,
+        "elapsed_seconds": null,
+        "starts_timer": false,
+        "duration_is_stated": false,
+        "scalable_amounts": [],
+        "step_role": null
+      },
+      {
+        "title": null,
+        "raw_text": "Once it's done dripping through, you're good to go.",
+        "duration_seconds": 10,
+        "elapsed_seconds": null,
+        "starts_timer": false,
+        "duration_is_stated": false,
+        "scalable_amounts": [],
+        "step_role": "drawdown"
+      }
+    ],
+    "notes": [
+      "Source gives no coffee amount, water amount, water temperature, or brewing method -- every quantity is described only qualitatively."
+    ],
+    "total_brew_time_seconds": null
+  },
+  "draft": {
+    "recipe": {
+      "brewing_method_id": null,
+      "coffee_amount": null,
+      "water_amount": null,
+      "water_temp": null,
+      "brew_time_seconds": 40,
+      "vendor_id": "usr-800792ab-c2ef-49f3-8d6a-c5dceaf71459"
+    },
+    "localization": {
+      "locale": "en",
+      "name": "Eyeball It Pour Over",
+      "grind_size": "Medium",
+      "short_description": "No measurements stated -- coffee, water, and method are all left to feel"
+    },
+    "steps": [
+      {
+        "step_order": 1,
+        "kind": "preparation",
+        "description_source": "Honestly, I never really measure anything, I just kind of eyeball it every time, so don't come at me for exact numbers here. Grind it somewhere in the middle, not too fine, not too coarse, whatever feels right for your grinder.",
+        "description_template": "Honestly, I never really measure anything, I just kind of eyeball it every time, so don't come at me for exact numbers here. Grind it somewhere in the middle, not too fine, not too coarse, whatever feels right for your grinder.",
+        "preview_text": "Honestly, I never really measure anything, I just kind of eyeball it every time, so don't come at me for exact numbers here. Grind it somewhere in the middle, not too fine, not too coarse, whatever feels right for your grinder.",
+        "duration_seconds": 0,
+        "elapsed_seconds": null,
+        "starts_timer": false,
+        "duration_is_stated": false,
+        "scalable_amounts": [],
+        "step_role": "preparation",
+        "expressions": []
+      },
+      {
+        "step_order": 2,
+        "kind": "brew",
+        "description_source": "Get your water hot, pour a splash over the grounds to wet everything, wait a bit for it to settle, and then just keep pouring in stages until it looks about right to you.",
+        "description_template": "Get your water hot, pour a splash over the grounds to wet everything, wait a bit for it to settle, and then just keep pouring in stages until it looks about right to you.",
+        "preview_text": "Get your water hot, pour a splash over the grounds to wet everything, wait a bit for it to settle, and then just keep pouring in stages until it looks about right to you.",
+        "duration_seconds": 30,
+        "elapsed_seconds": null,
+        "starts_timer": false,
+        "duration_is_stated": false,
+        "scalable_amounts": [],
+        "step_role": null,
+        "expressions": []
+      },
+      {
+        "step_order": 3,
+        "kind": "brew",
+        "description_source": "Once it's done dripping through, you're good to go.",
+        "description_template": "Once it's done dripping through, you're good to go.",
+        "preview_text": "Once it's done dripping through, you're good to go.",
+        "duration_seconds": 10,
+        "elapsed_seconds": null,
+        "starts_timer": false,
+        "duration_is_stated": false,
+        "scalable_amounts": [],
+        "step_role": "drawdown",
+        "expressions": []
+      }
+    ]
+  }
+}

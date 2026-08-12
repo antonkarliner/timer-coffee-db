@@ -1,0 +1,176 @@
+{
+  "detected_input_language": "en",
+  "provider_used": "groq",
+  "provider_model_used": "groq/fixture",
+  "provider_trail": [
+    {
+      "stage": "extraction",
+      "provider": "groq",
+      "model": "groq/fixture",
+      "attempts": 1
+    },
+    {
+      "stage": "normalization",
+      "provider": "groq",
+      "model": "groq/fixture",
+      "attempts": 1
+    }
+  ],
+  "capture_id": null,
+  "stage_outputs": null,
+  "tokens_used": 0,
+  "openai_tokens_used": 0,
+  "warnings": [
+    "Derived brew step durations were split deterministically from the stated total brew time.",
+    "Brewing method 'Cold Brew' is not among the supported methods and was left unset.",
+    "Brewing method could not be confidently determined from the source and was left empty.",
+    "Amount provenance could not be verified: the extraction stage did not report extracted_amounts, so this draft's coffee/water amounts are unconfirmed against the submitted text.",
+    "The source states a total brew time of 66600s, but the final brew steps sum to 65100s."
+  ],
+  "validation": {
+    "is_publishable": false,
+    "issues": [
+      {
+        "code": "missing_brewing_method",
+        "field": "recipe.brewing_method_id",
+        "message": "Brewing method could not be resolved confidently."
+      }
+    ]
+  },
+  "extraction": {
+    "detected_input_language": "en",
+    "likely_brewing_method": "Cold Brew",
+    "name": "18-Hour Cold Brew Concentrate",
+    "short_description": "Imperial-measured overnight steep with a flexible 14-24 hour window",
+    "grind_size": "Coarse",
+    "water_temp_celsius": 20,
+    "coffee_amount_grams": 82,
+    "water_amount": 946,
+    "preparation": "Grind about 1 cup of beans, that's roughly 82 grams, on the coarsest setting you've got, like breadcrumbs. Combine it with 4 cups of cold, filtered water -- that's about 946 milliliters -- in a big jar or pitcher.",
+    "steps": [
+      {
+        "title": null,
+        "raw_text": "Grind about 1 cup of beans, that's roughly 82 grams, on the coarsest setting you've got, like breadcrumbs. Combine it with 4 cups of cold, filtered water -- that's about 946 milliliters -- in a big jar or pitcher.",
+        "duration_seconds": 0,
+        "elapsed_seconds": null,
+        "starts_timer": false,
+        "duration_is_stated": false,
+        "scalable_amounts": [
+          {
+            "value": 82,
+            "unit": "g"
+          },
+          {
+            "value": 946,
+            "unit": "ml"
+          }
+        ],
+        "step_role": "preparation"
+      },
+      {
+        "title": null,
+        "raw_text": "Steep time is flexible, honestly anywhere from 14 to 24 hours works depending how strong you like it, but 18 hours is really the sweet spot for me, so let it steep for 18 hours at room temperature or in the fridge.",
+        "duration_seconds": 64800,
+        "elapsed_seconds": null,
+        "starts_timer": true,
+        "duration_is_stated": true,
+        "scalable_amounts": [],
+        "step_role": null
+      },
+      {
+        "title": null,
+        "raw_text": "After that, give it a gentle swirl, then strain it through a fine mesh or paper filter into a clean container, and serve it over ice, diluted to taste.",
+        "duration_seconds": 5,
+        "elapsed_seconds": null,
+        "starts_timer": false,
+        "duration_is_stated": false,
+        "scalable_amounts": [],
+        "step_role": "serve"
+      }
+    ],
+    "notes": [],
+    "total_brew_time_seconds": 66600
+  },
+  "draft": {
+    "recipe": {
+      "brewing_method_id": null,
+      "coffee_amount": 82,
+      "water_amount": 946,
+      "water_temp": 20,
+      "brew_time_seconds": 65100,
+      "vendor_id": "usr-800792ab-c2ef-49f3-8d6a-c5dceaf71459"
+    },
+    "localization": {
+      "locale": "en",
+      "name": "18-Hour Cold Brew Concentrate",
+      "grind_size": "Coarse",
+      "short_description": "Imperial-measured overnight steep with a flexible 14-24 hour window"
+    },
+    "steps": [
+      {
+        "step_order": 1,
+        "kind": "preparation",
+        "description_source": "Grind about 1 cup of beans, that's roughly 82 grams, on the coarsest setting you've got, like breadcrumbs. Combine it with 4 cups of cold, filtered water -- that's about 946 milliliters -- in a big jar or pitcher.",
+        "description_template": "Grind about 1 cup of beans, that's roughly (1 x <final_coffee_amount>)g, on the coarsest setting you've got, like breadcrumbs. Combine it with 4 cups of cold, filtered water -- that's about (1 x <final_water_amount>)ml -- in a big jar or pitcher.",
+        "preview_text": "Grind about 1 cup of beans, that's roughly 82g, on the coarsest setting you've got, like breadcrumbs. Combine it with 4 cups of cold, filtered water -- that's about 946 ml -- in a big jar or pitcher.",
+        "duration_seconds": 0,
+        "elapsed_seconds": null,
+        "starts_timer": false,
+        "duration_is_stated": false,
+        "scalable_amounts": [
+          {
+            "value": 82,
+            "unit": "g"
+          },
+          {
+            "value": 946,
+            "unit": "ml"
+          }
+        ],
+        "step_role": "preparation",
+        "expressions": [
+          {
+            "placeholder": "<final_coffee_amount>",
+            "multiplier": 1,
+            "unit": "g",
+            "preview_value": 82
+          },
+          {
+            "placeholder": "<final_water_amount>",
+            "multiplier": 1,
+            "unit": "ml",
+            "preview_value": 946
+          }
+        ]
+      },
+      {
+        "step_order": 2,
+        "kind": "brew",
+        "description_source": "Steep time is flexible, honestly anywhere from 14 to 24 hours works depending how strong you like it, but 18 hours is really the sweet spot for me, so let it steep for 18 hours at room temperature or in the fridge.",
+        "description_template": "Steep time is flexible, honestly anywhere from 14 to 24 hours works depending how strong you like it, but 18 hours is really the sweet spot for me, so let it steep for 18 hours at room temperature or in the fridge.",
+        "preview_text": "Steep time is flexible, honestly anywhere from 14 to 24 hours works depending how strong you like it, but 18 hours is really the sweet spot for me, so let it steep for 18 hours at room temperature or in the fridge.",
+        "duration_seconds": 64800,
+        "elapsed_seconds": null,
+        "starts_timer": true,
+        "duration_is_stated": true,
+        "scalable_amounts": [],
+        "step_role": null,
+        "expressions": []
+      },
+      {
+        "step_order": 3,
+        "kind": "brew",
+        "description_source": "After that, give it a gentle swirl, then strain it through a fine mesh or paper filter into a clean container, and serve it over ice, diluted to taste.",
+        "description_template": "After that, give it a gentle swirl, then strain it through a fine mesh or paper filter into a clean container, and serve it over ice, diluted to taste.",
+        "preview_text": "After that, give it a gentle swirl, then strain it through a fine mesh or paper filter into a clean container, and serve it over ice, diluted to taste.",
+        "duration_seconds": 300,
+        "elapsed_seconds": null,
+        "starts_timer": false,
+        "duration_is_stated": false,
+        "scalable_amounts": [],
+        "step_role": "serve",
+        "expressions": []
+      }
+    ]
+  }
+}

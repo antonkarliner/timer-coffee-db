@@ -1,0 +1,54 @@
+{
+  "detected_input_language": "en",
+  "likely_brewing_method": "Cold Brew",
+  "name": "18-Hour Cold Brew Concentrate",
+  "short_description": "Imperial-measured overnight steep with a flexible 14-24 hour window",
+  "grind_size": "Coarse",
+  "water_temp_celsius": 20,
+  "coffee_amount_grams": 82,
+  "water_amount": 946,
+  "preparation": "Grind about 1 cup of beans, that's roughly 82 grams, on the coarsest setting you've got, like breadcrumbs. Combine it with 4 cups of cold, filtered water -- that's about 946 milliliters -- in a big jar or pitcher.",
+  "steps": [
+    {
+      "title": null,
+      "raw_text": "Grind about 1 cup of beans, that's roughly 82 grams, on the coarsest setting you've got, like breadcrumbs. Combine it with 4 cups of cold, filtered water -- that's about 946 milliliters -- in a big jar or pitcher.",
+      "duration_seconds": 0,
+      "elapsed_seconds": null,
+      "starts_timer": false,
+      "duration_is_stated": false,
+      "scalable_amounts": [
+        {
+          "value": 82,
+          "unit": "g"
+        },
+        {
+          "value": 946,
+          "unit": "ml"
+        }
+      ],
+      "step_role": "preparation"
+    },
+    {
+      "title": null,
+      "raw_text": "Steep time is flexible, honestly anywhere from 14 to 24 hours works depending how strong you like it, but 18 hours is really the sweet spot for me, so let it steep for 18 hours at room temperature or in the fridge.",
+      "duration_seconds": 64800,
+      "elapsed_seconds": null,
+      "starts_timer": true,
+      "duration_is_stated": true,
+      "scalable_amounts": [],
+      "step_role": null
+    },
+    {
+      "title": null,
+      "raw_text": "After that, give it a gentle swirl, then strain it through a fine mesh or paper filter into a clean container, and serve it over ice, diluted to taste.",
+      "duration_seconds": 5,
+      "elapsed_seconds": null,
+      "starts_timer": false,
+      "duration_is_stated": false,
+      "scalable_amounts": [],
+      "step_role": "serve"
+    }
+  ],
+  "notes": [],
+  "total_brew_time_seconds": 66600
+}

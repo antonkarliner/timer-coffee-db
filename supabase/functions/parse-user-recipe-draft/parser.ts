@@ -1,5 +1,14 @@
 import { z } from "https://deno.land/x/zod@v3.23.8/mod.ts";
 import { GEMINI_DEFAULT_MODEL, OPENAI_MODELS } from "../_shared/ai-models.ts";
+import {
+  type ProvenanceFinding,
+  type RenderedAmount,
+  type RenderedTimingStep,
+  type TimingLandmark,
+  type TimingProvenanceFinding,
+  verifyAmountProvenance,
+  verifyTimingProvenance,
+} from "./provenance.ts";
 
 export type LlmProviderName = "groq" | "cerebras" | "openai" | "gemini";
 
@@ -14,12 +23,89 @@ export const parseUserRecipeDraftRequestSchema = z.object({
   text: z.string().trim().min(1, "text is required"),
   brewing_method_id: z.string().trim().min(1).optional(),
   source_language_hint: z.string().trim().min(1).optional(),
+  // Lets callers opt into the conservative "verify" parser mode (used by
+  // the sibling verify-user-recipe-draft function). Omitted/undefined must
+  // keep today's behaviour, which defaults to "extract" inside
+  // parseDraft — see RecipeDraftParserInput.mode.
+  mode: z.enum(["extract", "verify"]).optional(),
+  // Opt-in per-stage diagnostic capture (see plans/011-recipe-draft-lab-
+  // live-test-runbook.md in the timer-coffee-landing-2 repo). OFF unless the
+  // caller explicitly asks: capturing raw provider output persists it to
+  // service.parse_user_recipe_draft_captures, which is only worth the
+  // storage/size-guard overhead when a tester is deliberately building a
+  // replayable fixture. Gated by nothing beyond the recipe-draft-lab access
+  // check the handler already requires to reach this function at all — no
+  // separate per-account feature flag.
+  capture_stages: z.boolean().default(false),
+});
+
+// G22: mirrors provenance.ts's AmountProvenance type exactly (see that
+// file's own comments for what each field means and how it's checked).
+// value/unit/step_index/provenance are the identity of the record and stay
+// required — a malformed record is better rejected outright (triggering the
+// existing provider-retry machinery) than silently accepted as garbage.
+// The four class-specific fields are nullable+defaulted because provenance.ts
+// itself types them as `| null` unconditionally: a literal record has no
+// rule_*, a derived record has no source_quote, and neither the type nor
+// the runtime check requires the "other" class's fields to be present.
+const amountProvenanceSchema = z.object({
+  value: z.number(),
+  unit: z.string().trim().min(1),
+  step_index: z.number().int(),
+  provenance: z.enum(["literal", "derived", "inferred"]),
+  source_quote: z.string().trim().min(1).nullable().default(null),
+  rule: z.string().trim().min(1).nullable().default(null),
+  rule_source_quote: z.string().trim().min(1).nullable().default(null),
+  rule_inputs: z.record(z.number()).nullable().default(null),
 });
 
 const extractedStepSchema = z.object({
   title: z.string().trim().min(1).nullable().default(null),
   raw_text: z.string().trim().min(1),
   duration_seconds: z.number().int().nonnegative().nullable().default(null),
+  // Elapsed brew time, measured from timer start, at which this step's
+  // action begins. This is an elapsed timestamp, NOT a duration. Null when
+  // not stated by the source.
+  elapsed_seconds: z.number().int().nonnegative().nullable().default(null),
+  // True for the single step where the recipe says to start the timer /
+  // begin the first pour. A model that omits this must not fail the stage.
+  starts_timer: z.boolean().default(false),
+  // True only when the source text explicitly gives a duration for THIS
+  // step (e.g. "steep for 18 hours", "bloom for 45 seconds"). False when
+  // the duration was inferred, estimated, or carried over from a stated
+  // total. An elapsed timestamp ("at 1:30") is not a stated duration — see
+  // elapsed_seconds. A model that omits this must not fail the stage.
+  duration_is_stated: z.boolean().default(false),
+  // F5: amounts in THIS step's raw_text that are genuine recipe
+  // quantities — coffee or water that this recipe's own brew actually
+  // uses — and therefore should scale with the recipe. Never equipment
+  // capacities, product specifications, filter/paper weights, ratios
+  // quoted as an aside, comparisons to other recipes, or commentary. A
+  // model that omits this must not fail the stage; when empty,
+  // convertNumericValuesToExpressions falls back to its prior
+  // regex-only heuristic so scaling doesn't silently stop working.
+  scalable_amounts: z.array(
+    z.object({
+      value: z.number(),
+      unit: z.string().trim().min(1),
+    }),
+  ).default([]),
+  // Phase C3 (F29): labels what this step DOES — independent of the
+  // language it's written in — so role-detection (isDrawdownLikeStep, and
+  // bloom/drawdown selection in splitDerivedBrewStepDurationsFromTarget)
+  // can read this instead of matching English-only keyword regexes
+  // against the step's own text. Nullable + defaulted so a model that
+  // omits it cannot fail the stage; null means every role-detection
+  // function falls back to its pre-C3 English-only regex/heuristic
+  // exactly as before this field existed.
+  step_role: z.enum([
+    "preparation",
+    "bloom",
+    "pour",
+    "stir",
+    "drawdown",
+    "serve",
+  ]).nullable().default(null),
 });
 
 export const extractionSchema = z.object({
@@ -34,6 +120,21 @@ export const extractionSchema = z.object({
   preparation: z.string().trim().min(1).nullable().default(null),
   steps: z.array(extractedStepSchema).min(1),
   notes: z.array(z.string()).default([]),
+  // The recipe's stated total brew time target, in seconds. Must come only
+  // from a statement about this recipe's own brew. Null when not stated.
+  total_brew_time_seconds: z.number().int().positive().nullable().default(
+    null,
+  ),
+  // G22: provenance records for every numeric amount this stage emitted
+  // (recipe-level coffee_amount_grams/water_amount and every step's own
+  // amounts). Top-level rather than nested per-step, because each record
+  // already self-identifies its step via step_index (-1 for a recipe-level
+  // amount) — unlike scalable_amounts, a record here is not naturally
+  // "inside" any one step object. Defaulted so a model/provider that
+  // predates this field does not fail extraction; verifyAmountProvenance
+  // degrades an empty array to a single non-blocking warning rather than
+  // treating it as zero amounts to verify (see provenance.ts).
+  extracted_amounts: z.array(amountProvenanceSchema).default([]),
 });
 
 const normalizedStepSchema = z.object({
@@ -41,6 +142,29 @@ const normalizedStepSchema = z.object({
   description_source: z.string().trim().min(1),
   description_template: z.string().trim().min(1),
   duration_seconds: z.number().int().nonnegative(),
+  elapsed_seconds: z.number().int().nonnegative().nullable().default(null),
+  starts_timer: z.boolean().default(false),
+  // See extractedStepSchema.duration_is_stated — carried through unchanged.
+  duration_is_stated: z.boolean().default(false),
+  // See extractedStepSchema.scalable_amounts — carried through unchanged
+  // (split or merge this list along with the step it describes).
+  scalable_amounts: z.array(
+    z.object({
+      value: z.number(),
+      unit: z.string().trim().min(1),
+    }),
+  ).default([]),
+  // See extractedStepSchema.step_role — carried through unchanged (or
+  // reassigned if a step is split/merged and its role no longer applies
+  // cleanly to the resulting step).
+  step_role: z.enum([
+    "preparation",
+    "bloom",
+    "pour",
+    "stir",
+    "drawdown",
+    "serve",
+  ]).nullable().default(null),
 });
 
 export const normalizedDraftSchema = z.object({
@@ -61,6 +185,11 @@ export const normalizedDraftSchema = z.object({
     short_description: z.string().trim().min(1).nullable().default(null),
   }),
   steps: z.array(normalizedStepSchema).min(1),
+  // See extractedStepSchema.extracted_amounts above — carried through
+  // unchanged from extraction (or updated by normalization/repair if step
+  // splits/merges require re-pointing a record's step_index). Top-level,
+  // like warnings, not nested per step.
+  extracted_amounts: z.array(amountProvenanceSchema).default([]),
 });
 
 const cumulativeRewriteSchema = z.object({
@@ -95,6 +224,20 @@ export type DraftStep = {
   description_template: string;
   preview_text: string;
   duration_seconds: number;
+  elapsed_seconds: number | null;
+  starts_timer: boolean;
+  duration_is_stated: boolean;
+  // See extractedStepSchema.scalable_amounts.
+  scalable_amounts: Array<{ value: number; unit: string }>;
+  // See extractedStepSchema.step_role.
+  step_role:
+    | "preparation"
+    | "bloom"
+    | "pour"
+    | "stir"
+    | "drawdown"
+    | "serve"
+    | null;
   expressions: DraftExpression[];
 };
 
@@ -132,8 +275,61 @@ export type PublishProjection = {
   }>;
 };
 
+// Phase E (Task 3): records what actually ran per stage, so a response can
+// no longer misattribute a stage to a provider that didn't serve it (the
+// F12 telemetry lie — e.g. extraction served by one Groq model while
+// normalization fell through to another, with only the latter reported).
+// One entry per provider ATTEMPTED for a stage, in the order attempted,
+// whether that attempt ultimately succeeded or exhausted its retries and
+// fell through to the next provider.
+export type ProviderTrailEntry = {
+  stage: string;
+  provider: string;
+  model: string;
+  attempts: number;
+};
+
+// Stage-capture (opt-in via capture_stages): one entry per provider
+// invocation ATTEMPTED for a stage — same granularity as ProviderTrailEntry,
+// but recording what that specific attempt actually produced rather than
+// just the tally. attempt is a 1-based counter that increments across every
+// invocation for the stage, spanning both same-provider retries and
+// provider-to-provider fallback (mirrors how provider_trail itself
+// accumulates across both).
+export type StageCaptureEntry = {
+  attempt: number;
+  provider: string;
+  model: string;
+  finish_reason: string | null;
+  // The provider's raw response text, before JSON parsing — or, for an HTTP
+  // error response, the error body. This is deliberately captured even on
+  // failure: it is the most valuable thing available when a stage fails.
+  raw_text: string;
+  // The fully parsed-and-schema-validated result on success; null on any
+  // failure (HTTP error, truncation, malformed JSON, or schema validation
+  // failure) — see `error` for what went wrong.
+  parsed: unknown | null;
+  error: string | null;
+  // Present (true) only when raw_text was longer than the size guard and
+  // had its tail replaced with a truncation marker. Omitted (not false)
+  // when no truncation occurred, keeping untruncated entries lean.
+  truncated?: true;
+};
+
+export type StageOutputs = {
+  extraction: StageCaptureEntry[];
+  normalization: StageCaptureEntry[];
+  repair: StageCaptureEntry[];
+  cumulative_rewrite: StageCaptureEntry[];
+};
+
 export type ParseUserRecipeDraftResponse = {
   detected_input_language: string | null;
+  // Phase E (Task 3): identifies the provider/model that served the
+  // EXTRACTION stage — the stage that sets the draft's substance — not
+  // whichever provider happened to run last across normalization/repair/
+  // cumulative_rewrite. Kept for backward compatibility with existing
+  // consumers (the website, invocation logging).
   provider_used: LlmProviderName;
   provider_model_used: string;
   tokens_used: number;
@@ -162,19 +358,82 @@ export type ParseUserRecipeDraftResponse = {
     steps: DraftStep[];
   };
   publish_projection?: PublishProjection;
+  // Phase E (Task 3): optional and additive so existing consumers (notably
+  // the website's ParseUserRecipeDraftResponse type) keep compiling
+  // untouched. Omitted rather than set to an empty array only in the
+  // theoretical case parseDraft returns without running any stage, which
+  // cannot happen on a successful response.
+  provider_trail?: ProviderTrailEntry[];
+  // Identifies the row in service.parse_user_recipe_draft_captures holding
+  // this run's stage_outputs, when the request set capture_stages: true and
+  // the capture insert succeeded. This is the fixture's identity for replay
+  // (see plans/011's runbook §5) — null when capture wasn't requested, or
+  // when the insert failed (a capture failure must never turn a successful
+  // parse into an error response; see handler.ts).
+  capture_id: string | null;
+  // INTERNAL ONLY — never sent over HTTP. Populated by parseDraft only when
+  // input.captureStages is true; handler.ts reads this to build the
+  // service.parse_user_recipe_draft_captures row and then strips it before
+  // responding to the client. null when capture_stages is off, matching the
+  // "zero overhead when off" requirement: nothing is collected or retained
+  // beyond the existing provider_trail.
+  stage_outputs: StageOutputs | null;
 };
+
+type ProviderInvocationStage =
+  | "extraction"
+  | "normalization"
+  | "repair"
+  | "cumulative_rewrite";
 
 type ProviderInvocation<T> = {
   requestId: string;
-  stage:
-    | "extraction"
-    | "normalization"
-    | "repair"
-    | "cumulative_rewrite";
+  stage: ProviderInvocationStage;
   systemPrompt: string;
   userPrompt: string;
   schema: z.ZodType<T, z.ZodTypeDef, unknown>;
+  // F10: each stage states its own output-token ceiling rather than every
+  // provider call sharing one hardcoded limit — extraction and
+  // normalization/repair/cumulative_rewrite produce very differently sized
+  // JSON payloads, and Phases B/B2/C added four new per-step fields that
+  // made the old single 2500-token ceiling too easy to blow through.
+  maxCompletionTokens: number;
+  // Stage-capture hook (opt-in via capture_stages): called exactly once per
+  // invokeJson call, with the outcome of THAT call — before invokeJson
+  // returns or throws. Undefined/no-op when capture is off, so a provider
+  // implementation need only ever do `input.onAttempt?.(...)` and pay no
+  // cost when nobody is listening.
+  onAttempt?: (info: {
+    rawText: string;
+    finishReason: string | null;
+    parsed: T | null;
+    error: string | null;
+  }) => void;
 };
+
+// F10: clearly-typed so callers can recognize "the model ran out of output
+// tokens" and react (retry, surface a real reason) instead of it silently
+// surfacing as an opaque JSON.parse failure once the truncated payload
+// fails to parse.
+export class ProviderTruncationError extends Error {
+  readonly providerName: LlmProviderName;
+  readonly model: string;
+  readonly stage: ProviderInvocationStage;
+
+  constructor(args: {
+    providerName: LlmProviderName;
+    model: string;
+    stage: ProviderInvocationStage;
+  }) {
+    super(
+      `${args.providerName}:${args.model} response was truncated by the output-token limit during the "${args.stage}" stage.`,
+    );
+    this.name = "ProviderTruncationError";
+    this.providerName = args.providerName;
+    this.model = args.model;
+    this.stage = args.stage;
+  }
+}
 
 export type RecipeDraftAiProvider = {
   name: LlmProviderName;
@@ -185,6 +444,13 @@ export type RecipeDraftAiProvider = {
 };
 
 export type RecipeDraftParserConfig = {
+  // Phase E: buildProviders' DEFAULT provider list (used when
+  // config.providers is not injected) no longer reads these — Groq and
+  // Cerebras were removed from the default cascade (see buildProviders).
+  // Kept here only so existing callers that still pass them (e.g.
+  // verify-user-recipe-draft/index.ts) keep type-checking unchanged; they
+  // are otherwise dead unless a caller injects its own config.providers
+  // that uses them directly.
   groqApiKey?: string;
   cerebrasApiKey?: string;
   openAiApiKey?: string;
@@ -209,6 +475,12 @@ export type RecipeDraftParserInput = {
   requestId: string;
   disabledProviders?: LlmProviderName[];
   mode?: RecipeDraftParserMode;
+  // Opt-in per-stage diagnostic capture — see
+  // parseUserRecipeDraftRequestSchema's capture_stages field. Undefined/
+  // false (the default for every existing caller, including
+  // verify-user-recipe-draft, which never sets this) means parseDraft
+  // collects nothing and returns stage_outputs: null.
+  captureStages?: boolean;
 };
 
 export type RecipeDraftParser = {
@@ -220,21 +492,37 @@ export type RecipeDraftParser = {
 const DEFAULT_GEMINI_MODEL = GEMINI_DEFAULT_MODEL;
 const OPENAI_CHAT_COMPLETIONS_URL =
   "https://api.openai.com/v1/chat/completions";
-const GROQ_CHAT_COMPLETIONS_URL =
-  "https://api.groq.com/openai/v1/chat/completions";
-const CEREBRAS_CHAT_COMPLETIONS_URL =
-  "https://api.cerebras.ai/v1/chat/completions";
+// Phase E: Groq and Cerebras were removed from the default provider cascade
+// (see buildProviders below) — their chat-completions endpoint constants
+// were only ever referenced from that removed code, so they are deleted
+// here as genuinely unreferenced rather than left as dead exports.
+// F10: extraction reads the whole transcript and emits one JSON object per
+// raw step, so it needs materially more headroom than the other stages,
+// which only ever re-emit a bounded number of already-extracted steps.
+// Phases B/B2/C's four new per-step fields (elapsed_seconds, starts_timer,
+// duration_is_stated, scalable_amounts) made the old single 2500-token
+// ceiling too easy to blow through on every stage.
+const STAGE_MAX_COMPLETION_TOKENS: Record<ProviderInvocationStage, number> = {
+  extraction: 8000,
+  normalization: 4000,
+  repair: 4000,
+  cumulative_rewrite: 4000,
+};
 const FORBIDDEN_TIME_PLACEHOLDER_REGEX = /<t\d+>/i;
 const MIN_BREW_STEP_DURATION_SECONDS = 10;
 const FINAL_TIMESTAMPED_STEP_DURATION_SECONDS = 10;
 const DRAWDOWN_STEP_DURATION_SECONDS = 30;
-const DEFAULT_VAGUE_POUR_DURATION_SECONDS = 30;
-const LARGE_CHEMEX_VAGUE_POUR_DURATION_SECONDS = 45;
+// No single brew step duration that this parser infers (as opposed to one
+// the source stated explicitly) may exceed this many seconds.
+const INFERRED_BREW_STEP_DURATION_CAP_SECONDS = 300;
 const UNSUPPORTED_PLACEHOLDER_REGEX = /<([^>]+)>/g;
 const SUPPORTED_PLACEHOLDER_REGEX =
   /<(final_coffee_amount|final_water_amount)>/gi;
-const EXPRESSION_REGEX =
-  /\(([\d.]+)\s*(?:x|×)\s*<(final_coffee_amount|final_water_amount)>\)\s*([^\s<>().,;:!?\-–—]*)/gi;
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 const SCALABLE_UNITS = [
   "g",
   "g.",
@@ -332,6 +620,19 @@ const SCALABLE_UNITS = [
   "унции",
   "литр",
   "литры",
+  // Defect 3 (Aug 2026 live pass): short Russian abbreviations, as
+  // actually written in real recipes ("20 г", "60 мл") rather than the
+  // spelled-out forms above. Without these, a short-form Cyrillic amount
+  // was invisible to this regex entirely and never scaled — sorted
+  // longest-first below still tries "грамм"/"миллилитр" etc. before these,
+  // so a spelled-out word is never mis-split into its short prefix plus
+  // leftover letters.
+  "г",
+  "г.",
+  "гр",
+  "гр.",
+  "мл",
+  "мл.",
   "mililitre",
   "грам",
   "грами",
@@ -346,6 +647,69 @@ const SCALABLE_UNITS = [
   "盎司",
   "升",
 ] as const;
+
+// Fix 2 (Aug 2026 live pass): built once, longest-first, so a compound unit
+// like "gram"/"gr" is never truncated to a bare prefix that also happens to
+// be a valid unit on its own (see NUMERIC_SCALABLE_AMOUNT_REGEX below, which
+// shares this exact ordering requirement and independently builds the same
+// kind of alternation from the same list).
+//
+// Deliberately EXCLUDES any SCALABLE_UNITS entry containing a literal "."
+// (e.g. "g.", "gr.", "ml.", "l.", and their Arabic/Cyrillic/Persian
+// equivalents) — unlike NUMERIC_SCALABLE_AMOUNT_REGEX, which matches a unit
+// sitting directly against a bare number in the middle of prose,
+// EXPRESSION_REGEX's unit sits right after a ")" that very often *also* ends
+// the sentence ("...until you reach the full (1 x <final_water_amount>)g."
+// — that final "." terminates the SENTENCE, not the unit). A
+// period-inclusive alternative like "g." would greedily consume that
+// unrelated sentence period as if it were part of the unit. The
+// non-period forms ("g", "gr", "ml", "l", ...) still match fully; only the
+// redundant period-suffixed duplicates are dropped, so a genuine "20 g."
+// still renders as unit "g" with the period correctly left as trailing
+// punctuation — exactly what the old ASCII-denylist version did (it
+// excluded "." unconditionally) and what the golden fixtures already
+// encode.
+const EXPRESSION_UNIT_ALTERNATION = [...SCALABLE_UNITS]
+  .filter((unit) => !unit.includes("."))
+  .sort((left, right) => right.length - left.length)
+  .map((unit) => escapeRegExp(unit))
+  .join("|");
+
+// Fix 2 (Aug 2026 live pass): the trailing unit group used to be an
+// ASCII-only denylist ([^\s<>().,;:!?\-–—]*), which happily swallowed any
+// trailing text that wasn't specifically excluded — including non-ASCII
+// punctuation like the Japanese ideographic full stop "。". For a template
+// like "(0.316667 x <final_water_amount>)mlまで注ぐ。" (no space between the
+// unit and the following clause, as is normal in Japanese), the old pattern
+// captured "mlまで注ぐ。" as the "unit", corrupting extractExpressions'
+// output at the source — G22 then reported "60mlまで注ぐ。" as an
+// unverifiable amount, and the same corrupted unit string was rendered a
+// second time anywhere the admin draft-lab shows an expression's unit
+// standalone (recipe-draft-lab.tsx's "Proportional amounts" panel: `${
+// multiplier} x total, rendered as ${preview_value}${unit}`), which is what
+// made it look like the trailing clause was duplicated.
+//
+// Anchoring the unit capture to the SCALABLE_UNITS allowlist instead of a
+// denylist means only a real unit — in any script — is ever captured, and
+// nothing past it is swallowed. The group stays optional (a trailing "?")
+// because a range's first expression, e.g. the "(0.25 x
+// <final_water_amount>)" half of "(0.25 x <final_water_amount>)-(0.32 x
+// <final_water_amount>)g", legitimately has no unit of its own immediately
+// after it.
+const EXPRESSION_REGEX = new RegExp(
+  `\\(([\\d.]+)\\s*(?:x|×)\\s*<(final_coffee_amount|final_water_amount)>\\)\\s*(${EXPRESSION_UNIT_ALTERNATION})?`,
+  "gi",
+);
+
+// Defect 1 (Aug 2026 live pass): this keyword list is an English-only
+// fallback signal for resolveAmountPlaceholder — it cannot recognize a
+// coffee noun in German ("Kaffee"), French ("café"), Spanish ("café"), or
+// any other language. Do not treat this list as sufficient on its own;
+// resolveAmountPlaceholder checks the recipe's actual coffee_amount/
+// water_amount values (language-agnostic) FIRST, and only falls back to
+// this list when that structural check is inconclusive. Widen this list
+// only as a labelled, best-effort supplement — never as the primary
+// disambiguation mechanism.
 const COFFEE_CONTEXT_KEYWORDS = [
   "coffee",
   "bean",
@@ -471,12 +835,14 @@ const WATER_CONTEXT_KEYWORDS = [
   "reach",
   "reaching",
 ] as const;
+// F4: recognizes the wording that follows a rate amount (e.g. "9 to 10
+// milliliters A SECOND") so convertNumericValuesToExpressions leaves the
+// rate literal instead of scaling it like a dose. Covers "/s", "/sec",
+// "/min", "per second"/"per sec"/"per min", and — the form that was
+// missing and let a real pour-rate instruction scale wrongly — "a|each
+// |every second/minute".
 const RATE_CONTEXT_REGEX =
-  /^\s*(?:\/\s*(?:s|sec|secs|second|seconds|min|mins|minute|minutes|l|liter|litre|liters|litres)|per\s+(?:second|seconds|sec|secs|minute|minutes|min|mins|liter|litre|liters|litres))/i;
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
+  /^\s*(?:\/\s*(?:s|sec|secs|second|seconds|min|mins|minute|minutes|l|liter|litre|liters|litres)|per\s+(?:second|seconds|sec|secs|minute|minutes|min|mins|liter|litre|liters|litres)|(?:a|each|every)\s+(?:second|seconds|sec|secs|minute|minutes|min|mins))/i;
 
 const NUMERIC_SCALABLE_AMOUNT_REGEX = new RegExp(
   `\\(?([\\d]+(?:\\.\\d+)?)\\)?\\s*(${
@@ -505,8 +871,18 @@ const MULTIPLIER_LITERAL_AMOUNT_REGEX = new RegExp(
   })(?=$|[\\s,.;:!?)]|\\b)`,
   "giu",
 );
+// Defect 3 (Aug 2026 live pass): captures a trailing unit in BOTH possible
+// positions around the optional outer closing paren — right after the
+// INNER placeholder's own ")" (group 4) and, separately, right after the
+// (optional) OUTER ")" (group 5). A malformed nested expression can carry
+// a unit in both spots at once (e.g. a model-produced
+// "(1 x (0.2 x <final_water_amount>)мл)мл"), and the match must consume
+// BOTH so the replace callback below can collapse them into one instead
+// of leaving the second occurrence sitting unconsumed right after the
+// replacement — which is what previously let a doubled unit like "млмл"
+// reach rendered preview text (see normalizeExpressionLikeMath).
 const NESTED_PLACEHOLDER_EXPRESSION_REGEX =
-  /\(?([\d.]+)\)?\s*(?:x|×)\s*\(([\d.]+)\s*(?:x|×)\s*<(final_coffee_amount|final_water_amount)>\)\)?\s*([^\s<>()]*)/gi;
+  /\(?([\d.]+)\)?\s*(?:x|×)\s*\(([\d.]+)\s*(?:x|×)\s*<(final_coffee_amount|final_water_amount)>\)\s*([^\s<>()]*)(?:\)\s*([^\s<>()]*))?/gi;
 
 function uniqueStrings(values: string[]): string[] {
   return [...new Set(values.map((value) => value.trim()).filter(Boolean))];
@@ -547,12 +923,51 @@ function joinNaturalList(items: string[]): string {
   return `${items.slice(0, -1).join(", ")}, and ${items.at(-1)}`;
 }
 
-function formatMultiplier(multiplier: number): string {
-  if (Math.abs(multiplier - Math.round(multiplier)) < 0.01) {
-    return String(Math.round(multiplier));
+// F1(a): must never render a nonzero multiplier as "0" (or "-0") — that
+// was the silent-data-loss bug where e.g. 4.5g of a 500g base
+// (multiplier 0.009) vanished into "(0 x <final_water_amount>)g", which
+// renders as 0g and passes validation because it's syntactically valid.
+// Exported so tests can exercise its precision-capping behavior directly,
+// independent of the scalable-amount gating logic that decides whether a
+// literal amount reaches this formatter at all.
+export function formatMultiplier(multiplier: number): string {
+  const rounded = Math.round(multiplier);
+  // Snap to the nearest integer only when that integer is itself nonzero.
+  // This cleans up floating-point noise around whole multipliers (e.g.
+  // 0.99998 -> "1") without ever collapsing a small-but-real multiplier
+  // toward zero just because zero happens to be the nearest integer.
+  if (rounded !== 0 && Math.abs(multiplier - rounded) < 0.01) {
+    return String(rounded);
   }
 
-  return multiplier.toFixed(5).replace(/\.?0+$/, "");
+  if (multiplier === 0) {
+    return "0";
+  }
+
+  // Cap at 6 significant digits — enough precision for a scaling
+  // multiplier stored in a recipe template, and far less noisy than raw
+  // floating-point division (e.g. 25/300 -> 0.08333333333333333 would
+  // otherwise round-trip through here uncapped). Widen beyond 6
+  // significant digits only if that would round a genuinely nonzero
+  // multiplier to "0" (or "-0") — the zero-collapse guard always wins
+  // over the precision cap.
+  for (
+    let significantDigits = 6;
+    significantDigits <= 17;
+    significantDigits++
+  ) {
+    const formatted = multiplier.toPrecision(significantDigits).replace(
+      /(\.\d*?)0+$/,
+      "$1",
+    ).replace(/\.$/, "");
+    if (formatted !== "0" && formatted !== "-0") {
+      return formatted;
+    }
+  }
+
+  // Unreachable for any finite nonzero multiplier — toPrecision(17) is
+  // full double precision, so the loop above always returns first.
+  return String(multiplier);
 }
 
 function formatTemperatureNumber(value: number): string {
@@ -719,6 +1134,31 @@ function getPrimaryLanguageSignal(
   return null;
 }
 
+// F28/F10-follow-up: the deterministic timing passes can only resolve a
+// total-brew-time target from extraction.total_brew_time_seconds itself,
+// or (English only — see parseTotalBrewTimeTargetSeconds) by mining it
+// out of the narrowed source text. For a non-English recipe where
+// extraction left the field null, neither path can help, and derived
+// step durations silently fall back to the minimum instead of being
+// split from a real target — exactly the bug that shipped an 80s German
+// V60. Surface that condition explicitly instead of letting it pass
+// silently.
+function buildMissingNonEnglishTotalBrewTimeWarnings(input: {
+  detectedInputLanguage: string | null;
+  extractionTotalBrewTimeSeconds: number | null;
+}): string[] {
+  if (
+    input.extractionTotalBrewTimeSeconds !== null ||
+    isEnglishLikeLanguage(input.detectedInputLanguage)
+  ) {
+    return [];
+  }
+
+  return [
+    "No total brew time was extracted for a non-English recipe; step durations fall back to minimums and should be reviewed.",
+  ];
+}
+
 function filterDiagnosticNotes(notes: string[]): string[] {
   return uniqueStrings(notes.filter((note) => {
     const normalized = normalizeKeywordText(note);
@@ -844,6 +1284,16 @@ function parseJsonPayload(content: string): unknown {
 }
 
 function calculateCleanScore(number: number): number {
+  // F1(c): a ratio this small means the candidate amount is a negligible
+  // fraction of this base — almost certainly the WRONG base, not a
+  // "clean" one. Score it worse than every other branch below so
+  // getCleanestPlaceholder never prefers the base that makes an amount
+  // vanish (the "degenerate branch" that used to feed formatMultiplier's
+  // zero-collapse bug).
+  if (Math.abs(number) < 0.02) {
+    return -1000;
+  }
+
   if (Math.abs(number - Math.round(number)) < 0.01) {
     return 100 - Math.abs(number - Math.round(number)) * 100;
   }
@@ -939,6 +1389,13 @@ function nearestKeywordDistance(args: {
   return best;
 }
 
+// Defect 1 (Aug 2026 live pass): how close a candidate value must be to
+// coffeeAmount/waterAmount to count as "exactly equal to the recipe's own
+// amount" rather than a coincidentally-close different quantity. Matches
+// the tolerance already used elsewhere in this file for the same kind of
+// float-noise comparison (see e.g. the scalable_amounts allowlist match).
+const EXACT_AMOUNT_MATCH_TOLERANCE = 0.01;
+
 function resolveAmountPlaceholder(args: {
   description: string;
   stepKind: "preparation" | "brew";
@@ -947,7 +1404,45 @@ function resolveAmountPlaceholder(args: {
   value: number;
   coffeeAmount: number | null;
   waterAmount: number | null;
+  // See extractedStepSchema.step_role. Used only as a secondary,
+  // structural (language-agnostic) tiebreaker below — never required.
+  stepRole?:
+    | "preparation"
+    | "bloom"
+    | "pour"
+    | "stir"
+    | "drawdown"
+    | "serve"
+    | null;
 }): DraftExpression["placeholder"] | null {
+  // Defect 1 (Aug 2026 live pass): highest-priority, language-agnostic
+  // signal, checked BEFORE any keyword matching. A live German step "15 g
+  // Kaffee zugeben und umruehren." (coffee_amount 15, water_amount 250)
+  // used to resolve to (0.06 x <final_water_amount>)g because
+  // COFFEE_CONTEXT_KEYWORDS/WATER_CONTEXT_KEYWORDS below are English-only
+  // and matched neither "Kaffee" nor "zugeben" — the amount fell through
+  // to a brew-step default that always prefers water. A value that
+  // exactly equals this recipe's own coffee_amount (and not also its
+  // water_amount) is overwhelmingly likely to BE the coffee amount,
+  // regardless of what language or keywords surround it, so check that
+  // structural fact first. Symmetric for water_amount.
+  const matchesCoffeeExactly = args.coffeeAmount !== null &&
+    Math.abs(args.value - args.coffeeAmount) < EXACT_AMOUNT_MATCH_TOLERANCE;
+  const matchesWaterExactly = args.waterAmount !== null &&
+    Math.abs(args.value - args.waterAmount) < EXACT_AMOUNT_MATCH_TOLERANCE;
+
+  if (matchesCoffeeExactly && !matchesWaterExactly) {
+    return "<final_coffee_amount>";
+  }
+
+  if (matchesWaterExactly && !matchesCoffeeExactly) {
+    return "<final_water_amount>";
+  }
+
+  // English-only fallback keyword matching (see COFFEE_CONTEXT_KEYWORDS'
+  // own comment) — used only when the structural check above could not
+  // decide (value doesn't exactly match either base amount, or matches
+  // both).
   const coffeeDistance = nearestKeywordDistance({
     description: args.description,
     matchStart: args.matchStart,
@@ -982,6 +1477,26 @@ function resolveAmountPlaceholder(args: {
   }
 
   if (args.stepKind === "brew" && args.waterAmount !== null) {
+    // Defect 1 follow-up: step_role is a structural, language-agnostic
+    // signal (see extractedStepSchema.step_role) — "preparation" and
+    // "stir" steps describe dosing/setup actions, not water additions, so
+    // an unresolved amount there should not be forced onto the water
+    // base. Fall through to the ratio-based getCleanestPlaceholder
+    // instead. "bloom"/"pour"/"drawdown"/"serve"/null keep the original
+    // water default, since those roles (or the absence of a role, for
+    // drafts predating step_role) are genuinely water-shaped brew
+    // actions.
+    if (
+      (args.stepRole === "preparation" || args.stepRole === "stir") &&
+      args.coffeeAmount !== null
+    ) {
+      return getCleanestPlaceholder({
+        value: args.value,
+        coffeeAmount: args.coffeeAmount,
+        waterAmount: args.waterAmount,
+      });
+    }
+
     return "<final_water_amount>";
   }
 
@@ -992,15 +1507,62 @@ function resolveAmountPlaceholder(args: {
   });
 }
 
+// F1(b): amounts under 2% of their base are not meaningfully scalable — a
+// 1g addition in a 300g recipe should stay a literal number, not become a
+// fraction so small that formatMultiplier used to have to collapse it to
+// "0". Shared by both the range and single-amount passes below.
+const MIN_SCALABLE_AMOUNT_RATIO = 0.02;
+
 function convertNumericValuesToExpressions(args: {
   description: string;
   stepKind: "preparation" | "brew";
   coffeeAmount: number | null;
   waterAmount: number | null;
+  // F5: amounts this step's extraction/normalization stage identified as
+  // genuine recipe quantities. When non-empty, ONLY amounts appearing in
+  // this list (matched on value and normalized unit) are eligible for
+  // conversion — equipment capacities, product specs, and asides never
+  // make the list and stay literal even if they'd otherwise parse as a
+  // scalable amount near a coffee/water keyword.
+  scalableAmounts: Array<{ value: number; unit: string }>;
+  // See extractedStepSchema.step_role. Passed through to
+  // resolveAmountPlaceholder as a secondary, language-agnostic tiebreaker
+  // (defect 1 follow-up) — optional so callers that predate step_role
+  // keep compiling and behaving exactly as before.
+  stepRole?:
+    | "preparation"
+    | "bloom"
+    | "pour"
+    | "stir"
+    | "drawdown"
+    | "serve"
+    | null;
 }): string {
   if (!args.description.trim().length) {
     return args.description;
   }
+
+  // Backward compatibility (F5): an empty list means either this step
+  // truly has no scalable amounts, or — just as likely in the field — the
+  // model run that produced this draft predates/ignores the
+  // scalable_amounts field. There is no way to tell those apart from here,
+  // and refusing to convert in the second case would silently regress
+  // every recipe back to non-scaling instructions. So an empty list falls
+  // back to the pre-F5 regex-only heuristic (every match is eligible)
+  // rather than allowing nothing through.
+  const hasScalableAmountAllowlist = args.scalableAmounts.length > 0;
+  const isListedScalableAmount = (value: number, unit: string): boolean => {
+    if (!hasScalableAmountAllowlist) {
+      return true;
+    }
+
+    const normalizedUnit = normalizeExpressionUnit(unit).trim().toLowerCase();
+    return args.scalableAmounts.some((amount) =>
+      normalizeExpressionUnit(amount.unit).trim().toLowerCase() ===
+        normalizedUnit &&
+      Math.abs(amount.value - value) < 0.01
+    );
+  };
 
   const withRanges = args.description.replace(
     NUMERIC_SCALABLE_RANGE_REGEX,
@@ -1019,6 +1581,13 @@ function convertNumericValuesToExpressions(args: {
         !Number.isFinite(upperValue) ||
         lowerValue < 0.1 ||
         upperValue < 0.1
+      ) {
+        return fullMatch;
+      }
+
+      if (
+        !isListedScalableAmount(lowerValue, String(unit)) ||
+        !isListedScalableAmount(upperValue, String(unit))
       ) {
         return fullMatch;
       }
@@ -1048,6 +1617,7 @@ function convertNumericValuesToExpressions(args: {
         value: lowerValue,
         coffeeAmount: args.coffeeAmount,
         waterAmount: args.waterAmount,
+        stepRole: args.stepRole,
       });
       const upperPlaceholder = resolveAmountPlaceholder({
         description: String(fullDescription),
@@ -1057,6 +1627,7 @@ function convertNumericValuesToExpressions(args: {
         value: upperValue,
         coffeeAmount: args.coffeeAmount,
         waterAmount: args.waterAmount,
+        stepRole: args.stepRole,
       });
 
       if (!lowerPlaceholder || lowerPlaceholder !== upperPlaceholder) {
@@ -1068,6 +1639,13 @@ function convertNumericValuesToExpressions(args: {
         : args.waterAmount;
 
       if (baseAmount === null || baseAmount <= 0) {
+        return fullMatch;
+      }
+
+      if (
+        lowerValue / baseAmount < MIN_SCALABLE_AMOUNT_RATIO ||
+        upperValue / baseAmount < MIN_SCALABLE_AMOUNT_RATIO
+      ) {
         return fullMatch;
       }
 
@@ -1085,6 +1663,10 @@ function convertNumericValuesToExpressions(args: {
     (fullMatch, numericValue, unit, offset, fullDescription) => {
       const value = Number(numericValue);
       if (!Number.isFinite(value) || value < 0.1) {
+        return fullMatch;
+      }
+
+      if (!isListedScalableAmount(value, String(unit))) {
         return fullMatch;
       }
 
@@ -1113,6 +1695,7 @@ function convertNumericValuesToExpressions(args: {
         value,
         coffeeAmount: args.coffeeAmount,
         waterAmount: args.waterAmount,
+        stepRole: args.stepRole,
       });
 
       if (!placeholder) {
@@ -1124,6 +1707,10 @@ function convertNumericValuesToExpressions(args: {
         : args.waterAmount;
 
       if (baseAmount === null || baseAmount <= 0) {
+        return fullMatch;
+      }
+
+      if (value / baseAmount < MIN_SCALABLE_AMOUNT_RATIO) {
         return fullMatch;
       }
 
@@ -1165,7 +1752,8 @@ function normalizeExpressionLikeMath(args: {
       outerMultiplierValue,
       innerMultiplierValue,
       placeholderValue,
-      unitValue,
+      innerUnitValue,
+      outerUnitValue,
     ) => {
       const outerMultiplier = Number(outerMultiplierValue);
       const innerMultiplier = Number(innerMultiplierValue);
@@ -1175,9 +1763,20 @@ function normalizeExpressionLikeMath(args: {
         return _fullMatch;
       }
 
+      // Defect 3: prefer the unit captured after the OUTER closing paren
+      // (the syntactically-intended position) and fall back to the one
+      // after the inner paren only when the outer position was empty.
+      // When a malformed input carries the SAME unit in both positions
+      // (see NESTED_PLACEHOLDER_EXPRESSION_REGEX's comment), both were
+      // consumed by the match above, so using only one here — instead of
+      // concatenating both — is what stops the duplicate from reaching
+      // the rendered output.
+      const unitValue = String(outerUnitValue ?? "") ||
+        String(innerUnitValue ?? "");
+
       return `(${formatMultiplier(outerMultiplier * innerMultiplier)} x <${
         String(placeholderValue).toLowerCase()
-      }>)${normalizeExpressionUnit(String(unitValue ?? ""))}`;
+      }>)${normalizeExpressionUnit(unitValue)}`;
     },
   );
 
@@ -1233,57 +1832,98 @@ function createOpenAiCompatibleProvider(args: {
     async invokeJson<T>(
       input: ProviderInvocation<T>,
     ): Promise<{ result: T; tokensUsed: number }> {
-      const response = await args.fetchImpl(args.endpoint, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${args.apiKey}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model: args.model,
-          messages: [
-            {
-              role: "system",
-              content: input.systemPrompt,
-            },
-            {
-              role: "user",
-              content: input.userPrompt,
-            },
-          ],
-          response_format: {
-            type: "json_object",
+      // Stage-capture (opt-in via capture_stages): rawText/finishReason are
+      // filled in as soon as they're known, then onAttempt fires exactly
+      // once — in the catch block on any failure, or right before
+      // returning on success — so it always sees whatever text was
+      // available for THIS attempt, whether or not parsing succeeded.
+      let rawText = "";
+      let finishReason: string | null = null;
+
+      try {
+        const response = await args.fetchImpl(args.endpoint, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${args.apiKey}`,
+            "Content-Type": "application/json",
           },
-          temperature: 0.1,
-          max_completion_tokens: 2500,
-          stream: false,
-          ...(args.name === "openai"
-            ? { reasoning_effort: "none" as const }
-            : {}),
-        }),
-      });
+          body: JSON.stringify({
+            model: args.model,
+            messages: [
+              {
+                role: "system",
+                content: input.systemPrompt,
+              },
+              {
+                role: "user",
+                content: input.userPrompt,
+              },
+            ],
+            response_format: {
+              type: "json_object",
+            },
+            temperature: 0.1,
+            max_completion_tokens: input.maxCompletionTokens,
+            stream: false,
+            ...(args.name === "openai"
+              ? { reasoning_effort: "none" as const }
+              : {}),
+          }),
+        });
 
-      if (!response.ok) {
-        const errorBody = await response.text();
-        throw new Error(
-          `${args.name}:${args.model} HTTP ${response.status} ${
-            errorBody.slice(0, 300)
-          }`,
-        );
+        if (!response.ok) {
+          const errorBody = await response.text();
+          rawText = errorBody;
+          throw new Error(
+            `${args.name}:${args.model} HTTP ${response.status} ${
+              errorBody.slice(0, 300)
+            }`,
+          );
+        }
+
+        const data = await response.json();
+        finishReason = data.choices?.[0]?.finish_reason ?? null;
+        const content = data.choices?.[0]?.message?.content;
+        rawText = typeof content === "string" ? content : "";
+
+        // F10: detect an output-token-truncated response explicitly, before
+        // it has any chance to fail JSON.parse with an opaque error. A
+        // truncated response is a distinct, typed failure — not a generic
+        // "malformed JSON" one — so retry/fallback logic upstream can
+        // reason about it.
+        if (finishReason === "length") {
+          throw new ProviderTruncationError({
+            providerName: args.name,
+            model: args.model,
+            stage: input.stage,
+          });
+        }
+
+        if (typeof content !== "string" || content.trim().length === 0) {
+          throw new Error(`${args.name}:${args.model} returned empty content`);
+        }
+
+        const parsedJson = parseJsonPayload(content);
+        const result = input.schema.parse(parsedJson);
+        input.onAttempt?.({
+          rawText,
+          finishReason,
+          parsed: result,
+          error: null,
+        });
+        return {
+          result,
+          tokensUsed: data.usage?.total_tokens ?? 0,
+        };
+      } catch (error) {
+        input.onAttempt?.({
+          rawText,
+          finishReason,
+          parsed: null,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        throw error;
       }
-
-      const data = await response.json();
-      const content = data.choices?.[0]?.message?.content;
-
-      if (typeof content !== "string" || content.trim().length === 0) {
-        throw new Error(`${args.name}:${args.model} returned empty content`);
-      }
-
-      const parsed = parseJsonPayload(content);
-      return {
-        result: input.schema.parse(parsed),
-        tokensUsed: data.usage?.total_tokens ?? 0,
-      };
     },
   };
 }
@@ -1414,59 +2054,96 @@ function createGeminiProvider(args: {
     async invokeJson<T>(
       input: ProviderInvocation<T>,
     ): Promise<{ result: T; tokensUsed: number }> {
-      const accessToken = await getAccessToken();
-      const response = await args.fetchImpl(endpoint, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          systemInstruction: {
-            parts: [
-              {
-                text: input.systemPrompt,
-              },
-            ],
+      // Stage-capture (opt-in via capture_stages): see the mirrored comment
+      // in createOpenAiCompatibleProvider's invokeJson above.
+      let rawText = "";
+      let finishReason: string | null = null;
+
+      try {
+        const accessToken = await getAccessToken();
+        const response = await args.fetchImpl(endpoint, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            "Content-Type": "application/json",
           },
-          contents: [
-            {
-              role: "user",
+          body: JSON.stringify({
+            systemInstruction: {
               parts: [
                 {
-                  text: input.userPrompt,
+                  text: input.systemPrompt,
                 },
               ],
             },
-          ],
-          generationConfig: {
-            temperature: 0.1,
-            responseMimeType: "application/json",
-          },
-        }),
-      });
+            contents: [
+              {
+                role: "user",
+                parts: [
+                  {
+                    text: input.userPrompt,
+                  },
+                ],
+              },
+            ],
+            generationConfig: {
+              temperature: 0.1,
+              responseMimeType: "application/json",
+              maxOutputTokens: input.maxCompletionTokens,
+            },
+          }),
+        });
 
-      if (!response.ok) {
-        const errorBody = await response.text();
-        throw new Error(
-          `gemini:${args.model} HTTP ${response.status} ${
-            errorBody.slice(0, 300)
-          }`,
-        );
+        if (!response.ok) {
+          const errorBody = await response.text();
+          rawText = errorBody;
+          throw new Error(
+            `gemini:${args.model} HTTP ${response.status} ${
+              errorBody.slice(0, 300)
+            }`,
+          );
+        }
+
+        const data = await response.json();
+
+        // F10: Gemini's truncation signal, mirroring the OpenAI-compatible
+        // finish_reason === "length" check above.
+        finishReason = data.candidates?.[0]?.finishReason ?? null;
+        const content = data.candidates?.[0]?.content?.parts?.[0]?.text;
+        rawText = typeof content === "string" ? content : "";
+
+        if (finishReason === "MAX_TOKENS") {
+          throw new ProviderTruncationError({
+            providerName: "gemini",
+            model: args.model,
+            stage: input.stage,
+          });
+        }
+
+        if (typeof content !== "string" || content.trim().length === 0) {
+          throw new Error(`gemini:${args.model} returned empty content`);
+        }
+
+        const parsedJson = parseJsonPayload(content);
+        const result = input.schema.parse(parsedJson);
+        input.onAttempt?.({
+          rawText,
+          finishReason,
+          parsed: result,
+          error: null,
+        });
+        return {
+          result,
+          tokensUsed: data.usageMetadata?.totalTokenCount ?? 0,
+        };
+      } catch (error) {
+        input.onAttempt?.({
+          rawText,
+          finishReason,
+          parsed: null,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        throw error;
       }
-
-      const data = await response.json();
-      const content = data.candidates?.[0]?.content?.parts?.[0]?.text;
-
-      if (typeof content !== "string" || content.trim().length === 0) {
-        throw new Error(`gemini:${args.model} returned empty content`);
-      }
-
-      const parsed = parseJsonPayload(content);
-      return {
-        result: input.schema.parse(parsed),
-        tokensUsed: data.usageMetadata?.totalTokenCount ?? 0,
-      };
     },
   };
 }
@@ -1481,6 +2158,20 @@ function buildProviders(
   const fetchImpl = config.fetchImpl ?? fetch;
   const providers: RecipeDraftAiProvider[] = [];
 
+  // Phase E: measured against twelve live production parses, openai's
+  // MEDIUM tier served 11/12 end-to-end at 7,400-9,147 tokens; the one that
+  // fell through to Groq cost ~2.5x the tokens (21,834) and produced the
+  // worst output of the batch. Groq's org-wide 8,000 TPM ceiling cannot
+  // structurally absorb a single parse (3-5 sequential calls), and
+  // Cerebras's free tier (5 RPM) hits its request ceiling on one button
+  // press. So the default cascade is now: MEDIUM, then BIG as the single
+  // escalation for inputs MEDIUM fails, then Gemini kept only as a
+  // provider-outage fallback. Combined with the same-provider retry (F10 /
+  // Phase C2), this yields two attempts on MEDIUM, then two on BIG, then
+  // Gemini — strictly better coverage than the old cascade while never
+  // silently swapping in a weaker model. Groq/Cerebras remain available via
+  // explicit config.providers injection; see plans/README.md for why this
+  // is not a "normalize back onto Groq" candidate.
   if (config.openAiApiKey) {
     providers.push(
       createOpenAiCompatibleProvider({
@@ -1491,37 +2182,12 @@ function buildProviders(
         fetchImpl,
       }),
     );
-  }
-
-  if (config.groqApiKey) {
     providers.push(
       createOpenAiCompatibleProvider({
-        name: "groq",
-        apiKey: config.groqApiKey,
-        model: "groq/compound-mini",
-        endpoint: GROQ_CHAT_COMPLETIONS_URL,
-        fetchImpl,
-      }),
-    );
-
-    providers.push(
-      createOpenAiCompatibleProvider({
-        name: "groq",
-        apiKey: config.groqApiKey,
-        model: "openai/gpt-oss-20b",
-        endpoint: GROQ_CHAT_COMPLETIONS_URL,
-        fetchImpl,
-      }),
-    );
-  }
-
-  if (config.cerebrasApiKey) {
-    providers.push(
-      createOpenAiCompatibleProvider({
-        name: "cerebras",
-        apiKey: config.cerebrasApiKey,
-        model: "qwen-3-235b-a22b-instruct-2507",
-        endpoint: CEREBRAS_CHAT_COMPLETIONS_URL,
+        name: "openai",
+        apiKey: config.openAiApiKey,
+        model: OPENAI_MODELS.BIG,
+        endpoint: OPENAI_CHAT_COMPLETIONS_URL,
         fetchImpl,
       }),
     );
@@ -1552,10 +2218,32 @@ function buildBrewingMethodsPrompt(methods: BrewingMethodOption[]): string {
     .join("\n");
 }
 
+// G22: shared between the extraction, normalization and repair system
+// prompts (each stage can add or correct extracted_amounts records). Kept
+// as one block so the three stages never drift into inconsistent
+// definitions of what each provenance class means.
+const AMOUNT_PROVENANCE_PROMPT_RULES: string[] = [
+  "Every numeric coffee or water amount — recipe-level coffee_amount_grams/water_amount and every step's own amounts alike, including range endpoints and cumulative pour targets — must also get a matching record in extracted_amounts: { value, unit, step_index, provenance, source_quote, rule, rule_source_quote, rule_inputs }.",
+  "step_index is the 0-based index into steps that the amount belongs to, or -1 for a recipe-level amount not tied to one specific step.",
+  "provenance is exactly one of three values: 'literal', 'derived', or 'inferred'.",
+  '\'literal\' means the value appears verbatim in the source text. source_quote must be the exact substring of the source text stating it — copy it character for character, do not paraphrase or reformat it. rule, rule_source_quote, and rule_inputs must be null. Worked example (English): the text \'Pour 50 g of water for the bloom.\' gives { value: 50, unit: "g", provenance: "literal", source_quote: "50 g", rule: null, rule_source_quote: null, rule_inputs: null }. Worked example (German, non-English): the text \'25g Kaffee aufgießen und quellen lassen.\' gives { value: 25, unit: "g", provenance: "literal", source_quote: "25g", rule: null, rule_source_quote: null, rule_inputs: null } — never translate source_quote into English.',
+  "'derived' means the value is computed from other source facts by a rule the text states, not quoted directly as a number. rule must be exactly one of: multiple_of_coffee (N x coffee_amount), multiple_of_water (N x water_amount), ratio_of_total (percent of water_amount), concentration (grams_per_litre x millilitres / 1000, giving a COFFEE mass — use this ONLY when the value you are recording is the coffee amount), concentration_water_from_coffee (coffee_grams / grams_per_litre x 1000, giving a WATER volume — use this instead of concentration whenever the value you are recording is the water amount), range_endpoint (low, high, or midpoint of a stated range), cumulative_sum (running total of prior pours). rule_source_quote must be the exact source substring stating the RULE itself (not the resulting number), and rule_inputs must hold the exact numeric operands needed to recompute the value. source_quote must be null.",
+  'Worked example, multiple_of_coffee: \'Bloom with three times the dose of water\' for a 25 g dose gives { value: 75, unit: "g", provenance: "derived", source_quote: null, rule: "multiple_of_coffee", rule_source_quote: "three times the dose", rule_inputs: { multiplier: 3, coffee_amount: 25 } }.',
+  'Worked example, concentration: \'Use a ratio of 60 grams per liter\' at a 500 ml water target gives the COFFEE mass, { value: 30, unit: "g", provenance: "derived", source_quote: null, rule: "concentration", rule_source_quote: "60 grams per liter", rule_inputs: { grams_per_litre: 60, millilitres: 500 } }. This rule only derives a coffee mass from a concentration and a water volume — it cannot derive a water amount, so never use it to justify a water figure.',
+  'Worked example, concentration_water_from_coffee: the SAME \'Use a ratio of 60 grams per liter\' text, but now for a 30 g coffee dose, gives the WATER volume, { value: 500, unit: "ml", provenance: "derived", source_quote: null, rule: "concentration_water_from_coffee", rule_source_quote: "60 grams per liter", rule_inputs: { grams_per_litre: 60, coffee_grams: 30 } }. Never call this rule "concentration" and never pass the water figure you are trying to justify back in as one of its own rule_inputs — rule_inputs must hold only the OTHER facts (the concentration and the coffee dose), not the value being derived.',
+  'Worked example, range_endpoint: \'60-90 g of coffee\', when the recipe\'s own steps settle on the low end, gives { value: 60, unit: "g", provenance: "derived", source_quote: null, rule: "range_endpoint", rule_source_quote: "60-90 g", rule_inputs: { low: 60, high: 90, endpoint: 0 } }. endpoint is 0 for the low end, 1 for the high end, 0.5 for the midpoint.',
+  'Worked example, cumulative_sum: five pours to running totals 60/120/180/240/300 ml — the step pouring to 180 ml gives { value: 180, unit: "ml", provenance: "derived", source_quote: null, rule: "cumulative_sum", rule_source_quote: "<the source phrase stating the running/cumulative total for that pour>", rule_inputs: { sum: 180 } }.',
+  "'inferred' means there is no source basis for the value at all. inferred is PERMITTED ONLY for water temperature and grind size (never represented in extracted_amounts, since those are not coffee/water amounts) — it must NEVER be used for a coffee or water amount. If you cannot justify an amount as literal or derived per the rules above, do not invent one: leave it out of extracted_amounts rather than mark it inferred.",
+  "extracted_amounts may be an empty array only when the source genuinely states no coffee or water amounts at all. Never omit a record for an amount you did extract.",
+];
+
 function buildExtractionSystemPrompt(): string {
   return [
     "You extract coffee recipes for Timer.Coffee.",
     "Return only valid JSON.",
+    "CRITICAL: name, short_description, grind_size, preparation, and every step's raw_text must be written in the SAME LANGUAGE as the source recipe text. Translating any of these into a different language — including translating them into English when the source is not English — is an error, not a stylistic choice or a cleanup step.",
+    "Worked example: if the source text is German, e.g. a step reading 'V60 auf die Waage stellen, Filter einsetzen und spülen.', the corresponding raw_text must stay in German, unchanged in meaning and wording, never translated to English ('Place and tare the brewer, insert and rinse the filter.').",
+    "notes is diagnostic parser commentary, not recipe content, so it may be written in English regardless of the source language; mixed-language notes (English notes alongside a non-English recipe) are expected and acceptable.",
     "Do not translate or rewrite source text.",
     "Preserve literal amounts, units, and timings from the source recipe.",
     "Normalize all temperatures to Celsius before returning them.",
@@ -1568,6 +2256,22 @@ function buildExtractionSystemPrompt(): string {
     "All timed brew steps must use integer seconds when explicit or strongly inferable from local context; otherwise use null.",
     "If a step starts with a timestamp like 0:45 or 1:30, that timestamp is elapsed brew time from recipe start; preserve it in raw_text and do not treat it as the step duration unless the interval to the next action is explicit.",
     "Final coffee_amount_grams and water_amount should represent the overall recipe target, not a single pour.",
+    "If the source gives a range for coffee_amount_grams or water_amount (e.g. 'Dosis: 20-24g'), do not average or take the midpoint of the range. Instead use whichever value the recipe's own steps actually build up to — for example if the steps pour to a final total of 300g, use 300 for water_amount even if the intro text says '300g-350g'. If the steps never resolve the range to a single value, use the low end of the range.",
+    "elapsed_seconds is an elapsed timestamp measured from timer start, NOT a duration. Example: 'At 1:30, pour to 180g' has elapsed_seconds 90 for that step.",
+    "Times may be spelled as words, such as 'three fifteen to three forty-five' or 'a minute 30'; convert them to seconds.",
+    "starts_timer is true only for the single step where the recipe says to start the timer or begin the first pour. At most one step may have starts_timer true.",
+    "duration_is_stated is true only when the source text explicitly gives a duration for that specific step, such as 'steep for 18 hours' or 'bloom for 45 seconds'. It is false when the duration was inferred, estimated, or carried over from a recipe-level total. An elapsed timestamp like 'at 1:30' is never a stated duration — that belongs in elapsed_seconds instead.",
+    "total_brew_time_seconds must come only from a statement about this recipe's own stated brew time. Ignore timing mentioned in commentary, comparisons to other brewers, equipment asides, anecdotes, or general advice unrelated to this recipe's own brew.",
+    "This applies in EVERY language the source may be written in, not just English. A labelled total-time field is the same field regardless of what language it's labelled in — for example German 'Brühzeit: 2:30 - 3:30', Spanish 'tiempo de extracción', French 'temps d'infusion', or Japanese '抽出時間' are all total_brew_time_seconds, exactly like an English 'Brew time: 2:30-3:30'. Example: German 'Brühzeit: 2:30 - 3:30' becomes total_brew_time_seconds 180 (the midpoint, per the rounding rule below).",
+    "A sentence stating this recipe should finish within roughly some amount of time — such as 'should be finished within about 3 minutes' or its equivalent in another language — is a STATED total brew time, not commentary, and must populate total_brew_time_seconds. Only commentary about OTHER setups, other people's brews, or general advice unrelated to this recipe's own brew should be excluded, exactly as above.",
+    "The midpoint-of-range rule below applies only to total_brew_time_seconds. Never average or take the midpoint of a range for any other field, including coffee_amount_grams, water_amount, or any individual step's duration_seconds.",
+    "If the source gives a range for total_brew_time_seconds, use the midpoint rounded to the nearest 5 seconds. Example: 'three fifteen to three forty-five' becomes 210.",
+    "If no total brew time is stated for this recipe, total_brew_time_seconds must be null.",
+    "Each step's scalable_amounts must list ONLY the amounts in that step's raw_text that are genuine recipe quantities: coffee or water that this recipe's own brew actually uses. Never include equipment capacities (e.g. a reservoir or tank size), product specifications, paper or filter weights, ratios quoted as an aside, comparisons to other recipes, or any number mentioned only in commentary. Example: a Gabi Dripmaster's '120ml reservoir' is equipment capacity, not a scalable amount, even in a step that also pours water. When in doubt, leave an amount out of scalable_amounts.",
+    "scalable_amounts may be an empty array when a step has no genuine scalable coffee/water amount.",
+    "Each step's step_role labels what that step DOES, independent of the language it is written in. Use 'preparation' for setup before brewing starts, 'bloom' for the initial wetting pour, 'pour' for any subsequent water addition, 'stir' for a stir/swirl/agitate action with no water added, 'drawdown' for waiting for the bed to drain after the last pour, and 'serve' for decanting, straining, or serving. Use null only when no role clearly applies.",
+    "step_role describes the step's function, not its wording or language — for example a German step whose raw_text is 'Vollständig durchlaufen lassen.' (let it drain completely) is step_role 'drawdown', exactly like an English 'Let it fully draw down.' would be.",
+    ...AMOUNT_PROVENANCE_PROMPT_RULES,
   ].join(" ");
 }
 
@@ -1594,9 +2298,28 @@ function buildExtractionUserPrompt(input: {
             title: "string|null",
             raw_text: "string",
             duration_seconds: "number|null",
+            elapsed_seconds: "number|null",
+            starts_timer: "boolean",
+            duration_is_stated: "boolean",
+            scalable_amounts: [{ value: "number", unit: "string" }],
+            step_role: "preparation|bloom|pour|stir|drawdown|serve|null",
           },
         ],
         notes: ["string"],
+        total_brew_time_seconds: "number|null",
+        extracted_amounts: [
+          {
+            value: "number",
+            unit: "string",
+            step_index: "number (0-based, or -1 for a recipe-level amount)",
+            provenance: "literal|derived|inferred",
+            source_quote: "string|null",
+            rule:
+              "multiple_of_coffee|multiple_of_water|ratio_of_total|concentration|concentration_water_from_coffee|range_endpoint|cumulative_sum|null",
+            rule_source_quote: "string|null",
+            rule_inputs: "object of numeric operands, or null",
+          },
+        ],
       },
       null,
       2,
@@ -1617,7 +2340,10 @@ function buildNormalizationSystemPrompt(mode: RecipeDraftParserMode): string {
   const baseRules = [
     "You normalize extracted coffee recipes for Timer.Coffee user recipes.",
     "Return only valid JSON.",
-    "Storage locale is always 'en', but do not translate source text.",
+    "CRITICAL: description_source, description_template, localization.name, localization.grind_size, and localization.short_description must be written in the SAME LANGUAGE as the source recipe text. Translating any of these into a different language — including translating them into English when the source is not English — is an error, not a stylistic choice or a cleanup step.",
+    "Every recipe you process is stored under the database locale value 'en', regardless of what language its text is written in. That 'en' is metadata about the storage row, set by application code, not by you — it is NOT an instruction to write English and is not a signal about what language the source is in. Do not let it influence what language you write in.",
+    "Worked example: for a German source, description_source and description_template must both stay in German — e.g. a German source step 'V60 auf die Waage stellen, Filter einsetzen und spülen.' must produce description_template text still in German, such as 'V60 auf die Waage stellen, Filter einsetzen und spülen.', never translated to English ('Place and tare the brewer, insert and rinse the filter.').",
+    "warnings is diagnostic parser commentary, not recipe content, so it may be written in English regardless of the source language; mixed-language warnings (English warnings alongside a non-English recipe) are expected and acceptable.",
     "All temperatures must be normalized to Celsius.",
     "If the source text used Fahrenheit, convert it to Celsius before returning JSON.",
     "Temperature fields must be bare JSON numbers only, never strings, never include units like C, F, °C, or °F.",
@@ -1647,17 +2373,14 @@ function buildNormalizationSystemPrompt(mode: RecipeDraftParserMode): string {
     "duration_seconds is the interval until the next action or completion of that step, not an elapsed timestamp label such as 0:45 or 1:30.",
   ];
 
-  const cumulativeHint = mode === "verify"
-    ? []
-    : [
-      "For multi-pour brew steps, prefer cumulative water totals after the first pour, e.g. 'pour up to 200g' rather than 'pour another 100g'.",
-    ];
+  const cumulativeHint = mode === "verify" ? [] : [
+    "For multi-pour brew steps, prefer cumulative water totals after the first pour, e.g. 'pour up to 200g' rather than 'pour another 100g'.",
+  ];
 
   const placeholderRules = [
-    "Use only these scalable quantity placeholders when helpful:",
-    "(1 x <final_coffee_amount>)g",
-    "(0.2 x <final_water_amount>)g",
-    "(0.2 x <final_water_amount>)ml",
+    "Scalable quantity placeholders use exactly these two base names, and no others: <final_coffee_amount> and <final_water_amount>. An expression takes the form (M x <final_coffee_amount>)g or (M x <final_water_amount>)g/ml.",
+    "M is never a fixed value copied from an example. It is a multiplier YOU compute for this specific amount, always as amount ÷ base: the numeric quantity this step actually states, divided by the recipe's final coffee_amount_grams or water_amount — whichever one the placeholder names.",
+    "Worked example: (1 x <final_coffee_amount>)g illustrates the coffee case for a step whose stated amount equals the full dose, so M is 1 there. (0.2 x <final_water_amount>)g illustrates the water case only for a step whose stated amount happens to equal one-fifth of the final water amount — the 0.2 is that one step's own computed result, not a reusable constant. A different step, e.g. a bloom stated as 40 g against a 300 g final water_amount, must compute its OWN M as 40 ÷ 300 = 0.133333, giving (0.133333 x <final_water_amount>)g — copying the illustration's 0.2 onto that step would be wrong, even though 0.2 appears in these instructions.",
     "The multiplier must always be numeric, never a symbol or variable like N.",
     "Never nest scalable expressions; use either a plain numeric amount or one complete expression like (1 x <final_coffee_amount>)g.",
     "If a quantity scales with recipe coffee or water, do not leave it as a fixed literal number in description_template.",
@@ -1667,12 +2390,34 @@ function buildNormalizationSystemPrompt(mode: RecipeDraftParserMode): string {
     "Preserve concrete amounts and units in meaning even when converting to expressions.",
   ];
 
+  const timingCarryRules = [
+    "Each extracted step carries elapsed_seconds, starts_timer, and duration_is_stated. Carry all three through onto whichever normalized step corresponds to that original action, even if you split one extracted step into several normalized steps or merge several extracted steps into one.",
+    "elapsed_seconds is an elapsed timestamp from timer start, not a duration; never compute or invent it, only carry forward the value already present on the source step it came from.",
+    "starts_timer must stay true on only the single normalized step that starts the timer or begins the first pour, and false on every other step.",
+    "duration_is_stated must stay true only when the source text explicitly gave a duration for that step; never set it true because you inferred or estimated a duration_seconds value yourself.",
+    "Each extracted step also carries scalable_amounts. Carry it through onto whichever normalized step corresponds to that original action, splitting or merging the list along with the step. scalable_amounts must list ONLY amounts that are genuine coffee or water quantities this recipe's own brew uses — never equipment capacities, product specifications, paper or filter weights, ratios quoted as an aside, comparisons to other recipes, or numbers in commentary. Only convert a fixed numeric amount into a scalable expression in description_template when it is listed in that step's scalable_amounts.",
+    "Each extracted step also carries step_role, labelling what that step DOES independent of the language it is written in: 'preparation' (setup before brewing starts), 'bloom' (the initial wetting pour), 'pour' (any subsequent water addition), 'stir' (stir/swirl/agitate with no water added), 'drawdown' (waiting for the bed to drain after the last pour), or 'serve' (decanting, straining, or serving). Carry it through onto whichever normalized step corresponds to that original action, splitting or merging steps as needed; if you split or merge a step, assign step_role yourself so it still correctly describes the resulting step's function. Example: a German 'Vollständig durchlaufen lassen.' (let it drain completely) is step_role 'drawdown', exactly like an English 'Let it fully draw down.'",
+  ];
+
+  // G22: extracted_amounts is a TOP-LEVEL array (a sibling of steps), not
+  // nested inside each step, because every record already carries its own
+  // step_index. Carrying it correctly means re-pointing step_index values
+  // when a step is split or merged, not just copying the array unchanged.
+  const provenanceCarryRules = [
+    "The extraction stage also produced extracted_amounts, a top-level array of provenance records (NOT nested inside individual steps): { value, unit, step_index, provenance, source_quote, rule, rule_source_quote, rule_inputs }. Carry every record through into your own extracted_amounts array.",
+    "If you split one extracted step into several normalized steps, or merge several extracted steps into one, update each carried record's step_index so it still points at the correct normalized step (0-based index into your own steps array, or -1 for a recipe-level amount). Do not leave a record pointing at a step that no longer corresponds to where its amount actually appears.",
+    "Do not invent new extracted_amounts records for amounts the extraction stage did not already record, and do not change a carried record's value, unit, provenance, source_quote, rule, rule_source_quote, or rule_inputs — only step_index may need to change, and only to correct for a split or merge.",
+    ...AMOUNT_PROVENANCE_PROMPT_RULES,
+  ];
+
   return [
     ...baseRules,
     ...descriptionRules,
     ...structuralRules,
     ...cumulativeHint,
     ...placeholderRules,
+    ...timingCarryRules,
+    ...provenanceCarryRules,
   ].join(" ");
 }
 
@@ -1705,6 +2450,24 @@ function buildNormalizationUserPrompt(input: {
             description_source: "string",
             description_template: "string",
             duration_seconds: "number",
+            elapsed_seconds: "number|null",
+            starts_timer: "boolean",
+            duration_is_stated: "boolean",
+            scalable_amounts: [{ value: "number", unit: "string" }],
+            step_role: "preparation|bloom|pour|stir|drawdown|serve|null",
+          },
+        ],
+        extracted_amounts: [
+          {
+            value: "number",
+            unit: "string",
+            step_index: "number (0-based, or -1 for a recipe-level amount)",
+            provenance: "literal|derived|inferred",
+            source_quote: "string|null",
+            rule:
+              "multiple_of_coffee|multiple_of_water|ratio_of_total|concentration|concentration_water_from_coffee|range_endpoint|cumulative_sum|null",
+            rule_source_quote: "string|null",
+            rule_inputs: "object of numeric operands, or null",
           },
         ],
       },
@@ -1727,16 +2490,22 @@ function buildRepairSystemPrompt(mode: RecipeDraftParserMode): string {
     "You repair incomplete normalized coffee recipes for Timer.Coffee user recipes.",
     "Return only valid JSON.",
     "You must return the same normalized JSON shape as the normalization stage.",
-    "Re-read the original source text carefully and fill required fields that were missed.",
+    "Re-read the original source text carefully and fill in only these fields when they were missed: localization.name, localization.grind_size, localization.short_description, recipe.water_temp. These may be reasonably inferred from the brewing method or general context.",
     "Keep already-correct values stable unless they clearly contradict the source text.",
-    "Storage locale is always 'en', but do not translate source text.",
+    "CRITICAL: description_source, description_template, localization.name, localization.grind_size, and localization.short_description must be written in the SAME LANGUAGE as the source recipe text. Translating any of these into a different language — including translating them into English when the source is not English — is an error, not a stylistic choice or a cleanup step.",
+    "Every recipe you process is stored under the database locale value 'en', regardless of what language its text is written in. That 'en' is metadata about the storage row, set by application code, not by you — it is NOT an instruction to write English and is not a signal about what language the source is in. Do not let it influence what language you write in.",
+    "Worked example: for a German source, description_source and description_template must both stay in German — e.g. a German source step 'V60 auf die Waage stellen, Filter einsetzen und spülen.' must produce description_template text still in German, such as 'V60 auf die Waage stellen, Filter einsetzen und spülen.', never translated to English ('Place and tare the brewer, insert and rinse the filter.').",
+    "warnings is diagnostic parser commentary, not recipe content, so it may be written in English regardless of the source language; mixed-language warnings (English warnings alongside a non-English recipe) are expected and acceptable.",
     "All temperatures must be normalized to Celsius.",
     "If the source text used Fahrenheit, convert it to Celsius before returning JSON.",
     "Temperature fields must be bare JSON numbers only, never strings, never include units like C, F, °C, or °F.",
     "If any step description mentions temperature, normalize that mention to Celsius too.",
-    "If recipe.water_temp is not mentioned in the source text, infer a sensible default from the brewing method: use 93 for most filter methods (pour-over, drip, Aeropress, Chemex, Moka), 96 for espresso, 100 for French press or immersion, 93 as a safe fallback for any other method.",
+    "If recipe.water_temp is not mentioned in the source text, infer a sensible default from the brewing method: use 93 for most filter methods (pour-over, drip, Aeropress, Chemex, Moka), 96 for espresso, 100 for French press or hot immersion, 93 as a safe fallback for any other method.",
+    "Exception to the water_temp default above: if the source text explicitly indicates cold, iced, or room-temperature water, or the brewing method is cold brew, do NOT apply a hot-method default (not 93, not 96, not 100). Cold brew is a form of immersion but is not HOT immersion, so the 'French press or hot immersion' rule above must not fire for it. In this case, return null for recipe.water_temp instead of guessing a temperature — a correct null is far better than a confidently wrong hot number, and null here is a reviewable outcome, not an error.",
     "If localization.grind_size is not mentioned in the source text, infer from the brewing method: 'fine' for espresso or Moka, 'medium-fine' for pour-over or V60, 'medium' for drip or Aeropress, 'coarse' for French press or cold brew, 'medium' as a safe fallback for any other method.",
-    "Never return null for recipe.water_temp or localization.grind_size — always provide an inferred value if the source text is silent.",
+    "Never return null for recipe.water_temp or localization.grind_size — always provide an inferred value if the source text is silent — EXCEPT the cold/iced/room-temperature/cold-brew case above, where recipe.water_temp must stay null rather than default to a hot temperature.",
+    "recipe.coffee_amount, recipe.water_amount, and recipe.brewing_method_id must come only from what the source text explicitly states. Never invent, estimate, or default these three fields, even when the brewing method makes a typical value obvious.",
+    "If the source text does not state a coffee amount, water amount, or brewing method, return null for that specific field. Returning null for these three fields is correct and expected when the source is silent — do not treat it as an error to fix.",
     "short_description must be one concise recipe-level sentence, not a mini step list.",
     "Keep setup details, hardware modifications, filter prep, rinsing, and accessory instructions in the preparation step, not short_description.",
   ];
@@ -1762,21 +2531,33 @@ function buildRepairSystemPrompt(mode: RecipeDraftParserMode): string {
     "duration_seconds is the interval until the next action or completion of that step, not an elapsed timestamp label such as 0:45 or 1:30.",
   ];
 
-  const cumulativeHint = mode === "verify"
-    ? []
-    : [
-      "For multi-pour brew steps, prefer cumulative water totals after the first pour, e.g. 'pour up to 200g' rather than 'pour another 100g'.",
-    ];
+  const cumulativeHint = mode === "verify" ? [] : [
+    "For multi-pour brew steps, prefer cumulative water totals after the first pour, e.g. 'pour up to 200g' rather than 'pour another 100g'.",
+  ];
 
   const placeholderRules = [
-    "Use only these scalable quantity placeholders when helpful:",
-    "(1 x <final_coffee_amount>)g",
-    "(0.2 x <final_water_amount>)g",
-    "(0.2 x <final_water_amount>)ml",
+    "Scalable quantity placeholders use exactly these two base names, and no others: <final_coffee_amount> and <final_water_amount>. An expression takes the form (M x <final_coffee_amount>)g or (M x <final_water_amount>)g/ml.",
+    "M is never a fixed value copied from an example. It is a multiplier YOU compute for this specific amount, always as amount ÷ base: the numeric quantity this step actually states, divided by the recipe's final coffee_amount_grams or water_amount — whichever one the placeholder names.",
+    "Worked example: (1 x <final_coffee_amount>)g illustrates the coffee case for a step whose stated amount equals the full dose, so M is 1 there. (0.2 x <final_water_amount>)g illustrates the water case only for a step whose stated amount happens to equal one-fifth of the final water amount — the 0.2 is that one step's own computed result, not a reusable constant. A different step, e.g. a bloom stated as 40 g against a 300 g final water_amount, must compute its OWN M as 40 ÷ 300 = 0.133333, giving (0.133333 x <final_water_amount>)g — copying the illustration's 0.2 onto that step would be wrong, even though 0.2 appears in these instructions.",
     "The multiplier must always be numeric, never a symbol or variable like N.",
     "Never nest scalable expressions; use either a plain numeric amount or one complete expression like (1 x <final_coffee_amount>)g.",
     "Never emit <t1>..<t8> or any other time placeholder.",
     "brewing_method_id must be exactly one of the allowed ids or null, never a display label.",
+  ];
+
+  const timingCarryRules = [
+    "Each normalized step carries elapsed_seconds, starts_timer, and duration_is_stated from the extraction stage. Keep already-correct values stable and carry them onto whichever step corresponds to the original action, splitting or merging steps as needed.",
+    "elapsed_seconds is an elapsed timestamp from timer start, not a duration; never compute or invent it, only carry forward the value already present.",
+    "starts_timer must stay true on only the single step that starts the timer or begins the first pour, and false on every other step.",
+    "duration_is_stated must stay true only when the source text explicitly gave a duration for that step; never set it true because you inferred or estimated a duration_seconds value yourself.",
+    "Each normalized step also carries scalable_amounts from the extraction stage. Keep already-correct values stable and carry them onto whichever step corresponds to the original action. scalable_amounts must list ONLY amounts that are genuine coffee or water quantities this recipe's own brew uses — never equipment capacities, product specifications, paper or filter weights, ratios quoted as an aside, comparisons to other recipes, or numbers in commentary.",
+    "Each normalized step also carries step_role from the extraction stage — one of preparation, bloom, pour, stir, drawdown, or serve, labelling what that step DOES independent of the language it is written in (e.g. a German 'Vollständig durchlaufen lassen.' is step_role 'drawdown', exactly like an English 'Let it fully draw down.'). Keep already-correct values stable and carry them onto whichever step corresponds to the original action.",
+  ];
+
+  const provenanceCarryRules = [
+    "The current normalized JSON also carries extracted_amounts, a top-level array of provenance records (NOT nested inside individual steps): { value, unit, step_index, provenance, source_quote, rule, rule_source_quote, rule_inputs }. Carry every record through into your own extracted_amounts array unchanged, including when you only repaired other fields.",
+    "If repairing requires you to split or merge a step, update each affected record's step_index so it still points at the correct step (0-based index into your own steps array, or -1 for a recipe-level amount). Otherwise leave every record exactly as given — repair never invents, drops, or edits an extracted_amounts record's value, unit, provenance, source_quote, rule, rule_source_quote, or rule_inputs.",
+    ...AMOUNT_PROVENANCE_PROMPT_RULES,
   ];
 
   return [
@@ -1785,6 +2566,8 @@ function buildRepairSystemPrompt(mode: RecipeDraftParserMode): string {
     ...structuralRules,
     ...cumulativeHint,
     ...placeholderRules,
+    ...timingCarryRules,
+    ...provenanceCarryRules,
   ].join(" ");
 }
 
@@ -1821,7 +2604,7 @@ function buildCumulativeRewriteSystemPrompt(
     "You rewrite coffee recipe brew-step wording for Timer.Coffee.",
     "Return only valid JSON.",
     "Preserve the original language of the step descriptions. Do not translate.",
-    "Keep step count, step order, kind, duration_seconds, and description_source unchanged.",
+    "Keep step count, step order, kind, duration_seconds, description_source, elapsed_seconds, starts_timer, duration_is_stated, scalable_amounts, and step_role unchanged.",
     "Only rewrite brew-step description_template fields when needed.",
   ];
 
@@ -1869,6 +2652,11 @@ function buildCumulativeRewriteUserPrompt(input: {
             description_source: "string",
             description_template: "string",
             duration_seconds: "number",
+            elapsed_seconds: "number|null",
+            starts_timer: "boolean",
+            duration_is_stated: "boolean",
+            scalable_amounts: [{ value: "number", unit: "string" }],
+            step_role: "preparation|bloom|pour|stir|drawdown|serve|null",
           },
         ],
       },
@@ -1958,76 +2746,14 @@ function normalizeTemplateTextPolish(template: string): string {
     .trim();
 }
 
-function simplifyVerboseChemexPreparation(template: string): string {
-  const normalized = normalizeKeywordText(template);
-  if (
-    !normalized.includes("6 cup chemex") ||
-    !normalized.includes("trifold") ||
-    !normalized.includes("level coffee bed")
-  ) {
-    return template;
-  }
-
-  const coffeeExpression = template.match(
-    cloneRegex(EXPRESSION_REGEX),
-  )?.[0] ?? "coffee";
-  const tempMatch = template.match(/\bheat water to (\d+(?:\.\d+)?)C\b/i);
-  const heatClause = tempMatch
-    ? `heat water to ${tempMatch[1]}C`
-    : "heat water";
-
-  return `Prepare a 6 cup Chemex with a Chemex filter, ${heatClause}, place and rinse the filter with the trifold facing the spout, grind ${coffeeExpression} coffee medium coarse, level the bed, and tare the scale.`;
-}
-
-function simplifyVerboseBrewTemplate(template: string): string {
-  const waterExpression = template.match(cloneRegex(EXPRESSION_REGEX))?.[0] ??
-    null;
-  if (!waterExpression) {
-    return template;
-  }
-
-  const normalized = normalizeKeywordText(template);
-  if (
-    normalized.includes("first pour") &&
-    normalized.includes("coffee is completely saturated")
-  ) {
-    return `Start the timer and pour up to ${waterExpression}, spiraling from the center out and back.`;
-  }
-
-  if (
-    normalized.includes("second pour") &&
-    normalized.includes("avoid") &&
-    normalized.includes("filter")
-  ) {
-    return `Pour up to ${waterExpression} using the same spiral pattern, avoiding the filter, and let it drain almost completely.`;
-  }
-
-  if (
-    normalized.includes("third pour") &&
-    normalized.includes("same pouring pattern")
-  ) {
-    return `Pour up to ${waterExpression} using the same pouring pattern, then pause and let it drain.`;
-  }
-
-  if (
-    normalized.includes("fourth and final pour") ||
-    normalized.includes("final pour")
-  ) {
-    return `Pour up to ${waterExpression} with a consistent pour pattern.`;
-  }
-
-  return template;
-}
-
-function simplifyVerboseStepTemplate(args: {
-  template: string;
-  kind: "preparation" | "brew";
-}): string {
-  return args.kind === "preparation"
-    ? simplifyVerboseChemexPreparation(args.template)
-    : simplifyVerboseBrewTemplate(args.template);
-}
-
+// F2: simplifyVerboseChemexPreparation, simplifyVerboseBrewTemplate, and
+// simplifyVerboseStepTemplate used to live here. They were tuned on one
+// specific Chemex transcript and fired on ANY step whose text contained a
+// trigger phrase (e.g. "final pour") plus a water expression, discarding
+// everything else in the step — including real technique detail like
+// temperature and pour pattern. Deleted rather than fixed: conciseness is
+// the normalization prompt's job, not a hand-tuned regex's. Do not
+// reintroduce canned per-phrase rewrites here.
 function normalizeCumulativeWaterWording(template: string): string {
   return template
     .replace(/\bpour\s+to\s+/gi, "pour up to ")
@@ -2080,14 +2806,24 @@ function replaceFirstWaterExpression(
   );
 }
 
+// F3: rewrites the quantifier phrase in front of a water expression to
+// cumulative "pour up to" wording, along with swapping in the cumulative
+// amount. Returns rewritten:false when no recognized quantifier pattern
+// matched, so the caller can refuse to apply the cumulative amount rather
+// than leave a stale quantifier (e.g. "the remaining") next to a total it
+// no longer describes — the F3 bug was exactly this: "remaining 200g" was
+// renumbered to the recipe's 400g total while the word "remaining" (which
+// only makes sense for the incremental 200g) survived untouched.
 function rewriteWaterPhraseToCumulative(
   template: string,
   expression: string,
-): string {
+): { template: string; rewritten: boolean } {
   const escapedExpression = escapeRegExp(expression);
+  const quantifierGroup =
+    "(?:another|a\\s+further|the\\s+remaining|the\\s+rest\\s+of|the\\s+final|final)\\s+";
   const phrasePatterns = [
     new RegExp(
-      `\\b(?:pour|add)\\s+(?:another\\s+|the\\s+final\\s+|final\\s+)?${escapedExpression}(\\s+of\\s+water)?`,
+      `\\b(?:pour|add)\\s+(?:${quantifierGroup})?${escapedExpression}(\\s+of\\s+water)?`,
       "i",
     ),
     new RegExp(
@@ -2098,14 +2834,17 @@ function rewriteWaterPhraseToCumulative(
 
   for (const pattern of phrasePatterns) {
     if (pattern.test(template)) {
-      return template.replace(
-        pattern,
-        (_, waterSuffix = "") => `pour up to ${expression}${waterSuffix}`,
-      );
+      return {
+        template: template.replace(
+          pattern,
+          (_, waterSuffix = "") => `pour up to ${expression}${waterSuffix}`,
+        ),
+        rewritten: true,
+      };
     }
   }
 
-  return template;
+  return { template, rewritten: false };
 }
 
 function extractExpressions(
@@ -2222,15 +2961,14 @@ function normalizeStepDescriptionTemplate(args: {
       stepKind: args.step.kind,
       coffeeAmount: args.coffeeAmount,
       waterAmount: args.waterAmount,
+      scalableAmounts: args.step.scalable_amounts,
+      stepRole: args.step.step_role,
     });
 
     return normalizeTemplateTextPolish(
-      simplifyVerboseStepTemplate({
-        template: normalizeCumulativeWaterWording(
-          normalizeLeadingTimestampLabel(normalizedTemplate),
-        ),
-        kind: args.step.kind,
-      }),
+      normalizeCumulativeWaterWording(
+        normalizeLeadingTimestampLabel(normalizedTemplate),
+      ),
     );
   };
 
@@ -2268,6 +3006,11 @@ function buildDraftSteps(input: {
         input.waterAmount,
       ),
       duration_seconds: step.duration_seconds,
+      elapsed_seconds: step.elapsed_seconds,
+      starts_timer: step.starts_timer,
+      duration_is_stated: step.duration_is_stated,
+      scalable_amounts: step.scalable_amounts,
+      step_role: step.step_role,
       expressions: extractExpressions(
         normalizedTemplate,
         input.coffeeAmount,
@@ -2277,19 +3020,116 @@ function buildDraftSteps(input: {
   });
 }
 
+function endsWithSentenceTerminator(text: string): boolean {
+  return /[.!?]\s*$/.test(text);
+}
+
+function joinFoldedStepText(parts: string[]): string {
+  return parts.reduce((accumulated, part) => {
+    const trimmedPart = part.trim();
+    if (!trimmedPart) {
+      return accumulated;
+    }
+    if (!accumulated) {
+      return trimmedPart;
+    }
+    const separator = endsWithSentenceTerminator(accumulated) ? " " : ". ";
+    return `${accumulated}${separator}${trimmedPart}`;
+  }, "");
+}
+
+// The Flutter app renders exactly one untimed step (steps[0], duration 0,
+// shown as "preparation") — there is no timer-start marker. Some recipes
+// perform real actions (filling the dripper, adding coffee) BEFORE the
+// timer starts; if those land as timed brew steps, the app's on-screen
+// timer drifts ahead of the source recipe's own clock. Fold any such
+// pre-timer actions into the preparation step instead of timing them.
+function foldPreTimerStepsIntoPreparation(
+  input: {
+    steps: DraftStep[];
+    // verify-user-recipe-draft's handler hard-502s the app the moment the
+    // parser's step count diverges from the request's (see
+    // verify-user-recipe-draft/handler.ts), and folding removes steps — so
+    // verify mode must skip this pass outright, warning included, rather
+    // than merely running it "safely".
+    preserveStepCount: boolean;
+  },
+): { steps: DraftStep[]; warnings: string[] } {
+  if (input.preserveStepCount) {
+    return { steps: input.steps, warnings: [] };
+  }
+
+  const startsTimerIndex = input.steps.findIndex((step) =>
+    step.kind === "brew" && startsTimerLikeStep(step)
+  );
+
+  // No timer-start marker found, or it's already the first brew step (index
+  // <= 1) — nothing to fold. This is the common case, so keep blast radius
+  // small.
+  if (startsTimerIndex === -1 || startsTimerIndex <= 1) {
+    return { steps: input.steps, warnings: [] };
+  }
+
+  const preparationStep = input.steps[0];
+  const foldedSteps = input.steps.slice(1, startsTimerIndex);
+
+  const mergedPreparationStep: DraftStep = {
+    ...preparationStep,
+    description_source: joinFoldedStepText([
+      preparationStep.description_source,
+      ...foldedSteps.map((step) => step.description_source),
+    ]),
+    description_template: joinFoldedStepText([
+      preparationStep.description_template,
+      ...foldedSteps.map((step) => step.description_template),
+    ]),
+  };
+
+  const remainingSteps = [
+    mergedPreparationStep,
+    ...input.steps.slice(startsTimerIndex),
+  ].map((step, index) => ({
+    ...step,
+    step_order: index + 1,
+  }));
+
+  return {
+    steps: remainingSteps,
+    warnings: [
+      "Pre-timer actions were folded into the preparation step.",
+    ],
+  };
+}
+
 function convertWaterStepsToRunningTotals(input: {
   steps: DraftStep[];
   coffeeAmount: number | null;
   waterAmount: number | null;
-}): DraftStep[] {
+}): { steps: DraftStep[]; warnings: string[] } {
   if (input.waterAmount === null || input.waterAmount <= 0) {
-    return input.steps;
+    return { steps: input.steps, warnings: [] };
   }
 
   const finalWaterAmount = input.waterAmount;
-  let runningWaterAmount = 0;
+  // Pre-timer preparation actions (e.g. filling the dripper before starting
+  // the timer) can get folded into the preparation step by
+  // foldPreTimerStepsIntoPreparation. That step is never walked below since
+  // this loop only touches kind === "brew" steps, so seed the running total
+  // from any water expression already present in the preparation step —
+  // otherwise water poured during a folded preparation step would be
+  // excluded from the running total and later cumulative pours would be
+  // understated.
+  const preparationStep = input.steps[0];
+  const preparationWaterExpression = preparationStep?.kind === "preparation"
+    ? preparationStep.expressions.find((expression) =>
+      expression.placeholder === "<final_water_amount>" &&
+      expression.preview_value !== null
+    )
+    : undefined;
+  let runningWaterAmount = preparationWaterExpression?.preview_value ?? 0;
+  const warnings: string[] = [];
 
-  return input.steps.map((step) => {
+  const steps = input.steps.map((step) => {
     if (step.kind !== "brew") {
       return step;
     }
@@ -2319,7 +3159,7 @@ function convertWaterStepsToRunningTotals(input: {
     const cumulativeExpression = `(${
       formatMultiplier(nextRunningTotal / finalWaterAmount)
     } x <final_water_amount>)${waterExpression.unit}`;
-    const rewrittenTemplate = rewriteWaterPhraseToCumulative(
+    const phraseRewrite = rewriteWaterPhraseToCumulative(
       replaceFirstWaterExpression(
         step.description_template,
         cumulativeExpression,
@@ -2327,23 +3167,42 @@ function convertWaterStepsToRunningTotals(input: {
       cumulativeExpression,
     );
 
+    // The physical running total is correct regardless of whether this
+    // step's own wording could be rewritten, so later steps' cumulative
+    // math must still account for the water this step adds.
     runningWaterAmount = nextRunningTotal;
+
+    if (!phraseRewrite.rewritten) {
+      // F3: no recognized quantifier phrase (pour/add [another|the
+      // remaining|the rest of|a further|the final] <amount>) was found.
+      // Renumbering the amount to the cumulative total while leaving
+      // unrecognized wording in place (e.g. "the remaining 200g" next to
+      // a computed 400g) would produce a self-contradicting sentence.
+      // Skip the cumulative rewrite for this step and keep its own
+      // incremental amount and wording untouched instead.
+      warnings.push(
+        "Cumulative water wording could not be safely rewritten for a brew step; the incremental amount was kept instead.",
+      );
+      return step;
+    }
 
     return {
       ...step,
-      description_template: rewrittenTemplate,
+      description_template: phraseRewrite.template,
       preview_text: renderPreviewText(
-        rewrittenTemplate,
+        phraseRewrite.template,
         input.coffeeAmount,
         input.waterAmount,
       ),
       expressions: extractExpressions(
-        rewrittenTemplate,
+        phraseRewrite.template,
         input.coffeeAmount,
         input.waterAmount,
       ),
     };
   });
+
+  return { steps, warnings };
 }
 
 function enforceMinimumStepDurations(input: {
@@ -2529,6 +3388,22 @@ function parseClockDurationSeconds(text: string): number | null {
     : first * 3600 + second * 60 + third;
 }
 
+// F28/F10-follow-up: ENGLISH-ONLY FALLBACK. This mines a total brew time
+// out of narrowedText purely by matching English trigger words ("brew
+// time", "done", "complete", "drawdown", ...). It is a deliberate,
+// permanent limitation — do NOT try to internationalize these regexes by
+// adding translated keyword lists; that path never ends (every language,
+// every label variant, every phrasing). Semantic judgements like "is this
+// sentence a stated total brew time" belong to the LLM extraction stage,
+// which is multilingual by construction — see the extraction system
+// prompt's total_brew_time_seconds guidance. This function only exists to
+// catch cases where the extraction stage's own field came back null for
+// an ENGLISH source; for non-English sources where extraction returns
+// null, resolveTotalBrewTimeTargetSeconds below still calls this (it does
+// no harm — it simply won't match anything in another language), but the
+// caller is responsible for warning the operator that the fallback could
+// not help. See the "non-English recipe with no extracted total brew
+// time" warning built in finalizeDraftResponse.
 function parseTotalBrewTimeTargetSeconds(text: string): number | null {
   const candidates: number[] = [];
   const sentences = normalizeKeywordText(text).split(/(?<=[.!?])\s+/);
@@ -2583,6 +3458,13 @@ function parseStepElapsedTimestampSeconds(text: string): number | null {
 }
 
 function startsTimerLikeStep(step: DraftStep): boolean {
+  // Prefer the LLM-reported signal — it can recognize phrasings (e.g.
+  // "start the timer") that the regex below, kept only as a fallback for
+  // steps without the field, does not cover.
+  if (step.starts_timer) {
+    return true;
+  }
+
   const normalized = normalizeKeywordText(
     `${step.description_source} ${step.description_template}`,
   );
@@ -2591,40 +3473,35 @@ function startsTimerLikeStep(step: DraftStep): boolean {
 }
 
 function isDrawdownLikeStep(step: DraftStep): boolean {
-  const normalized = normalizeKeywordText(
-    `${step.description_source} ${step.description_template}`,
-  );
-  return /\b(?:draw\s*down|drawdown|drain|serve)\b/i.test(normalized);
-}
-
-function isVaguePourLikeStep(step: DraftStep): boolean {
-  const normalized = normalizeKeywordText(
-    `${step.description_source} ${step.description_template}`,
-  );
-  return /\b(?:similar\s+pouring\s+technique|pouring\s+technique|pouring\s+in\s+phases|continue\s+pouring|main\s+pour|final\s+pour|pour\s+up\s+to|reach\s+.+\btotal\s+water|until\s+you\s+reach)\b/i
-    .test(normalized);
-}
-
-function hasSourceDrawdownCue(text: string): boolean {
-  return /\b(?:draw\s*down|drawdown|dripping|drip\s+through|finish(?:es|ed)?\s+brewing|complete)\b/i
-    .test(normalizeKeywordText(text));
-}
-
-function inferVaguePourDurationSeconds(input: {
-  brewingMethodId: string | null;
-  sourceText: string;
-  waterAmount: number | null;
-}): number {
-  const normalizedSource = normalizeKeywordText(input.sourceText);
-  const isChemex = input.brewingMethodId === "chemex" ||
-    /\b(?:chemex|chemx|chemicx|chimics|kamex)\b/i.test(normalizedSource);
-  if (isChemex && (input.waterAmount ?? 0) >= 450) {
-    return LARGE_CHEMEX_VAGUE_POUR_DURATION_SECONDS;
+  // Phase C3 (F29): read the extraction-labelled role first. It identifies
+  // what the step DOES independent of the language it's written in, so a
+  // German "Vollständig durchlaufen lassen." (let it drain completely) is
+  // recognized just as reliably as an English "let it draw down" — no
+  // regex to internationalize. Only when the model left step_role null
+  // (it's nullable/defaulted so omitting it can't fail the stage) do we
+  // fall back to the regex below.
+  if (step.step_role !== null) {
+    return step.step_role === "drawdown";
   }
 
-  return DEFAULT_VAGUE_POUR_DURATION_SECONDS;
+  // ENGLISH-ONLY FALLBACK, used only for steps without a step_role label.
+  // Recognizes "draw down"/"drawdown" plus the inflected forms "drawing
+  // down" and "draws down" (F28) — a recipe ending on "let it finish
+  // drawing down" must match just as reliably as one ending on "let it
+  // draw down". Do not internationalize this regex — see F29: that path
+  // does not end. Label a step with step_role instead.
+  const normalized = normalizeKeywordText(
+    `${step.description_source} ${step.description_template}`,
+  );
+  return /\b(?:draw(?:s|ing)?\s*down|drawdown|drain|serve)\b/i.test(
+    normalized,
+  );
 }
 
+// F28/F10-follow-up: ENGLISH-ONLY FALLBACK, same rationale as
+// parseTotalBrewTimeTargetSeconds above — do not internationalize this
+// regex either. It only ever matches English completion phrasing
+// ("finished", "done", "complete", "dripping", "draw down"/"drawdown").
 function parseCompletionTargetSeconds(text: string): number | null {
   const sentences = text.split(/(?<=[.!?])\s+/);
   const candidates = sentences
@@ -2638,134 +3515,398 @@ function parseCompletionTargetSeconds(text: string): number | null {
   return candidates.length > 0 ? Math.max(...candidates) : null;
 }
 
-function normalizeVagueBrewDurationsFromTotalTarget(input: {
-  steps: DraftStep[];
-  sourceText: string;
-  brewingMethodId: string | null;
-  waterAmount: number | null;
-}): { steps: DraftStep[]; warnings: string[] } {
-  const completionTarget = parseCompletionTargetSeconds(input.sourceText);
-  const totalBrewTarget = parseTotalBrewTimeTargetSeconds(input.sourceText);
-  const targetSeconds = Math.max(completionTarget ?? 0, totalBrewTarget ?? 0);
-  if (targetSeconds <= 0) {
-    return { steps: input.steps, warnings: [] };
+// Single source of truth for "how long should this recipe's total brew
+// take". Prefers the extraction stage's explicit total_brew_time_seconds
+// (the LLM reads the whole transcript and is multilingual, so it can tell
+// a stated brew time — in any language — from commentary); only falls
+// back to mining it out of narrowedText — which is built solely from
+// extraction.preparation and each step's raw_text, never the full raw
+// transcript — when the extraction left it null. That regex fallback is
+// ENGLISH-ONLY (see parseTotalBrewTimeTargetSeconds/
+// parseCompletionTargetSeconds above), so for a non-English recipe whose
+// extraction came back null, this simply returns null too — see the
+// warning built in finalizeDraftResponse for surfacing that to the
+// operator rather than silently producing minimal step durations.
+function resolveTotalBrewTimeTargetSeconds(input: {
+  extractionTotalBrewTimeSeconds: number | null;
+  narrowedText: string;
+}): number | null {
+  if (input.extractionTotalBrewTimeSeconds !== null) {
+    return input.extractionTotalBrewTimeSeconds;
   }
 
-  const currentBrewTotal = input.steps
-    .filter((step) => step.kind === "brew")
-    .reduce((sum, step) => sum + step.duration_seconds, 0);
-  if (currentBrewTotal >= targetSeconds - MIN_BREW_STEP_DURATION_SECONDS) {
-    return { steps: input.steps, warnings: [] };
-  }
+  const completionTarget = parseCompletionTargetSeconds(input.narrowedText);
+  const totalBrewTarget = parseTotalBrewTimeTargetSeconds(input.narrowedText);
+  const target = Math.max(completionTarget ?? 0, totalBrewTarget ?? 0);
+  return target > 0 ? target : null;
+}
 
-  const inferredPourDuration = inferVaguePourDurationSeconds({
-    brewingMethodId: input.brewingMethodId,
-    sourceText: input.sourceText,
-    waterAmount: input.waterAmount,
+// Phase B2: a step's duration is ANCHORED — left completely alone by the
+// split below — when the source can be trusted for it. Everything else is
+// DERIVED, meaning no signal ties its duration to the source, so the value
+// currently sitting on it is just whatever a particular model run guessed
+// and must not survive into the final split.
+function isAnchoredBrewStep(step: DraftStep): boolean {
+  return step.duration_is_stated === true ||
+    step.elapsed_seconds !== null ||
+    // Defensive guard: this parser never itself infers a duration above the
+    // cap, so a duration that exceeds it cannot be one of our own guesses —
+    // it must have come from the source (e.g. an 18-hour cold brew steep).
+    step.duration_seconds > INFERRED_BREW_STEP_DURATION_CAP_SECONDS;
+}
+
+// A bloom's duration doesn't scale with how much water it adds — it's a
+// fixed nominal number of seconds, not a rate.
+const DERIVED_BLOOM_SECONDS = 45;
+// A derived step that adds no water and isn't the drawdown (stir, swirl,
+// serve) is a quick fixed action, not something that scales with volume.
+const DERIVED_STIR_SECONDS = 15;
+// Roughly how fast a controlled pour adds water. This is a seconds-per-gram
+// ESTIMATE, not a weight/scalar — it must stay in the same units (seconds)
+// as DERIVED_BLOOM_SECONDS and DERIVED_STIR_SECONDS so the three can be
+// compared and summed directly, unlike the abstract weights this replaced.
+const POUR_RATE_GRAMS_PER_SECOND = 8;
+
+function findWaterExpressionValue(step: DraftStep): number | null {
+  const waterExpression = step.expressions.find((expression) =>
+    expression.placeholder === "<final_water_amount>" &&
+    expression.preview_value !== null
+  );
+  return waterExpression?.preview_value ?? null;
+}
+
+function findCoffeeExpressionValue(step: DraftStep): number | null {
+  const coffeeExpression = step.expressions.find((expression) =>
+    expression.placeholder === "<final_coffee_amount>" &&
+    expression.preview_value !== null
+  );
+  return coffeeExpression?.preview_value ?? null;
+}
+
+// F31: recipes routinely phrase a bloom or pour as a multiple of the
+// coffee dose ("three times the dose, five times the dose, eight times
+// the dose") rather than a fraction of the final water amount. For a step
+// whose step_role marks it as one that adds water (bloom/pour), that
+// dose-based expression's preview_value IS the cumulative water figure —
+// just expressed relative to a different base — so it is a valid fallback
+// when no <final_water_amount> expression is present. The water
+// expression is still preferred when both are present: a pour step can
+// carry both the dose expression (from an aside like "roughly 3x your
+// dose on the way") and the water expression, and the water one is
+// authoritative. For any other/null step_role, only the water expression
+// counts — this preserves the fallback for models that omit step_role,
+// and prevents a stir/serve step that happens to mention the dose from
+// being counted as adding water.
+function resolveBrewStepCumulativeWaterAmount(step: DraftStep): number | null {
+  const waterValue = findWaterExpressionValue(step);
+  if (waterValue !== null) {
+    return waterValue;
+  }
+  if (step.step_role === "bloom" || step.step_role === "pour") {
+    return findCoffeeExpressionValue(step);
+  }
+  return null;
+}
+
+// Water added by each brew step, seeded from any <final_water_amount> (or,
+// per F31 above, dose-multiple <final_coffee_amount>) expression already
+// sitting on the preparation step (folded pre-timer pours) — mirrors the
+// running-total seed in convertWaterStepsToRunningTotals. By the time this
+// runs, convertWaterStepsToRunningTotals has already made every water
+// expression's preview_value a cumulative total, so the amount a given
+// step itself adds is just that cumulative value minus the previous one.
+// Non-brew steps and brew steps without a water signal return null (no
+// water signal for that step).
+function computeBrewStepWaterAddedAmounts(
+  steps: DraftStep[],
+): (number | null)[] {
+  const preparationStep = steps[0];
+  const preparationCumulativeWaterAmount = preparationStep?.kind ===
+      "preparation"
+    ? findWaterExpressionValue(preparationStep) ??
+      findCoffeeExpressionValue(preparationStep)
+    : null;
+  let previousCumulative = preparationCumulativeWaterAmount ?? 0;
+
+  return steps.map((step) => {
+    if (step.kind !== "brew") {
+      return null;
+    }
+
+    const cumulative = resolveBrewStepCumulativeWaterAmount(step);
+    if (cumulative === null) {
+      return null;
+    }
+
+    const added = Math.max(cumulative - previousCumulative, 0);
+    previousCumulative = Math.max(previousCumulative, cumulative);
+    return added;
   });
-  const vaguePourIndexes = input.steps
-    .map((step, index) => ({ step, index }))
-    .filter(({ step }) =>
-      step.kind === "brew" &&
-      !isDrawdownLikeStep(step) &&
-      isVaguePourLikeStep(step) &&
-      step.duration_seconds < inferredPourDuration
-    )
-    .map(({ index }) => index);
-  const drawdownIndexes = input.steps
-    .map((step, index) => ({ step, index }))
-    .filter(({ step }) =>
-      step.kind === "brew" &&
-      isDrawdownLikeStep(step) &&
-      step.duration_seconds <= DRAWDOWN_STEP_DURATION_SECONDS
-    )
-    .map(({ index }) => index);
+}
 
-  if (vaguePourIndexes.length === 0 && drawdownIndexes.length === 0) {
+// Index of the last brew step in the array, or -1 when there is none.
+// Deliberately avoids Array.prototype.findLastIndex for broad runtime
+// compatibility.
+function findLastBrewStepIndex(steps: DraftStep[]): number {
+  for (let index = steps.length - 1; index >= 0; index -= 1) {
+    if (steps[index].kind === "brew") {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function clampBrewStepDuration(value: number): number {
+  return Math.min(
+    Math.max(value, MIN_BREW_STEP_DURATION_SECONDS),
+    INFERRED_BREW_STEP_DURATION_CAP_SECONDS,
+  );
+}
+
+// Estimates a DERIVED, non-drawdown brew step's duration in SECONDS — never
+// an abstract weight. A bloom is a fixed pause; a pour scales with how much
+// water it itself adds at a plausible pour rate; anything else (stir,
+// swirl, serve) is a quick fixed action. Because all three branches return
+// seconds, they can be summed and compared directly.
+function estimateDerivedStepSeconds(input: {
+  isBloom: boolean;
+  waterAddedGrams: number | null;
+}): number {
+  if (input.isBloom) {
+    return DERIVED_BLOOM_SECONDS;
+  }
+  if (input.waterAddedGrams !== null && input.waterAddedGrams > 0) {
+    return Math.max(
+      MIN_BREW_STEP_DURATION_SECONDS,
+      Math.ceil(input.waterAddedGrams / POUR_RATE_GRAMS_PER_SECOND),
+    );
+  }
+  return DERIVED_STIR_SECONDS;
+}
+
+// Fallback only: spreads `available` seconds across `indexes` in proportion
+// to `weights`, flooring every share but the last and giving the last
+// whatever remains, then clamping each to [MIN, CAP]. Used only when the
+// primary "drawdown absorbs the remainder" model below can't keep every
+// derived step at or above the minimum.
+function allocateAvailableSecondsByWeight(
+  available: number,
+  indexes: number[],
+  weights: number[],
+): Map<number, number> {
+  const totalWeight = weights.reduce((sum, weight) => sum + weight, 0);
+  const allocation = new Map<number, number>();
+  let allocated = 0;
+
+  indexes.forEach((stepIndex, order) => {
+    const isLast = order === indexes.length - 1;
+    const rawShare = isLast
+      ? available - allocated
+      : Math.floor(available * (weights[order] / totalWeight));
+    allocated += rawShare;
+    allocation.set(stepIndex, clampBrewStepDuration(rawShare));
+  });
+
+  return allocation;
+}
+
+// Phase B2: replaces the old deficit-only redistribution. Phase B pinned
+// the recipe *total* to a stated target, but left the *split* between brew
+// steps at the mercy of whatever numbers a given model run happened to
+// guess for the steps the source never actually timed — three identical
+// transcripts could (and did, in production) come back with wildly
+// different per-step splits while still summing to the same total. This
+// pass makes the split itself deterministic: every step whose duration the
+// source did not actually state (DERIVED) has its duration recomputed
+// purely from the target total and the recipe's own water amounts/step
+// roles — never from the model's guess for that step.
+//
+// The model is physical, not an abstract weighted split: a bloom is a
+// fixed short pause, a pour takes roughly gramsAdded / pour-rate seconds,
+// a quick action (stir/swirl/serve) is a fixed short duration, and the
+// drawdown — which has no reliable estimate of its own — gets whatever
+// time is left over after the others are accounted for. On a Chemex or
+// V60 the drawdown is typically the *longest* derived step, not the
+// shortest, which is why it absorbs the remainder instead of competing
+// for a proportional share.
+function splitDerivedBrewStepDurationsFromTarget(input: {
+  steps: DraftStep[];
+  narrowedText: string;
+  extractionTotalBrewTimeSeconds: number | null;
+}): { steps: DraftStep[]; warnings: string[] } {
+  const targetSeconds = resolveTotalBrewTimeTargetSeconds({
+    extractionTotalBrewTimeSeconds: input.extractionTotalBrewTimeSeconds,
+    narrowedText: input.narrowedText,
+  });
+  if (targetSeconds === null || targetSeconds <= 0) {
     return { steps: input.steps, warnings: [] };
+  }
+
+  const brewSteps = input.steps
+    .map((step, index) => ({ step, index }))
+    .filter(({ step }) => step.kind === "brew");
+  if (brewSteps.length === 0) {
+    return { steps: input.steps, warnings: [] };
+  }
+
+  const waterAddedByIndex = computeBrewStepWaterAddedAmounts(input.steps);
+  // Phase C3 (F29): prefer the step explicitly labelled "bloom" — it
+  // identifies the bloom by what the step DOES, independent of language,
+  // and independent of whether a scalable water expression even landed on
+  // it. Only when no step carries that label do we fall back to the
+  // pre-C3 heuristic: the first brew step that adds any water at all is
+  // the bloom, whether or not it ends up anchored or derived.
+  const roleBloomIndex = brewSteps.find(({ step }) =>
+    step.step_role === "bloom"
+  )?.index;
+  const bloomIndex = roleBloomIndex ??
+    (brewSteps.find(({ index }) => (waterAddedByIndex[index] ?? 0) > 0)
+      ?.index ?? -1);
+
+  let anchoredTotal = 0;
+  const derivedIndexes: number[] = [];
+  for (const { step, index } of brewSteps) {
+    if (isAnchoredBrewStep(step)) {
+      anchoredTotal += step.duration_seconds;
+    } else {
+      derivedIndexes.push(index);
+    }
+  }
+
+  const available = targetSeconds - anchoredTotal;
+  if (
+    derivedIndexes.length === 0 ||
+    available < derivedIndexes.length * MIN_BREW_STEP_DURATION_SECONDS
+  ) {
+    // Either every brew step is already anchored (nothing to derive), or
+    // the anchored steps alone already leave no room to fit the derived
+    // ones above the minimum. Either way, manufacturing a split here would
+    // do more harm than good — leave the model's own values in place.
+    return { steps: input.steps, warnings: [] };
+  }
+
+  // The drawdown is whichever derived step reads as one; if none does,
+  // treat the last derived step as the drawdown (recipes very often end on
+  // an untimed "let it finish" beat even when the source never names it).
+  //
+  // Phase C3 (F29): isDrawdownLikeStep reads step_role === "drawdown"
+  // before ever falling back to its English-only regex, so a step's
+  // labelled role — not the language it happens to be written in —
+  // decides whether it reads as one here.
+  //
+  // F28: a step that itself adds water can never be the drawdown — a
+  // drawdown is by definition what happens after the last pour, so a POUR
+  // step whose wording happens to also mention "drain"/"drawdown" (e.g.
+  // "...avoid the filter walls, and let it drain almost completely") must
+  // never be selected here, even if it matches the regex, or is even
+  // mislabelled step_role "drawdown" by the model — a mislabel must not
+  // resurrect that bug. And when more than one eligible (non-water) step
+  // matches, the LAST one wins — recipes sometimes mention
+  // drawdown-adjacent wording earlier (e.g. in a pour step's aside) before
+  // the step that actually performs the drawdown.
+  const matchedDrawdownIndex = derivedIndexes
+    .filter((index) =>
+      (waterAddedByIndex[index] ?? 0) <= 0 &&
+      isDrawdownLikeStep(input.steps[index])
+    )
+    .at(-1);
+  const drawdownIndex = matchedDrawdownIndex ?? derivedIndexes.at(-1)!;
+  const otherDerivedIndexes = derivedIndexes.filter((index) =>
+    index !== drawdownIndex
+  );
+
+  const otherEstimates = otherDerivedIndexes.map((index) =>
+    clampBrewStepDuration(
+      estimateDerivedStepSeconds({
+        isBloom: index === bloomIndex,
+        waterAddedGrams: waterAddedByIndex[index],
+      }),
+    )
+  );
+  const sumOtherEstimates = otherEstimates.reduce(
+    (sum, estimate) => sum + estimate,
+    0,
+  );
+  const drawdownRemainder = available - sumOtherEstimates;
+
+  const finalDurations = new Map<number, number>();
+
+  if (drawdownRemainder >= MIN_BREW_STEP_DURATION_SECONDS) {
+    // Common case: the estimates for everything else fit comfortably, so
+    // the drawdown gets exactly what's left — the total lands on the
+    // target exactly whenever that remainder is also within the cap.
+    otherDerivedIndexes.forEach((index, order) => {
+      finalDurations.set(index, otherEstimates[order]);
+    });
+    finalDurations.set(
+      drawdownIndex,
+      Math.min(drawdownRemainder, INFERRED_BREW_STEP_DURATION_CAP_SECONDS),
+    );
+  } else {
+    // The non-drawdown estimates alone would leave the drawdown below the
+    // minimum. Scale them down proportionally until the drawdown reaches
+    // exactly the minimum, as long as doing so doesn't push any of them
+    // below the minimum themselves.
+    const targetOthersSum = available - MIN_BREW_STEP_DURATION_SECONDS;
+    const scale = sumOtherEstimates > 0
+      ? targetOthersSum / sumOtherEstimates
+      : 0;
+    const scaledFloors = otherEstimates.map((estimate) =>
+      Math.floor(estimate * scale)
+    );
+    const everyScaledFitsMinimum = sumOtherEstimates > 0 &&
+      scaledFloors.every((value) => value >= MIN_BREW_STEP_DURATION_SECONDS);
+
+    if (everyScaledFitsMinimum) {
+      let allocated = 0;
+      otherDerivedIndexes.forEach((index, order) => {
+        const isLastOther = order === otherDerivedIndexes.length - 1;
+        // Remainder from the floor goes on the last non-drawdown step so
+        // the scaled group still sums to exactly targetOthersSum, leaving
+        // the drawdown at exactly the minimum.
+        const value = isLastOther
+          ? targetOthersSum - allocated
+          : scaledFloors[order];
+        allocated += value;
+        finalDurations.set(index, clampBrewStepDuration(value));
+      });
+      finalDurations.set(drawdownIndex, MIN_BREW_STEP_DURATION_SECONDS);
+    } else {
+      // Even proportional scaling can't keep every derived step at or
+      // above the minimum — fall back to spreading `available` across all
+      // derived steps (drawdown included, using the same nominal weight as
+      // a quick action) by their estimated weight instead.
+      const fallbackWeights = derivedIndexes.map((index) => {
+        if (index === drawdownIndex) {
+          return DERIVED_STIR_SECONDS;
+        }
+        return otherEstimates[otherDerivedIndexes.indexOf(index)];
+      });
+      const fallbackAllocation = allocateAvailableSecondsByWeight(
+        available,
+        derivedIndexes,
+        fallbackWeights,
+      );
+      for (const [index, duration] of fallbackAllocation) {
+        finalDurations.set(index, duration);
+      }
+    }
   }
 
   const adjustedSteps = input.steps.map((step) => ({ ...step }));
-  const reservedDrawdownDuration = drawdownIndexes.length *
-    MIN_BREW_STEP_DURATION_SECONDS;
-  let assignedBrewTotal = adjustedSteps
-    .filter((step, index) =>
-      step.kind === "brew" &&
-      !vaguePourIndexes.includes(index) &&
-      !drawdownIndexes.includes(index)
-    )
-    .reduce((sum, step) => sum + step.duration_seconds, 0);
-  let adjusted = false;
-
-  for (const index of vaguePourIndexes) {
-    const step = adjustedSteps[index];
-    const remainingForPours = targetSeconds - assignedBrewTotal -
-      reservedDrawdownDuration;
-    if (remainingForPours < MIN_BREW_STEP_DURATION_SECONDS) {
-      assignedBrewTotal += step.duration_seconds;
-      continue;
+  let changed = false;
+  for (const [index, duration] of finalDurations) {
+    if (duration !== adjustedSteps[index].duration_seconds) {
+      changed = true;
     }
-
-    const duration = Math.max(
-      MIN_BREW_STEP_DURATION_SECONDS,
-      Math.min(inferredPourDuration, remainingForPours),
-    );
-    if (step.duration_seconds !== duration) {
-      adjusted = true;
-      step.duration_seconds = duration;
-    }
-    assignedBrewTotal += duration;
-  }
-
-  if (drawdownIndexes.length > 0) {
-    const drawdownTotal = targetSeconds - assignedBrewTotal;
-    if (drawdownTotal >= MIN_BREW_STEP_DURATION_SECONDS) {
-      drawdownIndexes.forEach((index, order) => {
-        const remainingSlots = drawdownIndexes.length - order;
-        const alreadyAssignedDrawdown = drawdownIndexes
-          .slice(0, order)
-          .reduce(
-            (sum, previousIndex) =>
-              sum + adjustedSteps[previousIndex].duration_seconds,
-            0,
-          );
-        const remainingDrawdown = drawdownTotal - alreadyAssignedDrawdown;
-        const duration = order === drawdownIndexes.length - 1
-          ? remainingDrawdown
-          : Math.max(
-            MIN_BREW_STEP_DURATION_SECONDS,
-            Math.floor(remainingDrawdown / remainingSlots),
-          );
-        if (adjustedSteps[index].duration_seconds !== duration) {
-          adjusted = true;
-          adjustedSteps[index].duration_seconds = duration;
-        }
-      });
-    }
-  } else {
-    const drawdownDuration = targetSeconds - assignedBrewTotal;
-    if (
-      drawdownDuration >= MIN_BREW_STEP_DURATION_SECONDS &&
-      hasSourceDrawdownCue(input.sourceText)
-    ) {
-      adjusted = true;
-      adjustedSteps.push({
-        step_order: adjustedSteps.length + 1,
-        kind: "brew",
-        description_source: "manual",
-        description_template: "Wait for the complete drawdown.",
-        preview_text: "Wait for the complete drawdown.",
-        duration_seconds: drawdownDuration,
-        expressions: [],
-      });
-    }
+    adjustedSteps[index].duration_seconds = duration;
   }
 
   return {
-    steps: adjusted ? adjustedSteps : input.steps,
-    warnings: adjusted
+    steps: changed ? adjustedSteps : input.steps,
+    warnings: changed
       ? [
-        "Vague brew step durations were inferred from the stated total brew time.",
+        "Derived brew step durations were split deterministically from the stated total brew time.",
       ]
       : [],
   };
@@ -2773,13 +3914,26 @@ function normalizeVagueBrewDurationsFromTotalTarget(input: {
 
 function normalizeAbsoluteTimestampDurations(input: {
   steps: DraftStep[];
-  sourceText: string;
+  narrowedText: string;
+  extractionTotalBrewTimeSeconds: number | null;
+  // F28: the already-resolved language signal (source hint, then
+  // normalization/extraction detection) — gates whether a synthetic
+  // English drawdown sentence may be appended below. See isEnglishLikeLanguage.
+  detectedInputLanguage: string | null;
+  // verify-user-recipe-draft's handler hard-502s the app the moment the
+  // parser's step count diverges from the request's (see
+  // verify-user-recipe-draft/handler.ts), and the synthetic drawdown append
+  // below adds a step — so verify mode must skip only that append. The
+  // duration/elapsed_seconds normalization above it changes values in
+  // place, never the count, so it stays on for both modes.
+  preserveStepCount: boolean;
 }): { steps: DraftStep[]; warnings: string[] } {
   const detectedTimestamped = input.steps
     .map((step, index) => ({
       index,
       timestampSeconds: step.kind === "brew"
-        ? parseStepElapsedTimestampSeconds(step.description_source) ??
+        ? step.elapsed_seconds ??
+          parseStepElapsedTimestampSeconds(step.description_source) ??
           parseStepElapsedTimestampSeconds(step.description_template)
         : null,
     }))
@@ -2820,9 +3974,10 @@ function normalizeAbsoluteTimestampDurations(input: {
   const timestampByIndex = new Map(
     timestamped.map((item, index) => [item.index, { ...item, order: index }]),
   );
-  const completionTargetSeconds = parseCompletionTargetSeconds(
-    input.sourceText,
-  );
+  const completionTargetSeconds = resolveTotalBrewTimeTargetSeconds({
+    extractionTotalBrewTimeSeconds: input.extractionTotalBrewTimeSeconds,
+    narrowedText: input.narrowedText,
+  });
 
   const steps = input.steps.map((step, index) => {
     const timestamp = timestampByIndex.get(index);
@@ -2832,6 +3987,11 @@ function normalizeAbsoluteTimestampDurations(input: {
         ? nextTimestamp.timestampSeconds - timestamp.timestampSeconds
         : FINAL_TIMESTAMPED_STEP_DURATION_SECONDS;
 
+      // Canonicalize elapsed_seconds to the resolved timestamp (which may
+      // have come from regex text parsing, not just the field itself) so
+      // later passes — namely the deterministic brew-step split — can tell
+      // this step's duration came from timestamp differencing and must not
+      // be re-derived from anything else.
       if (
         duration >= MIN_BREW_STEP_DURATION_SECONDS &&
         step.duration_seconds !== duration
@@ -2840,10 +4000,11 @@ function normalizeAbsoluteTimestampDurations(input: {
         return {
           ...step,
           duration_seconds: duration,
+          elapsed_seconds: timestamp.timestampSeconds,
         };
       }
 
-      return step;
+      return { ...step, elapsed_seconds: timestamp.timestampSeconds };
     }
 
     if (
@@ -2869,11 +4030,43 @@ function normalizeAbsoluteTimestampDurations(input: {
     index > lastTimestamped.index && step.kind === "brew" &&
     isDrawdownLikeStep(step)
   );
+  // Phase C3 (F29): a step can be explicitly labelled step_role
+  // "drawdown" without being positioned after lastTimestamped.index — for
+  // example when the drawdown step itself carries the final elapsed
+  // timestamp. hasDrawdownStep above only scans steps positionally after
+  // the timestamped run, so it can miss that case; this scans every step,
+  // regardless of position or language, and must independently suppress
+  // the synthetic append below.
+  const hasRoleDrawdownStep = steps.some((step) =>
+    step.step_role === "drawdown"
+  );
+  // F28: the recipe's actual last brew step — regardless of how it's
+  // worded — is already functioning as the tail once it adds no more
+  // water (nothing is poured after it), so there is nothing left to
+  // synthesize even when its wording doesn't happen to match
+  // isDrawdownLikeStep.
+  const lastBrewStepIndex = findLastBrewStepIndex(steps);
+  const lastBrewStepAddsNoWater = lastBrewStepIndex === -1
+    ? false
+    : (computeBrewStepWaterAddedAmounts(steps)[lastBrewStepIndex] ?? 0) <= 0;
+  // F28: only ever append an English sentence when the recipe itself is
+  // English-like. Losing a synthesized drawdown step is far better than
+  // injecting a foreign-language recipe with one English sentence — a
+  // German (or any non-English) recipe that already ends on its own
+  // "let it drain completely" style step must never gain a bolted-on
+  // English step.
+  const isEnglishLikeRecipe = isEnglishLikeLanguage(
+    input.detectedInputLanguage,
+  );
   if (
     completionTargetSeconds !== null &&
     completionTargetSeconds >
       finalTimestampedEndsAt + MIN_BREW_STEP_DURATION_SECONDS &&
-    !hasDrawdownStep
+    !hasDrawdownStep &&
+    !hasRoleDrawdownStep &&
+    !lastBrewStepAddsNoWater &&
+    isEnglishLikeRecipe &&
+    !input.preserveStepCount
   ) {
     adjusted = true;
     steps.push({
@@ -2883,6 +4076,11 @@ function normalizeAbsoluteTimestampDurations(input: {
       description_template: "Wait for the complete drawdown.",
       preview_text: "Wait for the complete drawdown.",
       duration_seconds: completionTargetSeconds - finalTimestampedEndsAt,
+      elapsed_seconds: null,
+      starts_timer: false,
+      duration_is_stated: false,
+      scalable_amounts: [],
+      step_role: "drawdown",
       expressions: [],
     });
   }
@@ -2918,10 +4116,57 @@ function applyExtractionFallbacks(args: {
       short_description: args.normalized.localization.short_description ??
         args.extraction.short_description,
     },
+    // G22: normalization/repair fully replace the working NormalizedDraft
+    // with their own LLM output (unlike the cumulative_rewrite merge,
+    // which only overwrites `steps`/`warnings`), so a provider that
+    // forgets to re-emit extracted_amounts would otherwise silently drop
+    // it here even though extraction captured it correctly. Prefer
+    // whatever normalization/repair carried forward; fall back to
+    // extraction's own copy only when that came back empty. `?? []` also
+    // covers a caller that bypasses zod's `.default([])` entirely (every
+    // test-provider stub in this repo does).
+    extracted_amounts: (args.normalized.extracted_amounts ?? []).length > 0
+      ? args.normalized.extracted_amounts
+      : (args.extraction.extracted_amounts ?? []),
   };
 }
 
+// INFERABLE fields may reasonably be derived by the repair model from the
+// brewing method or general context. They drive whether the repair stage
+// runs at all, and whether a repair attempt is considered successful.
 function getMissingRequiredRepairFields(args: {
+  normalized: NormalizedDraft;
+  extraction: ExtractionResult;
+  brewingMethods: BrewingMethodOption[];
+  brewingMethodHint?: string;
+}): string[] {
+  const normalizedWithFallbacks = applyExtractionFallbacks({
+    normalized: args.normalized,
+    extraction: args.extraction,
+  });
+
+  const missingFields: string[] = [];
+
+  if (!normalizedWithFallbacks.localization.name) {
+    missingFields.push("localization.name");
+  }
+  if (!normalizedWithFallbacks.localization.grind_size) {
+    missingFields.push("localization.grind_size");
+  }
+  if (!normalizedWithFallbacks.localization.short_description) {
+    missingFields.push("localization.short_description");
+  }
+  if (!normalizedWithFallbacks.recipe.water_temp) {
+    missingFields.push("recipe.water_temp");
+  }
+
+  return missingFields;
+}
+
+// SOURCE-ONLY fields must come from the source text. The repair model must
+// never invent these, so they never trigger or gate the repair stage. They
+// are only used to surface human-readable warnings when they end up null.
+function getMissingSourceOnlyFields(args: {
   normalized: NormalizedDraft;
   extraction: ExtractionResult;
   brewingMethods: BrewingMethodOption[];
@@ -2940,23 +4185,11 @@ function getMissingRequiredRepairFields(args: {
 
   const missingFields: string[] = [];
 
-  if (!normalizedWithFallbacks.localization.name) {
-    missingFields.push("localization.name");
-  }
-  if (!normalizedWithFallbacks.localization.grind_size) {
-    missingFields.push("localization.grind_size");
-  }
-  if (!normalizedWithFallbacks.localization.short_description) {
-    missingFields.push("localization.short_description");
-  }
   if (!normalizedWithFallbacks.recipe.coffee_amount) {
     missingFields.push("recipe.coffee_amount");
   }
   if (!normalizedWithFallbacks.recipe.water_amount) {
     missingFields.push("recipe.water_amount");
-  }
-  if (!normalizedWithFallbacks.recipe.water_temp) {
-    missingFields.push("recipe.water_temp");
   }
   if (!resolvedBrewingMethod.brewingMethodId) {
     missingFields.push("recipe.brewing_method_id");
@@ -2964,6 +4197,15 @@ function getMissingRequiredRepairFields(args: {
 
   return missingFields;
 }
+
+const SOURCE_ONLY_FIELD_WARNINGS: Record<string, string> = {
+  "recipe.coffee_amount":
+    "Coffee amount is not stated in the source and was left empty.",
+  "recipe.water_amount":
+    "Water amount is not stated in the source and was left empty.",
+  "recipe.brewing_method_id":
+    "Brewing method could not be confidently determined from the source and was left empty.",
+};
 
 function getMalformedStepTemplateRepairFields(
   normalized: NormalizedDraft,
@@ -3040,6 +4282,22 @@ function validateCumulativeRewriteSteps(args: {
     if (originalStep.description_source !== rewrittenStep.description_source) {
       return `cumulative rewrite changed description_source for step ${index}`;
     }
+
+    if (originalStep.elapsed_seconds !== rewrittenStep.elapsed_seconds) {
+      return `cumulative rewrite changed elapsed_seconds for step ${index}`;
+    }
+
+    if (originalStep.starts_timer !== rewrittenStep.starts_timer) {
+      return `cumulative rewrite changed starts_timer for step ${index}`;
+    }
+
+    if (originalStep.duration_is_stated !== rewrittenStep.duration_is_stated) {
+      return `cumulative rewrite changed duration_is_stated for step ${index}`;
+    }
+
+    if (originalStep.step_role !== rewrittenStep.step_role) {
+      return `cumulative rewrite changed step_role for step ${index}`;
+    }
   }
 
   return null;
@@ -3065,6 +4323,132 @@ function validateRewrittenStepTemplates(
 
   return null;
 }
+
+// Fix 1 (Aug 2026 live pass): the cumulative_rewrite stage is explicitly
+// licensed (via cumulativeHint/its own system prompt) to turn an additive
+// pour into cumulative wording — that conversion is correct and by design
+// whenever the RESULT is a single figure the recipe already states
+// somewhere (the common case this pass exists for: "pour another 100g"
+// becomes "pour up to 200g" when the source's own later steps already say
+// 200g). What is NOT safe is recomputing a RANGE: a German V60 capture
+// (627c64a7) had a bloom of 25g followed by "gieße nun weitere 50-70g" (an
+// ADDITIVE range on top of the bloom). The cumulative_rewrite stage turned
+// this into "auf insgesamt 75-95g" (a cumulative RANGE), i.e. it computed
+// 25+50=75 and 25+70=95 itself. Neither 75 nor 95 appears anywhere in the
+// source text, and there is no mechanism anywhere in this pipeline for
+// synthesizing a matching extracted_amounts record for a value the LLM
+// invented via its own arithmetic on two separate literal facts — so G22
+// correctly, and permanently, reports both figures as unverifiable no
+// matter how many times this is retried.
+//
+// A single-value cumulative rewrite doesn't have this problem because it
+// almost always lands on a figure that itself already has a literal
+// extracted_amounts record elsewhere in the recipe (the recipe's own later
+// "pour to 300g" language). A two-endpoint RANGE has no such anchor: both
+// endpoints are new arithmetic, not a restatement of an existing fact. The
+// fix is therefore narrow and mechanical: if cumulative_rewrite changed the
+// computed values of a step that had TWO OR MORE expressions for the same
+// placeholder (a range) before the rewrite, that step's rewrite is
+// rejected and its ORIGINAL (pre-rewrite, already correctly traceable)
+// description_template is kept instead — every other step's legitimate
+// rewrite is left untouched.
+function revertUntraceableRangeCumulativeRewrites(args: {
+  // The draft as rendered from `normalized.steps` BEFORE cumulative_rewrite
+  // ran — i.e. provisionalDraftSteps, whose .expressions already carry the
+  // correct, source-traceable preview values for every range.
+  original: DraftStep[];
+  // What the cumulative_rewrite stage returned.
+  rewritten: NormalizedDraft["steps"];
+  coffeeAmount: number | null;
+  waterAmount: number | null;
+}): { steps: NormalizedDraft["steps"]; warnings: string[] } {
+  const warnings: string[] = [];
+  const placeholders = [
+    "<final_coffee_amount>",
+    "<final_water_amount>",
+  ] as const;
+
+  const steps = args.rewritten.map((rewrittenStep, index) => {
+    const originalStep = args.original[index];
+    if (!originalStep) {
+      return rewrittenStep;
+    }
+
+    for (const placeholder of placeholders) {
+      const originalValues = originalStep.expressions
+        .filter((expression) => expression.placeholder === placeholder)
+        .map((expression) => expression.preview_value);
+
+      // Only a RANGE (two or more expressions for the same placeholder in
+      // one step) is in scope — a single-value cumulative rewrite is the
+      // legitimate, by-design case this guard must not touch.
+      if (originalValues.length < 2) {
+        continue;
+      }
+
+      const rewrittenValues = extractExpressions(
+        rewrittenStep.description_template,
+        args.coffeeAmount,
+        args.waterAmount,
+      )
+        .filter((expression) => expression.placeholder === placeholder)
+        .map((expression) => expression.preview_value);
+
+      const unchanged = originalValues.length === rewrittenValues.length &&
+        originalValues.every((value, position) => {
+          const rewrittenValue = rewrittenValues[position];
+          return value !== null && rewrittenValue !== null &&
+            Math.abs(value - rewrittenValue) < 0.01;
+        });
+
+      if (unchanged) {
+        continue;
+      }
+
+      warnings.push(
+        `Cumulative rewrite recomputed step ${
+          index + 1
+        }'s ${
+          placeholder === "<final_water_amount>" ? "water" : "coffee"
+        } amount range into new figures that do not trace to the source; the original wording was kept instead.`,
+      );
+      return {
+        ...rewrittenStep,
+        description_template: originalStep.description_template,
+      };
+    }
+
+    return rewrittenStep;
+  });
+
+  return { steps, warnings };
+}
+
+// Exact id, exact name, normalized-exact id, or normalized-exact name
+// matches (120/110/100/95) are always accepted.
+//
+// Containment matches are asymmetric, not a flat score floor:
+//   - ACCEPT when the CANDIDATE contains the method token, e.g. candidate
+//     "Kalita Wave pour over" contains method id "kalita". The candidate is
+//     a more specific label for a supported method — a legitimate
+//     specialization.
+//   - REJECT when the METHOD contains the candidate, e.g. method name
+//     "Wilfa Svart Pour Over" contains candidate "pour over". The candidate
+//     is a generic fragment and the method is a specific (often branded)
+//     device — guessing here routinely picks the wrong method (the "wilfa"
+//     bug).
+// A minimum method-token length guards against a very short id/name
+// matching almost anything as a substring.
+const CANDIDATE_CONTAINS_ID_SCORE = 85;
+const CANDIDATE_CONTAINS_NAME_SCORE = 82;
+const METHOD_CONTAINS_ID_SCORE = 40;
+const METHOD_CONTAINS_NAME_SCORE = 35;
+const MIN_BREWING_METHOD_TOKEN_LENGTH = 3;
+
+// The acceptance threshold sits between the two containment directions:
+// accept-direction tiers (82/85) pass, reject-direction tiers (35/40) and
+// non-matches (-1) do not.
+const HIGH_CONFIDENCE_BREWING_METHOD_SCORE = CANDIDATE_CONTAINS_NAME_SCORE;
 
 function scoreBrewingMethodCandidate(args: {
   candidate: string;
@@ -3095,18 +4479,26 @@ function scoreBrewingMethodCandidate(args: {
 
   if (
     candidateNormalized.length > 0 &&
-    (candidateNormalized.includes(methodIdNormalized) ||
-      methodIdNormalized.includes(candidateNormalized))
+    methodIdNormalized.length >= MIN_BREWING_METHOD_TOKEN_LENGTH
   ) {
-    return 80;
+    if (candidateNormalized.includes(methodIdNormalized)) {
+      return CANDIDATE_CONTAINS_ID_SCORE;
+    }
+    if (methodIdNormalized.includes(candidateNormalized)) {
+      return METHOD_CONTAINS_ID_SCORE;
+    }
   }
 
   if (
     candidateNormalized.length > 0 &&
-    (candidateNormalized.includes(methodNameNormalized) ||
-      methodNameNormalized.includes(candidateNormalized))
+    methodNameNormalized.length >= MIN_BREWING_METHOD_TOKEN_LENGTH
   ) {
-    return 75;
+    if (candidateNormalized.includes(methodNameNormalized)) {
+      return CANDIDATE_CONTAINS_NAME_SCORE;
+    }
+    if (methodNameNormalized.includes(candidateNormalized)) {
+      return METHOD_CONTAINS_NAME_SCORE;
+    }
   }
 
   return -1;
@@ -3128,10 +4520,38 @@ function resolveBrewingMethodId(args: {
     };
   }
 
+  const extractedLikelyBrewingMethod =
+    args.extractedLikelyBrewingMethod?.trim() ?? "";
+
+  if (extractedLikelyBrewingMethod.length > 0) {
+    const extractionMatchesAnySupportedMethod = args.brewingMethods.some(
+      (method) =>
+        scoreBrewingMethodCandidate({
+          candidate: extractedLikelyBrewingMethod,
+          method,
+        }) >= HIGH_CONFIDENCE_BREWING_METHOD_SCORE,
+    );
+
+    if (!extractionMatchesAnySupportedMethod) {
+      // The extraction stage identified a real brewing method mention from
+      // the source text, and it does not match any supported method. Any
+      // brewing_method_id the normalization stage produced in this case is
+      // a guess (or a self-contradiction — the model can simultaneously
+      // emit a warning that the method is unsupported and still return a
+      // matching id), not a reading of the source, so don't trust it.
+      return {
+        brewingMethodId: null,
+        warnings: [
+          `Brewing method '${extractedLikelyBrewingMethod}' is not among the supported methods and was left unset.`,
+        ],
+      };
+    }
+  }
+
   const candidates = uniqueStrings([
     args.normalizedBrewingMethodId ?? "",
     args.extractedLikelyBrewingMethod ?? "",
-  ]);
+  ]).filter((candidate) => candidate.length > 0);
 
   for (const candidate of candidates) {
     const scoredMatches = args.brewingMethods
@@ -3142,7 +4562,7 @@ function resolveBrewingMethodId(args: {
           method,
         }),
       }))
-      .filter((match) => match.score >= 0)
+      .filter((match) => match.score >= HIGH_CONFIDENCE_BREWING_METHOD_SCORE)
       .sort((left, right) => right.score - left.score);
 
     if (scoredMatches.length === 0) {
@@ -3173,7 +4593,9 @@ function resolveBrewingMethodId(args: {
     brewingMethodId: null,
     warnings: candidates.length > 0
       ? [
-        "Brewing method could not be matched to a supported brewing_method_id.",
+        `Brewing method '${
+          candidates[0]
+        }' is not among the supported methods and was left unset.`,
       ]
       : [],
   };
@@ -3427,6 +4849,496 @@ function buildPublishProjection(input: {
   };
 }
 
+// Text the deterministic duration-normalization passes are allowed to mine
+// timing numbers out of: only what the extraction stage itself identified
+// as recipe content (the preparation blurb and each step's raw text) —
+// never the full raw transcript, which is mostly commentary that regexes
+// have historically mismined as brew-time statements.
+function buildNarrowedSourceText(extraction: ExtractionResult): string {
+  return [
+    extraction.preparation,
+    ...extraction.steps.map((step) => step.raw_text),
+  ]
+    .filter((part): part is string => Boolean(part && part.trim().length))
+    .join(" ");
+}
+
+// G22: builds the RenderedAmount[] verifyAmountProvenance checks against,
+// from the FINAL draft steps — i.e. this must run after every LLM and
+// deterministic transform, so it sees exactly what the user would actually
+// be shown, including cumulative rewriting and the duration split.
+//
+// Two sources of amounts, per step:
+//  1. Scalable expressions — step.expressions already carries a computed
+//     preview_value for each one (see extractExpressions). This is the
+//     amount the user will actually see once <final_coffee_amount>/
+//     <final_water_amount> are substituted in.
+//  2. Literal numeric amounts left in the template — a fixed number the
+//     model chose not to (or could not) convert into a scalable
+//     expression. Found with the same NUMERIC_SCALABLE_AMOUNT_REGEX used
+//     elsewhere for scalable-amount matching, after stripping out
+//     expressions first so an expression's own multiplier (e.g. the "1" in
+//     "(1 x <final_coffee_amount>)g") is never double-counted as a second,
+//     unrelated literal amount.
+//
+// is_cumulative_water is only ever true for a <final_water_amount>
+// expression in a step whose wording reads as cumulative
+// (usesCumulativeWaterLanguage) — never for a literal leftover number,
+// which by definition is not what the deterministic cumulative-rewrite
+// pass touches.
+function buildRenderedAmountsFromDraftSteps(
+  draftSteps: DraftStep[],
+): RenderedAmount[] {
+  const rendered: RenderedAmount[] = [];
+
+  draftSteps.forEach((step, stepIndex) => {
+    const isCumulativeStep = usesCumulativeWaterLanguage(
+      step.description_template,
+    );
+
+    for (const expression of step.expressions) {
+      if (expression.preview_value === null) {
+        continue;
+      }
+      rendered.push({
+        step_index: stepIndex,
+        value: expression.preview_value,
+        unit: normalizeExpressionUnit(expression.unit),
+        is_cumulative_water: isCumulativeStep &&
+          expression.placeholder === "<final_water_amount>",
+      });
+    }
+
+    const withoutExpressions = step.description_template.replaceAll(
+      cloneRegex(EXPRESSION_REGEX),
+      " ",
+    );
+    for (
+      const match of withoutExpressions.matchAll(
+        cloneRegex(NUMERIC_SCALABLE_AMOUNT_REGEX),
+      )
+    ) {
+      const value = Number(match[1]);
+      if (!Number.isFinite(value)) {
+        continue;
+      }
+      rendered.push({
+        step_index: stepIndex,
+        value,
+        unit: normalizeExpressionUnit(match[2] ?? ""),
+        is_cumulative_water: false,
+      });
+    }
+  });
+
+  return rendered;
+}
+
+// G22 — timing landmark enforcement.
+//
+// Landmarks are captured from the draft steps AS THEY STAND RIGHT AFTER
+// fold (foldPreTimerStepsIntoPreparation) — i.e. after the one pass that
+// can change step count/order, but BEFORE every pass that can recompute
+// duration_seconds/elapsed_seconds (convertWaterStepsToRunningTotals never
+// touches timing, but normalizeAbsoluteTimestampDurations,
+// splitDerivedBrewStepDurationsFromTarget, and enforceMinimumStepDurations
+// all can). That makes this snapshot exactly "what the source stated,
+// before this parser's own heuristics had a chance to rewrite it" — the
+// same role extracted_amounts plays for verifyAmountProvenance, just
+// without needing a bespoke top-level field, since duration_is_stated and
+// elapsed_seconds already are that record.
+//
+// step_index here is guaranteed to line up 1:1 with the FINAL draftSteps
+// array's own indices: fold only ever REMOVES pre-timer preparation-kind
+// steps (before the first step that starts the timer), never brew-kind
+// steps, and every pass between this snapshot and the final draft either
+// mutates a step's fields in place or appends exactly one synthetic
+// drawdown step at the very end (extract mode only) — neither reorders or
+// removes anything this snapshot already captured. A landmark whose step
+// was itself folded away (necessarily a pre-timer, not a source-stated
+// brew landmark) simply finds nothing to compare against in
+// verifyTimingProvenance and is silently skipped, which is the correct
+// outcome: it is not part of the brew timeline being checked.
+function buildTimingLandmarksFromFoldedSteps(
+  foldedSteps: DraftStep[],
+): TimingLandmark[] {
+  const landmarks: TimingLandmark[] = [];
+
+  foldedSteps.forEach((step, stepIndex) => {
+    if (step.duration_is_stated) {
+      landmarks.push({
+        step_index: stepIndex,
+        kind: "duration",
+        seconds: step.duration_seconds,
+      });
+    }
+    if (step.elapsed_seconds !== null) {
+      landmarks.push({
+        step_index: stepIndex,
+        kind: "elapsed",
+        seconds: step.elapsed_seconds,
+      });
+    }
+  });
+
+  return landmarks;
+}
+
+function buildRenderedTimingStepsFromDraftSteps(
+  draftSteps: DraftStep[],
+): RenderedTimingStep[] {
+  return draftSteps.map((step, stepIndex) => ({
+    step_index: stepIndex,
+    kind: step.kind,
+    duration_seconds: step.duration_seconds,
+  }));
+}
+
+// F32: mirrors provenance.ts's AmountProvenance shape, taken from the
+// normalized draft's own carried-through field rather than re-imported,
+// since that's the exact array this repair pass reads.
+type AmountProvenanceRecord = NormalizedDraft["extracted_amounts"][number];
+
+// A tolerance for "is the rendered multiplier already numerically correct"
+// — needed because the multiplier arriving in description_template is
+// whatever text the LLM wrote (which may round or format differently than
+// formatMultiplier would), not necessarily a byte-for-byte match even when
+// the underlying number is right. Small enough to still catch a
+// genuinely-different value (e.g. the diagnosed 0.2 vs 0.1875 in the
+// Kalita case, a difference of 0.0125) while absorbing float/formatting
+// noise around a correct one.
+const MULTIPLIER_REPAIR_TOLERANCE = 0.0005;
+
+// F33: a small, deliberately duplicated copy of provenance.ts's own
+// normalizeForQuoteSearch/quoteAppearsInSource (see that file, ~line
+// 103-151). parser.ts does not import from provenance.ts's internals here on
+// purpose: provenance.ts is kept as a standalone, dependency-free checker
+// that the parser calls into, not a shared-utility module the parser reaches
+// back into — widening that boundary for one whitespace-normalisation helper
+// would cost more than the few duplicated lines below. Keep this in lockstep
+// with provenance.ts's implementation if that one ever changes.
+function normalizeQuoteForSearchLocal(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function quoteAppearsInSourceLocal(
+  quote: string | null,
+  requestText: string,
+): boolean {
+  if (!quote) {
+    return false;
+  }
+  const needle = normalizeQuoteForSearchLocal(quote);
+  if (!needle) {
+    return false;
+  }
+  return normalizeQuoteForSearchLocal(requestText).includes(needle);
+}
+
+type ExpressionOccurrence = {
+  // Position of this expression among all expressions in the step's
+  // template, in left-to-right appearance order — the key used to look up
+  // this occurrence's repair decision in the plan built below.
+  index: number;
+  matchStart: number;
+  matchText: string;
+  multiplierText: string;
+  multiplier: number;
+  unit: string;
+  placeholder: "<final_coffee_amount>" | "<final_water_amount>";
+};
+
+// Same parse as extractExpressions, but keeping match position/raw text
+// instead of computing preview values — this repair pass needs to splice
+// text back into the template, not render it.
+function findExpressionOccurrences(template: string): ExpressionOccurrence[] {
+  const occurrences: ExpressionOccurrence[] = [];
+  let position = 0;
+  for (const match of template.matchAll(cloneRegex(EXPRESSION_REGEX))) {
+    const multiplierText = match[1];
+    const multiplier = Number(multiplierText);
+    if (!Number.isFinite(multiplier) || match.index === undefined) {
+      continue;
+    }
+    occurrences.push({
+      index: position,
+      matchStart: match.index,
+      matchText: match[0],
+      multiplierText,
+      multiplier,
+      unit: (match[3] ?? "").trim(),
+      placeholder: `<${match[2]}>` as ExpressionOccurrence["placeholder"],
+    });
+    position += 1;
+  }
+  return occurrences;
+}
+
+// F32: decides which literal provenance record (if any) repairs which
+// expression occurrence in a single step. Returns a map from occurrence
+// index to the record that should replace its multiplier; an occurrence
+// absent from the map is left untouched.
+//
+// Two shapes are handled, both observed live:
+//  - Every expression in the step targets the SAME placeholder (a single
+//    amount, or a range rendered as two expressions like Chemex's 60-90 g
+//    bloom). Pair positionally in appearance order: extraction records
+//    amounts in reading order and the template preserves that same order,
+//    so this only fires when the counts line up exactly — never a guess.
+//  - The step's expressions target BOTH placeholders (a coffee-scaled
+//    amount and a water-scaled amount in one step). Positional order
+//    across the whole step no longer says which record belongs with which
+//    expression, so each side is split by base first. getCleanestPlaceholder
+//    is reused here (never reimplemented) purely to classify each record's
+//    likely base — the split is only trusted when a base's record count
+//    exactly matches its expression count; a mismatched or empty base is
+//    left untouched, same as the no-record/ambiguous cases below.
+function planStepMultiplierRepairs(args: {
+  occurrences: ExpressionOccurrence[];
+  literalRecords: AmountProvenanceRecord[];
+  coffeeAmount: number | null;
+  waterAmount: number | null;
+}): Map<number, AmountProvenanceRecord> {
+  const plan = new Map<number, AmountProvenanceRecord>();
+
+  if (args.occurrences.length === 0 || args.literalRecords.length === 0) {
+    return plan;
+  }
+
+  const distinctPlaceholders = new Set(
+    args.occurrences.map((occurrence) => occurrence.placeholder),
+  );
+
+  if (distinctPlaceholders.size === 1) {
+    if (args.literalRecords.length !== args.occurrences.length) {
+      // Ambiguous — more/fewer records than expressions to pair them
+      // with. Never guess: let G22 report it as it already does.
+      return plan;
+    }
+    args.occurrences.forEach((occurrence, position) => {
+      plan.set(occurrence.index, args.literalRecords[position]);
+    });
+    return plan;
+  }
+
+  for (const placeholder of distinctPlaceholders) {
+    const occurrencesForBase = args.occurrences.filter((occurrence) =>
+      occurrence.placeholder === placeholder
+    );
+    const recordsForBase = args.literalRecords.filter((record) =>
+      getCleanestPlaceholder({
+        value: record.value,
+        coffeeAmount: args.coffeeAmount,
+        waterAmount: args.waterAmount,
+      }) === placeholder
+    );
+    if (recordsForBase.length !== occurrencesForBase.length) {
+      continue;
+    }
+    occurrencesForBase.forEach((occurrence, position) => {
+      plan.set(occurrence.index, recordsForBase[position]);
+    });
+  }
+
+  return plan;
+}
+
+// F32 (PRIMARY fix — see the module-level defect note above
+// buildRenderedAmountsFromDraftSteps for the failure this repairs): the
+// normalization/repair LLM's prompt lists example scalable-quantity
+// placeholders such as "(0.2 x <final_water_amount>)g" to illustrate the
+// EXPRESSION SHAPE. Live traffic showed the model instead treating those
+// numbers as a closed set of values to copy onto whichever step it
+// pattern-matched, rather than as a worked example — e.g. a source step
+// literally stating "40 جرام" for the bloom (against a 300 g final water
+// amount, i.e. a correct multiplier of 40/300 = 0.133333) was rendered as
+// "(0.2 x <final_water_amount>)g", because 0.2 happens to be one of the
+// prompt's own example multipliers. The SAME run divided correctly to six
+// decimals on every OTHER pour in the recipe (140/300, 220/300, 300/300),
+// so this is example-copying on individual steps, not a systematic
+// arithmetic bug.
+//
+// Rather than harden the prompt further (F30 already showed that reduces
+// but never eliminates this class of failure), this recomputes the
+// multiplier deterministically wherever a more reliable number already
+// exists: extraction (or repair) already recorded the source's own literal
+// figure for this exact step in extracted_amounts (provenance "literal" —
+// appears verbatim in the submitted text, see AMOUNT_PROVENANCE_PROMPT_RULES).
+// Given that literal value and the recipe's own coffee/water totals, the
+// correct multiplier is a plain division; the model is never trusted to
+// have divided correctly.
+//
+// Deliberately conservative about when it fires — see
+// planStepMultiplierRepairs for the pairing rules:
+//  - Only 'literal' records are authoritative enough to overwrite a
+//    rendering. 'derived'/'inferred' records are the LLM's own computed or
+//    inferred figures, not a verbatim source fact, so they are left alone
+//    and reported by G22 (verifyAmountProvenance) exactly as before this
+//    fix.
+//  - The expression's EXISTING placeholder (already present in the
+//    malformed text) is trusted as the base to divide by, rather than
+//    re-derived from the literal record's value via getCleanestPlaceholder.
+//    That heuristic scores a ratio by how "clean" (near-integer / simple
+//    fraction) it looks — useful when there is no better signal, but
+//    actively wrong here: the diagnosed Arabic bloom is 40 g against a
+//    20 g coffee dose AND a 300 g water target, and 40/20 = 2 is a
+//    "cleaner" ratio than 40/300 = 0.1333, yet 40/300 is the value proven
+//    correct by every other pour in the same run. The model's placeholder
+//    CHOICE has not been observed wrong in any live example — only the
+//    multiplier constant — so it is trusted here. getCleanestPlaceholder is
+//    still reused (never reimplemented) for the one shape that genuinely
+//    needs an independent base decision: a step mixing both placeholders,
+//    handled in planStepMultiplierRepairs.
+//  - A step with no matching literal record, or a record/expression count
+//    that cannot be paired unambiguously, is left completely untouched.
+//  - Only the multiplier digits are spliced out of the matched expression
+//    text; the operator, spacing, placeholder, and trailing unit are kept
+//    byte-for-byte, so a non-Latin unit like جرام is never touched.
+//  - Warns rather than repairing silently: every actual change emits a
+//    warning naming the old and new values, so a wrong extraction can
+//    never quietly overwrite a correct rendering without a trace. A
+//    rendering that is already numerically correct (within
+//    MULTIPLIER_REPAIR_TOLERANCE) is left untouched with no warning.
+//  - F33: a 'literal' record is only trusted here once its own
+//    source_quote is verified to actually appear in the request text
+//    (quoteAppearsInSourceLocal, whitespace-normalised — same comparison
+//    G22/provenance.ts uses). A record that claims to be literal but whose
+//    quote is not really in the source (e.g. a hallucinated extraction) is
+//    excluded from literalRecords below exactly as if it did not exist, so
+//    the rendering is left untouched and G22 (verifyAmountProvenance) is
+//    the one to report the mismatch — this pass must never rewrite a
+//    correct rendering into a fabricated one on the strength of an
+//    unverified record.
+function repairExpressionMultipliersAgainstLiteralProvenance(input: {
+  steps: DraftStep[];
+  provenance: AmountProvenanceRecord[];
+  coffeeAmount: number | null;
+  waterAmount: number | null;
+  requestText: string;
+}): { steps: DraftStep[]; warnings: string[] } {
+  const warnings: string[] = [];
+
+  const steps = input.steps.map((step, stepIndex) => {
+    const occurrences = findExpressionOccurrences(step.description_template);
+    if (occurrences.length === 0) {
+      return step;
+    }
+
+    const literalRecords = input.provenance.filter((record) =>
+      record.step_index === stepIndex && record.provenance === "literal" &&
+      quoteAppearsInSourceLocal(record.source_quote, input.requestText)
+    );
+    if (literalRecords.length === 0) {
+      return step;
+    }
+
+    const plan = planStepMultiplierRepairs({
+      occurrences,
+      literalRecords,
+      coffeeAmount: input.coffeeAmount,
+      waterAmount: input.waterAmount,
+    });
+    if (plan.size === 0) {
+      return step;
+    }
+
+    let repairedTemplate = "";
+    let cursor = 0;
+    let changed = false;
+
+    for (const occurrence of occurrences) {
+      repairedTemplate += step.description_template.slice(
+        cursor,
+        occurrence.matchStart,
+      );
+      cursor = occurrence.matchStart + occurrence.matchText.length;
+
+      const record = plan.get(occurrence.index);
+      const base = occurrence.placeholder === "<final_coffee_amount>"
+        ? input.coffeeAmount
+        : input.waterAmount;
+
+      if (!record || base === null || !Number.isFinite(base) || base === 0) {
+        repairedTemplate += occurrence.matchText;
+        continue;
+      }
+
+      const newMultiplier = record.value / base;
+      if (
+        Math.abs(newMultiplier - occurrence.multiplier) <
+          MULTIPLIER_REPAIR_TOLERANCE
+      ) {
+        // Already correct — no repair, no warning.
+        repairedTemplate += occurrence.matchText;
+        continue;
+      }
+
+      const newMultiplierText = formatMultiplier(newMultiplier);
+      // Only the multiplier digits are replaced; the leading "(", operator,
+      // spacing, placeholder, closing paren, and unit that surround them
+      // are preserved exactly as the model wrote them. EXPRESSION_REGEX's
+      // group 1 (the multiplier) always starts one character into the
+      // match — right after the opening "(", with no whitespace allowed
+      // between them — so multiplierStart is always 1 in practice;
+      // indexOf is used rather than hardcoding 1 so this stays correct if
+      // the regex ever changes.
+      const multiplierStart = occurrence.matchText.indexOf(
+        occurrence.multiplierText,
+      );
+      if (multiplierStart < 0) {
+        // Defensive: unreachable given matchText/multiplierText are both
+        // derived from the same regex match, but never corrupt the
+        // template on an assumption that turns out false.
+        repairedTemplate += occurrence.matchText;
+        continue;
+      }
+      const rewrittenExpression = occurrence.matchText.slice(
+        0,
+        multiplierStart,
+      ) + newMultiplierText + occurrence.matchText.slice(
+        multiplierStart + occurrence.multiplierText.length,
+      );
+      repairedTemplate += rewrittenExpression;
+      changed = true;
+
+      const oldRenderedValue = (occurrence.multiplier * base).toFixed(2);
+      const newRenderedValue = record.value;
+      warnings.push(
+        `F32 repair: step ${
+          stepIndex + 1
+        }'s scaling expression rendered ${occurrence.multiplierText} x ${occurrence.placeholder} (~${oldRenderedValue}${
+          occurrence.unit ? occurrence.unit : ""
+        }), but the source literally states ${newRenderedValue}${record.unit} for this step (source_quote: ${
+          record.source_quote ?? "n/a"
+        }). Recomputed the multiplier to ${newMultiplierText}.`,
+      );
+    }
+
+    repairedTemplate += step.description_template.slice(cursor);
+
+    if (!changed) {
+      return step;
+    }
+
+    return {
+      ...step,
+      description_template: repairedTemplate,
+      preview_text: renderPreviewText(
+        repairedTemplate,
+        input.coffeeAmount,
+        input.waterAmount,
+      ),
+      expressions: extractExpressions(
+        repairedTemplate,
+        input.coffeeAmount,
+        input.waterAmount,
+      ),
+    };
+  });
+
+  return { steps, warnings };
+}
+
 function finalizeDraftResponse(input: {
   extraction: ExtractionResult;
   normalized: NormalizedDraft;
@@ -3438,9 +5350,34 @@ function finalizeDraftResponse(input: {
   tokensUsed: number;
   openaiTokensUsed: number;
   skipDeterministicWaterTotals?: boolean;
-  sourceText: string;
   nowMs: number;
+  // F28: threaded through to normalizeAbsoluteTimestampDurations so it can
+  // refuse to append a synthetic English drawdown sentence onto a
+  // non-English recipe.
+  detectedInputLanguage: string | null;
+  // Phase E (Task 3): the per-stage provider trail collected while running
+  // parseDraft, surfaced verbatim on the response.
+  providerTrail: ProviderTrailEntry[];
+  // Threaded through so the count-changing passes below can decline to run:
+  // verify-user-recipe-draft's handler hard-502s the app if the parser
+  // returns a different step count than the request supplied (see
+  // verify-user-recipe-draft/handler.ts), so verify mode must never let a
+  // structural pass add or remove a step.
+  mode: RecipeDraftParserMode;
+  // G22: the raw text the user submitted, exactly as sent — every literal
+  // source_quote/rule_source_quote in extracted_amounts must trace back to
+  // this string, not to any narrowed/normalized derivative of it.
+  requestText: string;
+  // Stage-capture (opt-in via capture_stages): collected while running
+  // parseDraft, null when capture wasn't requested. Surfaced on the
+  // response for handler.ts to persist and then strip before responding —
+  // see ParseUserRecipeDraftResponse.stage_outputs.
+  stageOutputs: StageOutputs | null;
 }): ParseUserRecipeDraftResponse {
+  // Derived once, structurally, rather than checked ad hoc at each call
+  // site below — every pass that can change the step count must consult
+  // this instead of re-deriving its own notion of "am I in verify mode".
+  const preserveStepCount = input.mode === "verify";
   const resolvedBrewingMethod = resolveBrewingMethodId({
     brewingMethods: input.brewingMethods,
     brewingMethodHint: input.brewingMethodHint,
@@ -3469,35 +5406,84 @@ function finalizeDraftResponse(input: {
     },
   };
 
+  const narrowedText = buildNarrowedSourceText(input.extraction);
+
   const builtDraftSteps = buildDraftSteps({
     steps: normalizedWithBalancedCopy.steps,
     coffeeAmount: normalizedWithBalancedCopy.recipe.coffee_amount,
     waterAmount: normalizedWithBalancedCopy.recipe.water_amount,
   });
-  const waterNormalizedDraftSteps = input.skipDeterministicWaterTotals
-    ? builtDraftSteps
+  const foldedDraftSteps = foldPreTimerStepsIntoPreparation({
+    steps: builtDraftSteps,
+    preserveStepCount,
+  });
+  // The fold above merges plain text into steps[0]'s description; re-render
+  // its preview text and re-extract its expressions so the merged content
+  // is reflected (foldPreTimerStepsIntoPreparation itself only touches
+  // steps, not the amounts needed to render/extract expressions).
+  const preparationRenderedDraftSteps = foldedDraftSteps.steps.map(
+    (step, index) => {
+      if (index !== 0) {
+        return step;
+      }
+
+      return {
+        ...step,
+        preview_text: renderPreviewText(
+          step.description_template,
+          normalizedWithBalancedCopy.recipe.coffee_amount,
+          normalizedWithBalancedCopy.recipe.water_amount,
+        ),
+        expressions: extractExpressions(
+          step.description_template,
+          normalizedWithBalancedCopy.recipe.coffee_amount,
+          normalizedWithBalancedCopy.recipe.water_amount,
+        ),
+      };
+    },
+  );
+  const waterNormalizedDraftStepsResult = input.skipDeterministicWaterTotals
+    ? { steps: preparationRenderedDraftSteps, warnings: [] as string[] }
     : convertWaterStepsToRunningTotals({
-      steps: builtDraftSteps,
+      steps: preparationRenderedDraftSteps,
       coffeeAmount: normalizedWithBalancedCopy.recipe.coffee_amount,
       waterAmount: normalizedWithBalancedCopy.recipe.water_amount,
     });
+  const waterNormalizedDraftSteps = waterNormalizedDraftStepsResult.steps;
   const timestampNormalizedDraftSteps = normalizeAbsoluteTimestampDurations({
     steps: waterNormalizedDraftSteps,
-    sourceText: input.sourceText,
+    narrowedText,
+    extractionTotalBrewTimeSeconds: input.extraction.total_brew_time_seconds,
+    detectedInputLanguage: input.detectedInputLanguage,
+    preserveStepCount,
   });
   const totalTargetNormalizedDraftSteps =
-    normalizeVagueBrewDurationsFromTotalTarget(
+    splitDerivedBrewStepDurationsFromTarget(
       {
         steps: timestampNormalizedDraftSteps.steps,
-        sourceText: input.sourceText,
-        brewingMethodId: normalizedWithBalancedCopy.recipe.brewing_method_id,
-        waterAmount: normalizedWithBalancedCopy.recipe.water_amount,
+        narrowedText,
+        extractionTotalBrewTimeSeconds:
+          input.extraction.total_brew_time_seconds,
       },
     );
   const durationNormalizedDraftSteps = enforceMinimumStepDurations({
     steps: totalTargetNormalizedDraftSteps.steps,
   });
-  const draftSteps = durationNormalizedDraftSteps.steps;
+  // F32: runs after every LLM and deterministic transform above (same
+  // "sees exactly what the user would be shown" requirement as G22's own
+  // renderedAmounts build below) and BEFORE verifyAmountProvenance, so G22
+  // verifies the REPAIRED rendering rather than flagging a mismatch this
+  // pass already fixed deterministically.
+  const multiplierRepair = repairExpressionMultipliersAgainstLiteralProvenance(
+    {
+      steps: durationNormalizedDraftSteps.steps,
+      provenance: normalizedWithBalancedCopy.extracted_amounts ?? [],
+      coffeeAmount: normalizedWithBalancedCopy.recipe.coffee_amount,
+      waterAmount: normalizedWithBalancedCopy.recipe.water_amount,
+      requestText: input.requestText,
+    },
+  );
+  const draftSteps = multiplierRepair.steps;
   const brewSteps = draftSteps.filter((step) => step.kind === "brew");
   const brewTimeSeconds = brewSteps.length > 0 &&
       brewSteps.every((step) =>
@@ -3513,24 +5499,136 @@ function finalizeDraftResponse(input: {
     brewingMethodHint: input.brewingMethodHint,
   });
 
+  const missingSourceOnlyFieldWarnings = getMissingSourceOnlyFields({
+    normalized: normalizedWithBalancedCopy,
+    extraction: input.extraction,
+    brewingMethods: input.brewingMethods,
+    brewingMethodHint: input.brewingMethodHint,
+  }).map((field) => SOURCE_ONLY_FIELD_WARNINGS[field]);
+
+  const missingNonEnglishTotalBrewTimeWarnings =
+    buildMissingNonEnglishTotalBrewTimeWarnings({
+      detectedInputLanguage: input.detectedInputLanguage,
+      extractionTotalBrewTimeSeconds: input.extraction.total_brew_time_seconds,
+    });
+
+  // G22: runs AFTER every LLM and deterministic transform above — folding,
+  // running-water-total conversion, timestamp normalization, the duration
+  // split, and minimum-duration enforcement have all already produced
+  // `draftSteps` by this point, so this sees exactly what the user would
+  // be shown. `?? []` guards a caller that bypasses zod's `.default([])`
+  // (every test-provider stub in this repo does, since they hand back a
+  // plain object instead of running it through schema.parse) — without the
+  // guard, a fixture predating this field would crash here instead of
+  // correctly falling into verifyAmountProvenance's `unverified` path.
+  const renderedAmounts = buildRenderedAmountsFromDraftSteps(draftSteps);
+  const provenanceResult = verifyAmountProvenance({
+    requestText: input.requestText,
+    renderedAmounts,
+    provenance: normalizedWithBalancedCopy.extracted_amounts ?? [],
+  });
+
+  // Enforcement is asymmetric by field and mode (plans/009-recipe-draft-
+  // lab-transcript-robustness.md §"G22 — settled design", point 3):
+  //
+  //             | extract mode | verify mode |
+  //   amounts   |    block     |    block    |
+  //   timing    |     warn     |    block    |
+  //
+  // Amounts collapse to a single behaviour regardless of mode: every
+  // finding blocks. Do not special-case `input.mode` here; that would be
+  // under-enforcing verify mode's amounts, which the table above never
+  // asks for.
+  const provenanceIssues: ValidationIssue[] = provenanceResult.findings.map(
+    (finding: ProvenanceFinding) => ({
+      code: finding.code,
+      field: `steps[${finding.step_index}].description_template`,
+      message: finding.message,
+    }),
+  );
+
+  // Compatibility path (provenance.ts's own `unverified` contract): a
+  // provider that ignores extracted_amounts entirely — or a fixture
+  // predating this field — must not become unpublishable the moment this
+  // check landed. Emit exactly one warning and do NOT block.
+  const provenanceWarnings = provenanceResult.unverified
+    ? [
+      "Amount provenance could not be verified: the extraction stage did not report extracted_amounts, so this draft's coffee/water amounts are unconfirmed against the submitted text.",
+    ]
+    : [];
+
+  // G22 — timing landmarks. Unlike amounts, this row of the matrix DOES
+  // vary by mode: extract mode warns only, because Phase B2's deterministic
+  // split computes every unstated duration from the target total and the
+  // recipe's own water amounts — those derived durations never trace to a
+  // source-stated figure BY CONSTRUCTION, and blocking on that would make
+  // every ordinary transcript unpublishable. A stated landmark being
+  // CHANGED is still worth surfacing even in extract mode, which is why it
+  // warns rather than being skipped outright. verify mode blocks, matching
+  // amounts, because verify mode's whole premise is that the source is
+  // already a well-formed recipe and nothing should be silently rewritten.
+  const timingLandmarks = buildTimingLandmarksFromFoldedSteps(
+    preparationRenderedDraftSteps,
+  );
+  const renderedTimingSteps = buildRenderedTimingStepsFromDraftSteps(
+    draftSteps,
+  );
+  const timingResult = verifyTimingProvenance({
+    statedTotalBrewTimeSeconds: input.extraction.total_brew_time_seconds,
+    renderedSteps: renderedTimingSteps,
+    landmarks: timingLandmarks,
+  });
+  const timingValidationIssues: ValidationIssue[] = preserveStepCount
+    ? timingResult.findings.map((finding: TimingProvenanceFinding) => ({
+      code: finding.code,
+      field: finding.step_index >= 0
+        ? `steps[${finding.step_index}].duration_seconds`
+        : "extraction.total_brew_time_seconds",
+      message: finding.message,
+    }))
+    : [];
+  const timingWarnings = preserveStepCount
+    ? []
+    : timingResult.findings.map((finding) => finding.message);
+
   const response: ParseUserRecipeDraftResponse = {
     detected_input_language:
       normalizedWithBalancedCopy.detected_input_language ??
         input.extraction.detected_input_language,
     provider_used: input.providerUsed,
     provider_model_used: input.providerModelUsed,
+    provider_trail: input.providerTrail,
+    // Set by handler.ts after the service.parse_user_recipe_draft_captures
+    // insert completes (or left null if capture wasn't requested, or the
+    // insert failed) — parseDraft itself never writes to the database, so
+    // it cannot know the row id yet.
+    capture_id: null,
+    stage_outputs: input.stageOutputs,
     tokens_used: input.tokensUsed,
     openai_tokens_used: input.openaiTokensUsed,
     warnings: uniqueStrings([
       ...filterDiagnosticNotes(input.extraction.notes),
+      ...foldedDraftSteps.warnings,
+      ...waterNormalizedDraftStepsResult.warnings,
       ...timestampNormalizedDraftSteps.warnings,
       ...totalTargetNormalizedDraftSteps.warnings,
       ...durationNormalizedDraftSteps.warnings,
       ...validation.warnings,
+      ...missingSourceOnlyFieldWarnings,
+      ...missingNonEnglishTotalBrewTimeWarnings,
+      ...multiplierRepair.warnings,
+      ...provenanceWarnings,
+      ...timingWarnings,
     ]),
     validation: {
-      is_publishable: validation.issues.length === 0,
-      issues: validation.issues,
+      is_publishable: validation.issues.length === 0 &&
+        provenanceIssues.length === 0 &&
+        timingValidationIssues.length === 0,
+      issues: [
+        ...validation.issues,
+        ...provenanceIssues,
+        ...timingValidationIssues,
+      ],
     },
     extraction: input.extraction,
     draft: {
@@ -3553,7 +5651,12 @@ function finalizeDraftResponse(input: {
     },
   };
 
-  if (validation.issues.length === 0 && brewTimeSeconds !== null) {
+  if (
+    validation.issues.length === 0 &&
+    provenanceIssues.length === 0 &&
+    timingValidationIssues.length === 0 &&
+    brewTimeSeconds !== null
+  ) {
     response.publish_projection = buildPublishProjection({
       userId: input.userId,
       normalized: normalizedWithBalancedCopy,
@@ -3564,6 +5667,112 @@ function finalizeDraftResponse(input: {
   }
 
   return response;
+}
+
+// F10: most observed provider failures are transient or truncation-shaped
+// rather than a genuine capability gap, so falling through to the next
+// (often weaker) model on the very first failure throws away a model that
+// would likely have succeeded on a second try. This retries the SAME
+// provider exactly once before the caller's own per-provider loop gives up
+// on it and advances to the next provider.
+//
+// Phase E (Task 3): also reports how many attempts it took (1 = succeeded
+// first try, 2 = succeeded on the retry) so callers can populate
+// provider_trail accurately. On failure this function always makes exactly
+// 2 attempts before propagating the second call's error — callers building
+// a trail entry for a caught error can rely on that contract instead of
+// tracking attempts themselves.
+async function invokeProviderStageWithRetry<T>(args: {
+  provider: RecipeDraftAiProvider;
+  invocation: ProviderInvocation<T>;
+  logger: Logger;
+}): Promise<{ result: T; tokensUsed: number; attempts: number }> {
+  try {
+    const outcome = await args.provider.invokeJson<T>(args.invocation);
+    return { ...outcome, attempts: 1 };
+  } catch (firstError) {
+    args.logger.warn(
+      `[parse-user-recipe-draft] ${args.invocation.stage}_retry requestId=${args.invocation.requestId} provider=${args.provider.name} model=${args.provider.model} error=${
+        summarizeError(firstError)
+      }`,
+    );
+    const outcome = await args.provider.invokeJson<T>(args.invocation);
+    return { ...outcome, attempts: 2 };
+  }
+}
+
+// Phase E (Task 3): every provider ATTEMPTED for a stage is used exactly
+// once before either succeeding or being abandoned by
+// invokeProviderStageWithRetry, so a caught error always means exactly
+// STAGE_RETRY_ATTEMPT_COUNT attempts were made.
+const STAGE_RETRY_ATTEMPT_COUNT = 2;
+
+// Stage-capture size guard (required — see the task brief): an unbounded
+// row is a liability once transcripts plus four stages of JSON accumulate,
+// so any single raw_text longer than this is truncated, with the tail
+// replaced by a marker and `truncated: true` set on the entry.
+const STAGE_CAPTURE_MAX_RAW_TEXT_LENGTH = 200_000;
+const STAGE_CAPTURE_TRUNCATION_MARKER = "\n…[truncated for storage]";
+
+function truncateRawTextForCapture(
+  rawText: string,
+): { text: string; truncated: boolean } {
+  if (rawText.length <= STAGE_CAPTURE_MAX_RAW_TEXT_LENGTH) {
+    return { text: rawText, truncated: false };
+  }
+
+  const keepLength = Math.max(
+    0,
+    STAGE_CAPTURE_MAX_RAW_TEXT_LENGTH - STAGE_CAPTURE_TRUNCATION_MARKER.length,
+  );
+  return {
+    text: rawText.slice(0, keepLength) + STAGE_CAPTURE_TRUNCATION_MARKER,
+    truncated: true,
+  };
+}
+
+// Stage-capture (opt-in via capture_stages): builds the onAttempt callback
+// for one provider's invocation(s) within a single stage. `targetArray` is
+// the specific stage's array inside the run's StageOutputs (or null when
+// capture is off, in which case this returns a no-op — zero allocation,
+// zero retention, matching the "zero overhead when off" requirement).
+// `attemptCounter` is threaded in BY REFERENCE (as a single-element array)
+// so it keeps incrementing across every provider this stage tries, not just
+// within one provider's own retries — matching how provider_trail itself
+// accumulates across provider fallback.
+function createStageAttemptRecorder(
+  targetArray: StageCaptureEntry[] | null,
+  attemptCounter: { count: number },
+  provider: { name: string; model: string },
+):
+  | ((info: {
+    rawText: string;
+    finishReason: string | null;
+    parsed: unknown;
+    error: string | null;
+  }) => void)
+  | undefined {
+  if (!targetArray) {
+    return undefined;
+  }
+
+  return (info) => {
+    attemptCounter.count += 1;
+    const { text, truncated } = truncateRawTextForCapture(info.rawText);
+    const entry: StageCaptureEntry = {
+      attempt: attemptCounter.count,
+      provider: provider.name,
+      model: provider.model,
+      finish_reason: info.finishReason,
+      raw_text: text,
+      parsed: info.parsed ?? null,
+      error: info.error,
+    };
+    if (truncated) {
+      entry.truncated = true;
+    }
+    targetArray.push(entry);
+  };
 }
 
 export function createRecipeDraftParser(
@@ -3589,32 +5798,70 @@ export function createRecipeDraftParser(
 
       let totalTokensUsed = 0;
       let openaiTokensUsed = 0;
+      const providerTrail: ProviderTrailEntry[] = [];
+
+      // Stage-capture (opt-in via capture_stages): allocated only when
+      // requested — "zero overhead when off" per the task brief. Each
+      // stage's attempt counter lives in its own ref cell so it can
+      // increment across that stage's own provider fallback loop (and, for
+      // repair, its nested per-provider attempt loop too) without
+      // interfering with the other stages' counters.
+      const stageOutputs: StageOutputs | null = input.captureStages
+        ? { extraction: [], normalization: [], repair: [], cumulative_rewrite: [] }
+        : null;
+      const extractionAttemptCounter = { count: 0 };
+      const normalizationAttemptCounter = { count: 0 };
+      const repairAttemptCounter = { count: 0 };
+      const cumulativeRewriteAttemptCounter = { count: 0 };
 
       let extraction: ExtractionResult | null = null;
       let extractionProviderIndex = -1;
+      let extractionLastError: unknown = null;
 
       for (let index = 0; index < activeProviders.length; index += 1) {
         const provider = activeProviders[index];
         try {
-          const { result, tokensUsed } = await provider.invokeJson<
-            ExtractionResult
-          >({
-            requestId: input.requestId,
-            stage: "extraction",
-            systemPrompt: buildExtractionSystemPrompt(),
-            userPrompt: buildExtractionUserPrompt({
-              text: input.text,
-              brewingMethodHint: input.brewingMethodHint,
-              sourceLanguageHint: input.sourceLanguageHint,
-            }),
-            schema: extractionSchema,
-          });
+          const { result, tokensUsed, attempts } =
+            await invokeProviderStageWithRetry<ExtractionResult>({
+              provider,
+              logger,
+              invocation: {
+                requestId: input.requestId,
+                stage: "extraction",
+                systemPrompt: buildExtractionSystemPrompt(),
+                userPrompt: buildExtractionUserPrompt({
+                  text: input.text,
+                  brewingMethodHint: input.brewingMethodHint,
+                  sourceLanguageHint: input.sourceLanguageHint,
+                }),
+                schema: extractionSchema,
+                maxCompletionTokens: STAGE_MAX_COMPLETION_TOKENS.extraction,
+                onAttempt: createStageAttemptRecorder(
+                  stageOutputs?.extraction ?? null,
+                  extractionAttemptCounter,
+                  provider,
+                ),
+              },
+            });
           extraction = result;
           totalTokensUsed += tokensUsed;
           if (provider.name === "openai") openaiTokensUsed += tokensUsed;
           extractionProviderIndex = index;
+          providerTrail.push({
+            stage: "extraction",
+            provider: provider.name,
+            model: provider.model,
+            attempts,
+          });
           break;
         } catch (error) {
+          extractionLastError = error;
+          providerTrail.push({
+            stage: "extraction",
+            provider: provider.name,
+            model: provider.model,
+            attempts: STAGE_RETRY_ATTEMPT_COUNT,
+          });
           logger.warn(
             `[parse-user-recipe-draft] extraction_failed requestId=${input.requestId} provider=${provider.name} model=${provider.model} error=${
               summarizeError(error)
@@ -3624,40 +5871,79 @@ export function createRecipeDraftParser(
       }
 
       if (!extraction || extractionProviderIndex === -1) {
-        throw new Error("All providers failed during recipe extraction.");
+        throw new Error(
+          `All providers failed during recipe extraction: ${
+            summarizeError(extractionLastError)
+          }`,
+        );
       }
 
       extraction = normalizeExtractionTemperatures(extraction);
 
+      // Phase E (Task 3): the provider that served extraction is pinned and
+      // preferred for every subsequent stage (normalization, repair,
+      // cumulative_rewrite). Each of those stages starts its own walk from
+      // this SAME index — not from wherever the previous stage happened to
+      // land — and only advances past it if the pinned provider exhausts
+      // its retry for that stage. This stops a later stage's fallback
+      // (e.g. normalization dropping to a weaker model) from becoming the
+      // new "current" provider for every stage after it.
+      const pinnedProviderIndex = extractionProviderIndex;
+
       let normalized: NormalizedDraft | null = null;
       let normalizationProviderIndex = -1;
+      let normalizationLastError: unknown = null;
 
       for (
-        let index = extractionProviderIndex;
+        let index = pinnedProviderIndex;
         index < activeProviders.length;
         index += 1
       ) {
         const provider = activeProviders[index];
         try {
-          const { result, tokensUsed } = await provider.invokeJson<
-            NormalizedDraft
-          >({
-            requestId: input.requestId,
-            stage: "normalization",
-            systemPrompt: buildNormalizationSystemPrompt(input.mode ?? "extract"),
-            userPrompt: buildNormalizationUserPrompt({
-              extraction,
-              brewingMethods: input.brewingMethods,
-              brewingMethodHint: input.brewingMethodHint,
-            }),
-            schema: normalizedDraftSchema,
-          });
+          const { result, tokensUsed, attempts } =
+            await invokeProviderStageWithRetry<NormalizedDraft>({
+              provider,
+              logger,
+              invocation: {
+                requestId: input.requestId,
+                stage: "normalization",
+                systemPrompt: buildNormalizationSystemPrompt(
+                  input.mode ?? "extract",
+                ),
+                userPrompt: buildNormalizationUserPrompt({
+                  extraction,
+                  brewingMethods: input.brewingMethods,
+                  brewingMethodHint: input.brewingMethodHint,
+                }),
+                schema: normalizedDraftSchema,
+                maxCompletionTokens: STAGE_MAX_COMPLETION_TOKENS.normalization,
+                onAttempt: createStageAttemptRecorder(
+                  stageOutputs?.normalization ?? null,
+                  normalizationAttemptCounter,
+                  provider,
+                ),
+              },
+            });
           normalized = result;
           totalTokensUsed += tokensUsed;
           if (provider.name === "openai") openaiTokensUsed += tokensUsed;
           normalizationProviderIndex = index;
+          providerTrail.push({
+            stage: "normalization",
+            provider: provider.name,
+            model: provider.model,
+            attempts,
+          });
           break;
         } catch (error) {
+          normalizationLastError = error;
+          providerTrail.push({
+            stage: "normalization",
+            provider: provider.name,
+            model: provider.model,
+            attempts: STAGE_RETRY_ATTEMPT_COUNT,
+          });
           logger.warn(
             `[parse-user-recipe-draft] normalization_failed requestId=${input.requestId} provider=${provider.name} model=${provider.model} error=${
               summarizeError(error)
@@ -3667,7 +5953,11 @@ export function createRecipeDraftParser(
       }
 
       if (!normalized || normalizationProviderIndex === -1) {
-        throw new Error("All providers failed during recipe normalization.");
+        throw new Error(
+          `All providers failed during recipe normalization: ${
+            summarizeError(normalizationLastError)
+          }`,
+        );
       }
 
       normalized = normalizeDraftTemperatures(normalized);
@@ -3676,7 +5966,6 @@ export function createRecipeDraftParser(
         extraction,
       });
 
-      let finalProviderIndex = normalizationProviderIndex;
       const repairFields = uniqueStrings([
         ...getMissingRequiredRepairFields({
           normalized,
@@ -3691,24 +5980,34 @@ export function createRecipeDraftParser(
 
       if (repairFields.length > 0) {
         for (
-          let index = normalizationProviderIndex;
+          let index = pinnedProviderIndex;
           index < activeProviders.length;
           index += 1
         ) {
           const provider = activeProviders[index];
           let repairSucceeded = false;
+          let repairAttemptsMade = 0;
 
           for (
             let attempt = 0;
             attempt < REPAIR_MAX_ATTEMPTS_PER_PROVIDER;
             attempt += 1
           ) {
+            repairAttemptsMade = attempt + 1;
             try {
+              // Note: repair already retries the same provider up to
+              // REPAIR_MAX_ATTEMPTS_PER_PROVIDER times below on ANY error
+              // (transient/truncation or a still-missing-fields semantic
+              // failure) before the outer loop advances to the next
+              // provider, so it does not need invokeProviderStageWithRetry
+              // on top — that would compound into up to 4 attempts.
               const { result: repaired, tokensUsed } = await provider
                 .invokeJson<NormalizedDraft>({
                   requestId: input.requestId,
                   stage: "repair",
-                  systemPrompt: buildRepairSystemPrompt(input.mode ?? "extract"),
+                  systemPrompt: buildRepairSystemPrompt(
+                    input.mode ?? "extract",
+                  ),
                   userPrompt: buildRepairUserPrompt({
                     text: input.text,
                     extraction,
@@ -3718,6 +6017,12 @@ export function createRecipeDraftParser(
                     brewingMethodHint: input.brewingMethodHint,
                   }),
                   schema: normalizedDraftSchema,
+                  maxCompletionTokens: STAGE_MAX_COMPLETION_TOKENS.repair,
+                  onAttempt: createStageAttemptRecorder(
+                    stageOutputs?.repair ?? null,
+                    repairAttemptCounter,
+                    provider,
+                  ),
                 });
               totalTokensUsed += tokensUsed;
               if (provider.name === "openai") openaiTokensUsed += tokensUsed;
@@ -3755,7 +6060,6 @@ export function createRecipeDraftParser(
                   "Missing or malformed fields were repaired after re-reading the original text.",
                 ]),
               };
-              finalProviderIndex = index;
               repairSucceeded = true;
               break;
             } catch (error) {
@@ -3768,6 +6072,13 @@ export function createRecipeDraftParser(
               );
             }
           }
+
+          providerTrail.push({
+            stage: "repair",
+            provider: provider.name,
+            model: provider.model,
+            attempts: repairAttemptsMade,
+          });
 
           if (repairSucceeded) break;
         }
@@ -3793,7 +6104,7 @@ export function createRecipeDraftParser(
         })
       ) {
         for (
-          let index = finalProviderIndex;
+          let index = pinnedProviderIndex;
           index < activeProviders.length;
           index += 1
         ) {
@@ -3802,11 +6113,20 @@ export function createRecipeDraftParser(
             const {
               result: rewritten,
               tokensUsed,
-            }: { result: CumulativeRewriteResult; tokensUsed: number } =
-              await provider.invokeJson<CumulativeRewriteResult>({
+              attempts,
+            }: {
+              result: CumulativeRewriteResult;
+              tokensUsed: number;
+              attempts: number;
+            } = await invokeProviderStageWithRetry<CumulativeRewriteResult>({
+              provider,
+              logger,
+              invocation: {
                 requestId: input.requestId,
                 stage: "cumulative_rewrite",
-                systemPrompt: buildCumulativeRewriteSystemPrompt(input.mode ?? "extract"),
+                systemPrompt: buildCumulativeRewriteSystemPrompt(
+                  input.mode ?? "extract",
+                ),
                 userPrompt: buildCumulativeRewriteUserPrompt({
                   mode: input.mode ?? "extract",
                   detectedInputLanguage,
@@ -3814,7 +6134,15 @@ export function createRecipeDraftParser(
                   draftSteps: provisionalDraftSteps,
                 }),
                 schema: cumulativeRewriteSchema,
-              });
+                maxCompletionTokens:
+                  STAGE_MAX_COMPLETION_TOKENS.cumulative_rewrite,
+                onAttempt: createStageAttemptRecorder(
+                  stageOutputs?.cumulative_rewrite ?? null,
+                  cumulativeRewriteAttemptCounter,
+                  provider,
+                ),
+              },
+            });
             totalTokensUsed += tokensUsed;
             if (provider.name === "openai") openaiTokensUsed += tokensUsed;
 
@@ -3832,18 +6160,45 @@ export function createRecipeDraftParser(
               throw new Error(rewrittenTemplateValidationError);
             }
 
+            // Fix 1 (Aug 2026 live pass): reject any step where
+            // cumulative_rewrite recomputed a RANGE's numeric content
+            // itself (see the function doc above) rather than merely
+            // rewording around an unchanged amount — that recomputation
+            // invents a figure with no traceable provenance record. Falls
+            // back to that one step's pre-rewrite (already-traceable)
+            // template; every other step's legitimate rewrite is kept.
+            const { steps: rangeSafeSteps, warnings: rangeSafeWarnings } =
+              revertUntraceableRangeCumulativeRewrites({
+                original: provisionalDraftSteps,
+                rewritten: rewritten.steps,
+                coffeeAmount: normalized.recipe.coffee_amount,
+                waterAmount: normalized.recipe.water_amount,
+              });
+
             normalized = {
               ...normalized,
               warnings: uniqueStrings([
                 ...normalized.warnings,
                 ...rewritten.warnings,
+                ...rangeSafeWarnings,
               ]),
-              steps: rewritten.steps,
+              steps: rangeSafeSteps,
             };
-            finalProviderIndex = index;
             skipDeterministicWaterTotals = true;
+            providerTrail.push({
+              stage: "cumulative_rewrite",
+              provider: provider.name,
+              model: provider.model,
+              attempts,
+            });
             break;
           } catch (error) {
+            providerTrail.push({
+              stage: "cumulative_rewrite",
+              provider: provider.name,
+              model: provider.model,
+              attempts: STAGE_RETRY_ATTEMPT_COUNT,
+            });
             logger.warn(
               `[parse-user-recipe-draft] cumulative_rewrite_failed requestId=${input.requestId} provider=${provider.name} model=${provider.model} error=${
                 summarizeError(error)
@@ -3853,19 +6208,27 @@ export function createRecipeDraftParser(
         }
       }
 
+      // Phase E (Task 3): provider_used/provider_model_used reflect the
+      // provider that served EXTRACTION — the stage that sets the draft's
+      // substance — not whichever provider a later stage happened to fall
+      // through to. See provider_trail for the full per-stage record.
       return finalizeDraftResponse({
         extraction,
         normalized,
         userId: input.userId,
         brewingMethods: input.brewingMethods,
         brewingMethodHint: input.brewingMethodHint,
-        providerUsed: activeProviders[finalProviderIndex].name,
-        providerModelUsed: activeProviders[finalProviderIndex].model,
+        providerUsed: activeProviders[extractionProviderIndex].name,
+        providerModelUsed: activeProviders[extractionProviderIndex].model,
         tokensUsed: totalTokensUsed,
         openaiTokensUsed,
         skipDeterministicWaterTotals,
-        sourceText: input.text,
         nowMs: now(),
+        detectedInputLanguage,
+        providerTrail,
+        mode: input.mode ?? "extract",
+        requestText: input.text,
+        stageOutputs,
       });
     },
   };

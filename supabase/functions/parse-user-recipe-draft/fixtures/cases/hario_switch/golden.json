@@ -1,0 +1,263 @@
+{
+  "detected_input_language": "en",
+  "provider_used": "groq",
+  "provider_model_used": "groq/fixture",
+  "provider_trail": [
+    {
+      "stage": "extraction",
+      "provider": "groq",
+      "model": "groq/fixture",
+      "attempts": 1
+    },
+    {
+      "stage": "normalization",
+      "provider": "groq",
+      "model": "groq/fixture",
+      "attempts": 1
+    }
+  ],
+  "capture_id": null,
+  "stage_outputs": null,
+  "tokens_used": 0,
+  "openai_tokens_used": 0,
+  "warnings": [
+    "Pre-timer actions were folded into the preparation step.",
+    "Derived brew step durations were split deterministically from the stated total brew time.",
+    "Amount provenance could not be verified: the extraction stage did not report extracted_amounts, so this draft's coffee/water amounts are unconfirmed against the submitted text."
+  ],
+  "validation": {
+    "is_publishable": true,
+    "issues": []
+  },
+  "extraction": {
+    "detected_input_language": "en",
+    "likely_brewing_method": "Hario Switch",
+    "name": "Hario Switch 20:260",
+    "short_description": "Immersion-then-drain Switch recipe with pre-timer fill and dose",
+    "grind_size": "Medium",
+    "water_temp_celsius": 94,
+    "coffee_amount_grams": 20,
+    "water_amount": 260,
+    "preparation": "Rinse the filter with hot water and close the switch so it's in immersion mode.",
+    "steps": [
+      {
+        "title": null,
+        "raw_text": "Rinse the filter with hot water and close the switch so it's in immersion mode.",
+        "duration_seconds": 0,
+        "elapsed_seconds": null,
+        "starts_timer": false,
+        "duration_is_stated": false,
+        "scalable_amounts": [],
+        "step_role": "preparation"
+      },
+      {
+        "title": null,
+        "raw_text": "Fill the brewer with 260 grams of water at around 94 degrees.",
+        "duration_seconds": 20,
+        "elapsed_seconds": null,
+        "starts_timer": false,
+        "duration_is_stated": false,
+        "scalable_amounts": [
+          {
+            "value": 260,
+            "unit": "g"
+          }
+        ],
+        "step_role": null
+      },
+      {
+        "title": null,
+        "raw_text": "Add your 20 grams of coffee straight into the water.",
+        "duration_seconds": 15,
+        "elapsed_seconds": null,
+        "starts_timer": false,
+        "duration_is_stated": false,
+        "scalable_amounts": [
+          {
+            "value": 20,
+            "unit": "g"
+          }
+        ],
+        "step_role": null
+      },
+      {
+        "title": null,
+        "raw_text": "We're gonna start the timer when we start our stir, so give it a good stir right as you hit start.",
+        "duration_seconds": 40,
+        "elapsed_seconds": 0,
+        "starts_timer": true,
+        "duration_is_stated": false,
+        "scalable_amounts": [],
+        "step_role": "stir"
+      },
+      {
+        "title": null,
+        "raw_text": "At the 40 second mark, open the switch and let it start draining into the cup below.",
+        "duration_seconds": 5,
+        "elapsed_seconds": null,
+        "starts_timer": false,
+        "duration_is_stated": false,
+        "scalable_amounts": [],
+        "step_role": null
+      },
+      {
+        "title": null,
+        "raw_text": "Let it fully steep and drain until about 1:25, then pull the Switch off the cup and you're done.",
+        "duration_seconds": 40,
+        "elapsed_seconds": null,
+        "starts_timer": false,
+        "duration_is_stated": false,
+        "scalable_amounts": [],
+        "step_role": "drawdown"
+      }
+    ],
+    "notes": [],
+    "total_brew_time_seconds": null
+  },
+  "draft": {
+    "recipe": {
+      "brewing_method_id": "hario_switch",
+      "coffee_amount": 20,
+      "water_amount": 260,
+      "water_temp": 94,
+      "brew_time_seconds": 85,
+      "vendor_id": "usr-800792ab-c2ef-49f3-8d6a-c5dceaf71459"
+    },
+    "localization": {
+      "locale": "en",
+      "name": "Hario Switch 20:260",
+      "grind_size": "Medium",
+      "short_description": "Immersion-then-drain Switch recipe with pre-timer fill and dose"
+    },
+    "steps": [
+      {
+        "step_order": 1,
+        "kind": "preparation",
+        "description_source": "Rinse the filter with hot water and close the switch so it's in immersion mode. Fill the brewer with 260 grams of water at around 94 degrees. Add your 20 grams of coffee straight into the water.",
+        "description_template": "Rinse the filter with hot water and close the switch so it's in immersion mode. Fill the brewer with (1 x <final_water_amount>)g of water at around 94 degrees. Add your (1 x <final_coffee_amount>)g of coffee straight into the water.",
+        "preview_text": "Rinse the filter with hot water and close the switch so it's in immersion mode. Fill the brewer with 260g of water at around 94 degrees. Add your 20g of coffee straight into the water.",
+        "duration_seconds": 0,
+        "elapsed_seconds": null,
+        "starts_timer": false,
+        "duration_is_stated": false,
+        "scalable_amounts": [],
+        "step_role": "preparation",
+        "expressions": [
+          {
+            "placeholder": "<final_water_amount>",
+            "multiplier": 1,
+            "unit": "g",
+            "preview_value": 260
+          },
+          {
+            "placeholder": "<final_coffee_amount>",
+            "multiplier": 1,
+            "unit": "g",
+            "preview_value": 20
+          }
+        ]
+      },
+      {
+        "step_order": 2,
+        "kind": "brew",
+        "description_source": "We're gonna start the timer when we start our stir, so give it a good stir right as you hit start.",
+        "description_template": "We're gonna start the timer when we start our stir, so give it a good stir right as you hit start.",
+        "preview_text": "We're gonna start the timer when we start our stir, so give it a good stir right as you hit start.",
+        "duration_seconds": 40,
+        "elapsed_seconds": 0,
+        "starts_timer": true,
+        "duration_is_stated": false,
+        "scalable_amounts": [],
+        "step_role": "stir",
+        "expressions": []
+      },
+      {
+        "step_order": 3,
+        "kind": "brew",
+        "description_source": "At the 40 second mark, open the switch and let it start draining into the cup below.",
+        "description_template": "At the 40 second mark, open the switch and let it start draining into the cup below.",
+        "preview_text": "At the 40 second mark, open the switch and let it start draining into the cup below.",
+        "duration_seconds": 15,
+        "elapsed_seconds": null,
+        "starts_timer": false,
+        "duration_is_stated": false,
+        "scalable_amounts": [],
+        "step_role": null,
+        "expressions": []
+      },
+      {
+        "step_order": 4,
+        "kind": "brew",
+        "description_source": "Let it fully steep and drain until about 1:25, then pull the Switch off the cup and you're done.",
+        "description_template": "Let it fully steep and drain until about 1:25, then pull the Switch off the cup and you're done.",
+        "preview_text": "Let it fully steep and drain until about 1:25, then pull the Switch off the cup and you're done.",
+        "duration_seconds": 30,
+        "elapsed_seconds": null,
+        "starts_timer": false,
+        "duration_is_stated": false,
+        "scalable_amounts": [],
+        "step_role": "drawdown",
+        "expressions": []
+      }
+    ]
+  },
+  "publish_projection": {
+    "user_recipe": {
+      "id": "usr-800792ab-c2ef-49f3-8d6a-c5dceaf71459-1776000000000",
+      "brewing_method_id": "hario_switch",
+      "coffee_amount": 20,
+      "water_amount": 260,
+      "water_temp": 94,
+      "brew_time": 85,
+      "vendor_id": "usr-800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+      "last_modified": "2026-04-12T13:20:00.000Z",
+      "import_id": null,
+      "is_imported": false,
+      "ispublic": false,
+      "is_deleted": false,
+      "needs_moderation_review": false
+    },
+    "user_recipe_localization": {
+      "id": "<random-uuid>",
+      "recipe_id": "usr-800792ab-c2ef-49f3-8d6a-c5dceaf71459-1776000000000",
+      "locale": "en",
+      "name": "Hario Switch 20:260",
+      "grind_size": "Medium",
+      "short_description": "Immersion-then-drain Switch recipe with pre-timer fill and dose"
+    },
+    "user_steps": [
+      {
+        "id": "<random-uuid>",
+        "recipe_id": "usr-800792ab-c2ef-49f3-8d6a-c5dceaf71459-1776000000000",
+        "step_order": 1,
+        "description": "Rinse the filter with hot water and close the switch so it's in immersion mode. Fill the brewer with (1 x <final_water_amount>)g of water at around 94 degrees. Add your (1 x <final_coffee_amount>)g of coffee straight into the water.",
+        "time": "0",
+        "locale": "en"
+      },
+      {
+        "id": "<random-uuid>",
+        "recipe_id": "usr-800792ab-c2ef-49f3-8d6a-c5dceaf71459-1776000000000",
+        "step_order": 2,
+        "description": "We're gonna start the timer when we start our stir, so give it a good stir right as you hit start.",
+        "time": "40",
+        "locale": "en"
+      },
+      {
+        "id": "<random-uuid>",
+        "recipe_id": "usr-800792ab-c2ef-49f3-8d6a-c5dceaf71459-1776000000000",
+        "step_order": 3,
+        "description": "At the 40 second mark, open the switch and let it start draining into the cup below.",
+        "time": "15",
+        "locale": "en"
+      },
+      {
+        "id": "<random-uuid>",
+        "recipe_id": "usr-800792ab-c2ef-49f3-8d6a-c5dceaf71459-1776000000000",
+        "step_order": 4,
+        "description": "Let it fully steep and drain until about 1:25, then pull the Switch off the cup and you're done.",
+        "time": "30",
+        "locale": "en"
+      }
+    ]
+  }
+}

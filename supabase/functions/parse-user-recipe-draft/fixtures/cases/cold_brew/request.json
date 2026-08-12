@@ -1,0 +1,22 @@
+{
+  "userId": "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+  "brewingMethods": [
+    {
+      "brewing_method_id": "french_press",
+      "brewing_method": "French Press"
+    },
+    {
+      "brewing_method_id": "v60",
+      "brewing_method": "Hario V60"
+    },
+    {
+      "brewing_method_id": "chemex",
+      "brewing_method": "Chemex"
+    },
+    {
+      "brewing_method_id": "aeropress",
+      "brewing_method": "AeroPress"
+    }
+  ],
+  "requestId": "req-fixture-cold-brew"
+}

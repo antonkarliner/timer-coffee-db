@@ -1,0 +1,88 @@
+{
+  "detected_input_language": "de",
+  "warnings": [],
+  "recipe": {
+    "brewing_method_id": "v60",
+    "brewing_method_confidence": "high",
+    "coffee_amount": 22,
+    "water_amount": 325,
+    "water_temp": 92
+  },
+  "localization": {
+    "name": "V60 Rezept fuer Zuhause",
+    "grind_size": "Mittelfein",
+    "short_description": "Deutsches Rezept mit Dosis-, Wassermengen- und Bruehzeit-Bereichen"
+  },
+  "steps": [
+    {
+      "kind": "preparation",
+      "description_source": "Zuerst den Filter falten, in den Dripper einsetzen und mit ca. 92 Grad heissem Wasser vorspuelen, damit kein Papiergeschmack ins Rezept kommt. Den Kaffee mittelfein mahlen und in den Filter geben.",
+      "description_template": "Zuerst den Filter falten, in den Dripper einsetzen und mit ca. 92 Grad heissem Wasser vorspuelen, damit kein Papiergeschmack ins Rezept kommt. Den Kaffee mittelfein mahlen und in den Filter geben.",
+      "duration_seconds": 0,
+      "elapsed_seconds": null,
+      "starts_timer": false,
+      "duration_is_stated": false,
+      "scalable_amounts": [],
+      "step_role": "preparation"
+    },
+    {
+      "kind": "brew",
+      "description_source": "Nun mit 25g Wasser aufgiessen, das ist der Bloom, und 30 Sekunden quellen lassen.",
+      "description_template": "Nun mit 25g Wasser aufgiessen, das ist der Bloom, und 30 Sekunden quellen lassen.",
+      "duration_seconds": 30,
+      "elapsed_seconds": null,
+      "starts_timer": true,
+      "duration_is_stated": true,
+      "scalable_amounts": [
+        {
+          "value": 25,
+          "unit": "g"
+        }
+      ],
+      "step_role": "bloom"
+    },
+    {
+      "kind": "brew",
+      "description_source": "Bei 30 Sekunden langsam im Kreis bis 175g giessen.",
+      "description_template": "Bei 30 Sekunden langsam im Kreis bis 175g giessen.",
+      "duration_seconds": 30,
+      "elapsed_seconds": 30,
+      "starts_timer": false,
+      "duration_is_stated": false,
+      "scalable_amounts": [
+        {
+          "value": 175,
+          "unit": "g"
+        }
+      ],
+      "step_role": "pour"
+    },
+    {
+      "kind": "brew",
+      "description_source": "Nach einer Minute auf 300g auffuellen.",
+      "description_template": "Nach einer Minute auf 300g auffuellen.",
+      "duration_seconds": 25,
+      "elapsed_seconds": 60,
+      "starts_timer": false,
+      "duration_is_stated": false,
+      "scalable_amounts": [
+        {
+          "value": 300,
+          "unit": "g"
+        }
+      ],
+      "step_role": "pour"
+    },
+    {
+      "kind": "brew",
+      "description_source": "Vollstaendig durchlaufen lassen.",
+      "description_template": "Vollstaendig durchlaufen lassen.",
+      "duration_seconds": 5,
+      "elapsed_seconds": null,
+      "starts_timer": false,
+      "duration_is_stated": false,
+      "scalable_amounts": [],
+      "step_role": "drawdown"
+    }
+  ]
+}

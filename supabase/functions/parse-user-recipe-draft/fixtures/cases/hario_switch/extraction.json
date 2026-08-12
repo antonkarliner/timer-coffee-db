@@ -1,0 +1,85 @@
+{
+  "detected_input_language": "en",
+  "likely_brewing_method": "Hario Switch",
+  "name": "Hario Switch 20:260",
+  "short_description": "Immersion-then-drain Switch recipe with pre-timer fill and dose",
+  "grind_size": "Medium",
+  "water_temp_celsius": 94,
+  "coffee_amount_grams": 20,
+  "water_amount": 260,
+  "preparation": "Rinse the filter with hot water and close the switch so it's in immersion mode.",
+  "steps": [
+    {
+      "title": null,
+      "raw_text": "Rinse the filter with hot water and close the switch so it's in immersion mode.",
+      "duration_seconds": 0,
+      "elapsed_seconds": null,
+      "starts_timer": false,
+      "duration_is_stated": false,
+      "scalable_amounts": [],
+      "step_role": "preparation"
+    },
+    {
+      "title": null,
+      "raw_text": "Fill the brewer with 260 grams of water at around 94 degrees.",
+      "duration_seconds": 20,
+      "elapsed_seconds": null,
+      "starts_timer": false,
+      "duration_is_stated": false,
+      "scalable_amounts": [
+        {
+          "value": 260,
+          "unit": "g"
+        }
+      ],
+      "step_role": null
+    },
+    {
+      "title": null,
+      "raw_text": "Add your 20 grams of coffee straight into the water.",
+      "duration_seconds": 15,
+      "elapsed_seconds": null,
+      "starts_timer": false,
+      "duration_is_stated": false,
+      "scalable_amounts": [
+        {
+          "value": 20,
+          "unit": "g"
+        }
+      ],
+      "step_role": null
+    },
+    {
+      "title": null,
+      "raw_text": "We're gonna start the timer when we start our stir, so give it a good stir right as you hit start.",
+      "duration_seconds": 40,
+      "elapsed_seconds": 0,
+      "starts_timer": true,
+      "duration_is_stated": false,
+      "scalable_amounts": [],
+      "step_role": "stir"
+    },
+    {
+      "title": null,
+      "raw_text": "At the 40 second mark, open the switch and let it start draining into the cup below.",
+      "duration_seconds": 5,
+      "elapsed_seconds": null,
+      "starts_timer": false,
+      "duration_is_stated": false,
+      "scalable_amounts": [],
+      "step_role": null
+    },
+    {
+      "title": null,
+      "raw_text": "Let it fully steep and drain until about 1:25, then pull the Switch off the cup and you're done.",
+      "duration_seconds": 40,
+      "elapsed_seconds": null,
+      "starts_timer": false,
+      "duration_is_stated": false,
+      "scalable_amounts": [],
+      "step_role": "drawdown"
+    }
+  ],
+  "notes": [],
+  "total_brew_time_seconds": null
+}

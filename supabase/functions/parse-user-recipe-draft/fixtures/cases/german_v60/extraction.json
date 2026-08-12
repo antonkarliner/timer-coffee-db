@@ -1,0 +1,80 @@
+{
+  "detected_input_language": "de",
+  "likely_brewing_method": "V60",
+  "name": "V60 Rezept fuer Zuhause",
+  "short_description": "Deutsches Rezept mit Dosis-, Wassermengen- und Bruehzeit-Bereichen",
+  "grind_size": "Mittelfein",
+  "water_temp_celsius": 92,
+  "coffee_amount_grams": 22,
+  "water_amount": 325,
+  "preparation": "Zuerst den Filter falten, in den Dripper einsetzen und mit ca. 92 Grad heissem Wasser vorspuelen, damit kein Papiergeschmack ins Rezept kommt. Den Kaffee mittelfein mahlen und in den Filter geben.",
+  "steps": [
+    {
+      "title": null,
+      "raw_text": "Zuerst den Filter falten, in den Dripper einsetzen und mit ca. 92 Grad heissem Wasser vorspuelen, damit kein Papiergeschmack ins Rezept kommt. Den Kaffee mittelfein mahlen und in den Filter geben.",
+      "duration_seconds": 0,
+      "elapsed_seconds": null,
+      "starts_timer": false,
+      "duration_is_stated": false,
+      "scalable_amounts": [],
+      "step_role": "preparation"
+    },
+    {
+      "title": null,
+      "raw_text": "Nun mit 25g Wasser aufgiessen, das ist der Bloom, und 30 Sekunden quellen lassen.",
+      "duration_seconds": 30,
+      "elapsed_seconds": null,
+      "starts_timer": true,
+      "duration_is_stated": true,
+      "scalable_amounts": [
+        {
+          "value": 25,
+          "unit": "g"
+        }
+      ],
+      "step_role": "bloom"
+    },
+    {
+      "title": null,
+      "raw_text": "Bei 30 Sekunden langsam im Kreis bis 175g giessen.",
+      "duration_seconds": 30,
+      "elapsed_seconds": 30,
+      "starts_timer": false,
+      "duration_is_stated": false,
+      "scalable_amounts": [
+        {
+          "value": 175,
+          "unit": "g"
+        }
+      ],
+      "step_role": "pour"
+    },
+    {
+      "title": null,
+      "raw_text": "Nach einer Minute auf 300g auffuellen.",
+      "duration_seconds": 25,
+      "elapsed_seconds": 60,
+      "starts_timer": false,
+      "duration_is_stated": false,
+      "scalable_amounts": [
+        {
+          "value": 300,
+          "unit": "g"
+        }
+      ],
+      "step_role": "pour"
+    },
+    {
+      "title": null,
+      "raw_text": "Vollstaendig durchlaufen lassen.",
+      "duration_seconds": 5,
+      "elapsed_seconds": null,
+      "starts_timer": false,
+      "duration_is_stated": false,
+      "scalable_amounts": [],
+      "step_role": "drawdown"
+    }
+  ],
+  "notes": [],
+  "total_brew_time_seconds": 180
+}

@@ -200,8 +200,26 @@ const GENERIC_PREPARATION_PLACEHOLDERS = new Set([
   "klargøring",
   "valmistelu",
   "klargjøring",
+  // Defect 2 (Aug 2026 live pass): Arabic, Chinese (simplified — "準備"
+  // above already covers traditional Chinese, shared with Japanese), and
+  // Hebrew were missing entirely, so a step like the Arabic
+  // "الإعداد: Filter einlegen und Dripper vorbereiten." was not recognized
+  // as a generic-preparation placeholder at all and its dropped prefix
+  // was never restored (see matchGenericPreparationPrefix below).
+  "الإعداد",
+  "إعداد",
+  "تحضير",
+  "准备",
+  "הכנה",
   "",
 ]);
+
+// Defect 2 (Aug 2026 live pass): matches punctuation/whitespace that can
+// separate a generic-preparation placeholder word from real content that
+// follows it (e.g. "الإعداد: Filter einlegen..." or "準備：フィルターを..."),
+// covering both ASCII and fullwidth/CJK punctuation.
+const GENERIC_PREPARATION_PREFIX_SEPARATOR_REGEX =
+  /^[\s:：、,，\-–—]+/;
 
 function containsTokenIgnoringCase(text: string, token: string): boolean {
   if (!token) return false;
@@ -210,6 +228,61 @@ function containsTokenIgnoringCase(text: string, token: string): boolean {
 
 function inputContainsAnyToken(text: string, tokens: string[]): boolean {
   return tokens.some((token) => containsTokenIgnoringCase(text, token));
+}
+
+// Defect 2 (Aug 2026 live pass): previously this only matched the WHOLE
+// input string against GENERIC_PREPARATION_PLACEHOLDERS, so a placeholder
+// word followed by real content (a prefix, not the whole string) was never
+// recognized and its dropped prefix was never restored — the AI model's
+// correctly-preserved German content came back with the Arabic "الإعداد: "
+// label silently missing. This checks for the placeholder as either the
+// WHOLE trimmed input (hasRealContent: false — the original whole-string
+// case) or a PREFIX of it followed by a separator and further content
+// (hasRealContent: true). `toLowerCase()` is a no-op for scripts with no
+// case concept (Arabic, Hebrew, Chinese, Korean, Japanese) and only
+// affects the Latin/Cyrillic-alphabet entries above, so this is safe
+// across every placeholder in the set.
+function matchGenericPreparationPrefix(
+  text: string,
+): { prefixLength: number; hasRealContent: boolean } | null {
+  const trimmed = text.trim();
+  const lowerTrimmed = trimmed.toLowerCase();
+
+  // Longest-first so a longer placeholder (e.g. "préparation") is matched
+  // in full rather than stopping at a shorter placeholder that happens to
+  // be one of its prefixes (e.g. "prepara").
+  const sortedPlaceholders = [...GENERIC_PREPARATION_PLACEHOLDERS]
+    .filter((placeholder) => placeholder.length > 0)
+    .sort((left, right) => right.length - left.length);
+
+  for (const placeholder of sortedPlaceholders) {
+    const lowerPlaceholder = placeholder.toLowerCase();
+    if (!lowerTrimmed.startsWith(lowerPlaceholder)) {
+      continue;
+    }
+
+    const remainder = trimmed.slice(placeholder.length);
+    if (remainder.length === 0) {
+      return { prefixLength: placeholder.length, hasRealContent: false };
+    }
+
+    const separatorMatch = remainder.match(
+      GENERIC_PREPARATION_PREFIX_SEPARATOR_REGEX,
+    );
+    if (!separatorMatch) {
+      continue;
+    }
+
+    const contentStart = separatorMatch[0].length;
+    if (remainder.slice(contentStart).trim().length > 0) {
+      return {
+        prefixLength: placeholder.length + contentStart,
+        hasRealContent: true,
+      };
+    }
+  }
+
+  return null;
 }
 
 function revertLossyRewrites(
@@ -247,10 +320,15 @@ function revertLossyRewrites(
       COFFEE_NOUN_TOKENS,
     );
 
-    const trimmedLowerInput = inputDescription.trim().toLowerCase();
-    const inputIsGenericPreparation = inputStep.order === 1 &&
-      GENERIC_PREPARATION_PLACEHOLDERS.has(trimmedLowerInput);
-    const preparationWasRewritten = inputIsGenericPreparation &&
+    const preparationPrefixMatch = inputStep.order === 1
+      ? matchGenericPreparationPrefix(inputDescription)
+      : null;
+
+    // A BARE generic-preparation placeholder (no real content of its own,
+    // e.g. input "Preparation") is entirely hallucinated if the model
+    // changed it at all — revert the whole step, exactly as before.
+    const preparationWasRewritten = preparationPrefixMatch !== null &&
+      !preparationPrefixMatch.hasRealContent &&
       outputDescription.trim() !== inputDescription.trim();
 
     const lostRange = inputHasRange && !outputHasRange;
@@ -262,6 +340,140 @@ function revertLossyRewrites(
       lostWaterNoun ||
       lostCoffeeNoun ||
       preparationWasRewritten
+    ) {
+      outputStep.description_template = inputDescription;
+      outputStep.preview_text = inputDescription;
+      continue;
+    }
+
+    // Defect 2 (Aug 2026 live pass): a generic-preparation-word PREFIX
+    // followed by real content (e.g. the Arabic "الإعداد: Filter
+    // einlegen...") must keep that prefix even when the model otherwise
+    // correctly preserved the real content — restore only the missing
+    // prefix instead of rejecting the whole (correctly-handled) step.
+    if (preparationPrefixMatch?.hasRealContent) {
+      const prefix = inputDescription.trim().slice(
+        0,
+        preparationPrefixMatch.prefixLength,
+      );
+      const outputTrimmed = outputDescription.trim();
+      const outputAlreadyHasPrefix = outputTrimmed
+        .toLowerCase()
+        .startsWith(prefix.toLowerCase());
+
+      if (!outputAlreadyHasPrefix) {
+        // `prefix` already carries whatever separator (and its own
+        // whitespace, if any) the ORIGINAL input used — e.g. ": " for the
+        // Arabic case above, but no space at all after the fullwidth "："
+        // in a Chinese "准备：..." input, since CJK punctuation
+        // conventionally has none. Concatenate directly rather than
+        // inserting an extra space, so the restored prefix matches the
+        // source's own formatting instead of a Latin-punctuation default.
+        const restored = `${prefix}${outputTrimmed}`;
+        outputStep.description_template = restored;
+        outputStep.preview_text = restored;
+      }
+    }
+  }
+}
+
+// Defect (Aug 2026 live 4-step verify run, see plans/009 §"Live browser
+// robustness regression" and plans/012): a live request kept its step count
+// (4 in, 4 out) and none of the lossy-rewrite guards above fired — no range,
+// water noun, coffee noun, or preparation placeholder was lost — yet the
+// model still rewrote wording verify mode's prompt told it to preserve
+// verbatim. Step 3 lost its leading elapsed-time landmark "At 0:45," and
+// amount spacing was reflowed ("50 g" -> "50g", "300 g" -> "300g"). Those two
+// changes are different in kind: reflowing the space between a number and
+// its unit is cosmetic (the amount is still correct and legible), but
+// dropping "At 0:45," deletes information the source explicitly stated —
+// when in the brew to perform the pour — which a timer app cannot recover.
+//
+// This guard masks out amount tokens (both plain literal amounts like
+// "300g"/"300 g" and the parser's own scalable expressions like
+// "(0.2 x <final_water_amount>)g") from both the submitted description and
+// the corrected template before comparing them, so legitimate amount
+// templating and cosmetic unit-spacing changes never trip it. Any OTHER
+// wording difference — a dropped clause, a reordered phrase, a deleted
+// timing landmark — still does, and is reverted to the submitted text, the
+// same remedy already used by revertLossyRewrites above. A per-step revert
+// was chosen over a whole-draft rejection: it is the treatment already
+// established for the other lossy-rewrite cases, and blocking the entire
+// draft would discard correctly-preserved steps to punish a fault localized
+// to one step. It was chosen over a warning-only response because
+// `is_publishable: true` and low-visibility warnings are exactly how this
+// defect shipped silently in the first place — verify mode's contract is
+// that nothing gets silently rewritten, so the fix must not depend on
+// anyone reading a warning.
+const AMOUNT_UNIT_TOKENS = [
+  "milliliters",
+  "milliliter",
+  "millilitres",
+  "millilitre",
+  "grammes",
+  "gramme",
+  "grams",
+  "gram",
+  "liters",
+  "liter",
+  "litres",
+  "litre",
+  "ounces",
+  "ounce",
+  "onces",
+  "once",
+  "kg",
+  "ml",
+  "oz",
+  "gr",
+  "g",
+  "l",
+];
+
+// Mirrors the shape of the scalable expressions parser.ts emits, e.g.
+// "(0.24 x <final_water_amount>)g" — matched and masked as a single unit so
+// legitimate literal-to-expression templating never trips the drift check.
+const SCALABLE_EXPRESSION_MASK_REGEX =
+  /\(\s*[\d.]+\s*(?:x|×)\s*<final_(?:coffee|water)_amount>\s*\)\s*[^\s()<>]*/gi;
+
+// Longest-unit-first so an alternation match like "gr" or "gram" is taken in
+// full rather than stopping at the shorter "g" that happens to prefix it.
+const LITERAL_AMOUNT_MASK_REGEX = new RegExp(
+  `\\d+(?:\\.\\d+)?\\s*(?:${
+    AMOUNT_UNIT_TOKENS.join("|")
+  })(?=$|[\\s,.;:!?)]|\\b)`,
+  "giu",
+);
+
+// A private-use-area character: essentially guaranteed not to collide with
+// real recipe text, so masking never accidentally creates a spurious match.
+const AMOUNT_MASK_TOKEN = "";
+
+function maskAmountsForDriftComparison(text: string): string {
+  return text
+    .replace(SCALABLE_EXPRESSION_MASK_REGEX, AMOUNT_MASK_TOKEN)
+    .replace(LITERAL_AMOUNT_MASK_REGEX, AMOUNT_MASK_TOKEN)
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function revertNonAmountWordingDrift(
+  request: VerifyUserRecipeDraftRequest,
+  result: ParseUserRecipeDraftResponse,
+): void {
+  if (result.draft.steps.length !== request.steps.length) {
+    return;
+  }
+
+  for (let index = 0; index < result.draft.steps.length; index += 1) {
+    const inputStep = request.steps[index];
+    const outputStep = result.draft.steps[index];
+    const inputDescription = inputStep.description;
+    const outputDescription = outputStep.description_template;
+
+    if (
+      maskAmountsForDriftComparison(inputDescription) !==
+        maskAmountsForDriftComparison(outputDescription)
     ) {
       outputStep.description_template = inputDescription;
       outputStep.preview_text = inputDescription;
@@ -400,6 +612,7 @@ export function createVerifyUserRecipeDraftHandler(
       });
 
       revertLossyRewrites(parsedBody, result);
+      revertNonAmountWordingDrift(parsedBody, result);
 
       const correctedSteps = mapCorrectedSteps(parsedBody, result);
       if (!correctedSteps) {

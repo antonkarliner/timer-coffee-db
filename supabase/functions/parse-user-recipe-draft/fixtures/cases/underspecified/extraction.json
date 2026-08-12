@@ -1,0 +1,47 @@
+{
+  "detected_input_language": "en",
+  "likely_brewing_method": null,
+  "name": "Eyeball It Pour Over",
+  "short_description": "No measurements stated -- coffee, water, and method are all left to feel",
+  "grind_size": "Medium",
+  "water_temp_celsius": null,
+  "coffee_amount_grams": null,
+  "water_amount": null,
+  "preparation": "Honestly, I never really measure anything, I just kind of eyeball it every time, so don't come at me for exact numbers here. Grind it somewhere in the middle, not too fine, not too coarse, whatever feels right for your grinder.",
+  "steps": [
+    {
+      "title": null,
+      "raw_text": "Honestly, I never really measure anything, I just kind of eyeball it every time, so don't come at me for exact numbers here. Grind it somewhere in the middle, not too fine, not too coarse, whatever feels right for your grinder.",
+      "duration_seconds": 0,
+      "elapsed_seconds": null,
+      "starts_timer": false,
+      "duration_is_stated": false,
+      "scalable_amounts": [],
+      "step_role": "preparation"
+    },
+    {
+      "title": null,
+      "raw_text": "Get your water hot, pour a splash over the grounds to wet everything, wait a bit for it to settle, and then just keep pouring in stages until it looks about right to you.",
+      "duration_seconds": 30,
+      "elapsed_seconds": null,
+      "starts_timer": false,
+      "duration_is_stated": false,
+      "scalable_amounts": [],
+      "step_role": null
+    },
+    {
+      "title": null,
+      "raw_text": "Once it's done dripping through, you're good to go.",
+      "duration_seconds": 10,
+      "elapsed_seconds": null,
+      "starts_timer": false,
+      "duration_is_stated": false,
+      "scalable_amounts": [],
+      "step_role": "drawdown"
+    }
+  ],
+  "notes": [
+    "Source gives no coffee amount, water amount, water temperature, or brewing method -- every quantity is described only qualitatively."
+  ],
+  "total_brew_time_seconds": null
+}

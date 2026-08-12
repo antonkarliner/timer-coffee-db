@@ -1,0 +1,284 @@
+{
+  "detected_input_language": "en",
+  "provider_used": "groq",
+  "provider_model_used": "groq/fixture",
+  "provider_trail": [
+    {
+      "stage": "extraction",
+      "provider": "groq",
+      "model": "groq/fixture",
+      "attempts": 1
+    },
+    {
+      "stage": "normalization",
+      "provider": "groq",
+      "model": "groq/fixture",
+      "attempts": 1
+    }
+  ],
+  "capture_id": null,
+  "stage_outputs": null,
+  "tokens_used": 0,
+  "openai_tokens_used": 0,
+  "warnings": [
+    "Derived brew step durations were split deterministically from the stated total brew time.",
+    "Amount provenance could not be verified: the extraction stage did not report extracted_amounts, so this draft's coffee/water amounts are unconfirmed against the submitted text."
+  ],
+  "validation": {
+    "is_publishable": true,
+    "issues": []
+  },
+  "extraction": {
+    "detected_input_language": "en",
+    "likely_brewing_method": "Chemex",
+    "name": "Chemex 60g/L Half Liter",
+    "short_description": "Commentary-heavy Chemex transcript with filter-weight trivia",
+    "grind_size": "Medium-coarse",
+    "water_temp_celsius": 96,
+    "coffee_amount_grams": 30,
+    "water_amount": 500,
+    "preparation": "Quick aside on filters -- a Chemex filter is noticeably heavier than a normal V60 filter, it actually weighs about 4.5 grams dry versus around 1.5 grams for a Hario paper, which is part of why the Chemex cup comes out so clean. Fold the filter, rinse it with hot water, and dose in 30 grams of coffee.",
+    "steps": [
+      {
+        "title": null,
+        "raw_text": "Quick aside on filters -- a Chemex filter is noticeably heavier than a normal V60 filter, it actually weighs about 4.5 grams dry versus around 1.5 grams for a Hario paper, which is part of why the Chemex cup comes out so clean. Fold the filter, rinse it with hot water, and dose in 30 grams of coffee.",
+        "duration_seconds": 0,
+        "elapsed_seconds": null,
+        "starts_timer": false,
+        "duration_is_stated": false,
+        "scalable_amounts": [
+          {
+            "value": 30,
+            "unit": "g"
+          }
+        ],
+        "step_role": "preparation"
+      },
+      {
+        "title": null,
+        "raw_text": "In terms of the bloom, do exactly as the V60: 60 to 90 grams of bloom water, and let that bloom for at least 45 seconds.",
+        "duration_seconds": 45,
+        "elapsed_seconds": null,
+        "starts_timer": true,
+        "duration_is_stated": true,
+        "scalable_amounts": [
+          {
+            "value": 60,
+            "unit": "g"
+          },
+          {
+            "value": 90,
+            "unit": "g"
+          }
+        ],
+        "step_role": "bloom"
+      },
+      {
+        "title": null,
+        "raw_text": "Once the bloom settles, start pouring in slow concentric circles, pretty controlled, maybe 3 grams a second, avoiding the filter walls, until you reach the full 500 grams. You're gonna have four to five minute brew times brewing half a liter with the Chemex.",
+        "duration_seconds": 60,
+        "elapsed_seconds": null,
+        "starts_timer": false,
+        "duration_is_stated": false,
+        "scalable_amounts": [
+          {
+            "value": 500,
+            "unit": "g"
+          }
+        ],
+        "step_role": "pour"
+      },
+      {
+        "title": null,
+        "raw_text": "At the end, give it a little stir and a swirl to help the drawdown and keep a flat bed, then just let it finish draining completely.",
+        "duration_seconds": 30,
+        "elapsed_seconds": null,
+        "starts_timer": false,
+        "duration_is_stated": false,
+        "scalable_amounts": [],
+        "step_role": "drawdown"
+      }
+    ],
+    "notes": [],
+    "total_brew_time_seconds": 270
+  },
+  "draft": {
+    "recipe": {
+      "brewing_method_id": "chemex",
+      "coffee_amount": 30,
+      "water_amount": 500,
+      "water_temp": 96,
+      "brew_time_seconds": 270,
+      "vendor_id": "usr-800792ab-c2ef-49f3-8d6a-c5dceaf71459"
+    },
+    "localization": {
+      "locale": "en",
+      "name": "Chemex 60g/L Half Liter",
+      "grind_size": "Medium-coarse",
+      "short_description": "Medium-coarse Chemex recipe using 30g coffee and 500g water."
+    },
+    "steps": [
+      {
+        "step_order": 1,
+        "kind": "preparation",
+        "description_source": "Quick aside on filters -- a Chemex filter is noticeably heavier than a normal V60 filter, it actually weighs about 4.5 grams dry versus around 1.5 grams for a Hario paper, which is part of why the Chemex cup comes out so clean. Fold the filter, rinse it with hot water, and dose in 30 grams of coffee.",
+        "description_template": "Quick aside on filters -- a Chemex filter is noticeably heavier than a normal V60 filter, it actually weighs about 4.5 grams dry versus around 1.5 grams for a Hario paper, which is part of why the Chemex cup comes out so clean. Fold the filter, rinse it with hot water, and dose in (1 x <final_coffee_amount>)g of coffee.",
+        "preview_text": "Quick aside on filters -- a Chemex filter is noticeably heavier than a normal V60 filter, it actually weighs about 4.5 grams dry versus around 1.5 grams for a Hario paper, which is part of why the Chemex cup comes out so clean. Fold the filter, rinse it with hot water, and dose in 30g of coffee.",
+        "duration_seconds": 0,
+        "elapsed_seconds": null,
+        "starts_timer": false,
+        "duration_is_stated": false,
+        "scalable_amounts": [
+          {
+            "value": 30,
+            "unit": "g"
+          }
+        ],
+        "step_role": "preparation",
+        "expressions": [
+          {
+            "placeholder": "<final_coffee_amount>",
+            "multiplier": 1,
+            "unit": "g",
+            "preview_value": 30
+          }
+        ]
+      },
+      {
+        "step_order": 2,
+        "kind": "brew",
+        "description_source": "In terms of the bloom, do exactly as the V60: 60 to 90 grams of bloom water, and let that bloom for at least 45 seconds.",
+        "description_template": "In terms of the bloom, do exactly as the V60: (0.12 x <final_water_amount>)-(0.18 x <final_water_amount>)g of bloom water, and let that bloom for at least 45 seconds.",
+        "preview_text": "In terms of the bloom, do exactly as the V60: 60-90g of bloom water, and let that bloom for at least 45 seconds.",
+        "duration_seconds": 45,
+        "elapsed_seconds": null,
+        "starts_timer": true,
+        "duration_is_stated": true,
+        "scalable_amounts": [
+          {
+            "value": 60,
+            "unit": "g"
+          },
+          {
+            "value": 90,
+            "unit": "g"
+          }
+        ],
+        "step_role": "bloom",
+        "expressions": [
+          {
+            "placeholder": "<final_water_amount>",
+            "multiplier": 0.12,
+            "unit": "",
+            "preview_value": 60
+          },
+          {
+            "placeholder": "<final_water_amount>",
+            "multiplier": 0.18,
+            "unit": "g",
+            "preview_value": 90
+          }
+        ]
+      },
+      {
+        "step_order": 3,
+        "kind": "brew",
+        "description_source": "Once the bloom settles, start pouring in slow concentric circles, pretty controlled, maybe 3 grams a second, avoiding the filter walls, until you reach the full 500 grams. You're gonna have four to five minute brew times brewing half a liter with the Chemex.",
+        "description_template": "Once the bloom settles, start pouring in slow concentric circles, pretty controlled, maybe 3 grams a second, avoiding the filter walls, until you reach the full (1 x <final_water_amount>)g. You're gonna have four to five minute brew times brewing half a liter with the Chemex.",
+        "preview_text": "Once the bloom settles, start pouring in slow concentric circles, pretty controlled, maybe 3 grams a second, avoiding the filter walls, until you reach the full 500g. You're gonna have four to five minute brew times brewing half a liter with the Chemex.",
+        "duration_seconds": 55,
+        "elapsed_seconds": null,
+        "starts_timer": false,
+        "duration_is_stated": false,
+        "scalable_amounts": [
+          {
+            "value": 500,
+            "unit": "g"
+          }
+        ],
+        "step_role": "pour",
+        "expressions": [
+          {
+            "placeholder": "<final_water_amount>",
+            "multiplier": 1,
+            "unit": "g",
+            "preview_value": 500
+          }
+        ]
+      },
+      {
+        "step_order": 4,
+        "kind": "brew",
+        "description_source": "At the end, give it a little stir and a swirl to help the drawdown and keep a flat bed, then just let it finish draining completely.",
+        "description_template": "At the end, give it a little stir and a swirl to help the drawdown and keep a flat bed, then just let it finish draining completely.",
+        "preview_text": "At the end, give it a little stir and a swirl to help the drawdown and keep a flat bed, then just let it finish draining completely.",
+        "duration_seconds": 170,
+        "elapsed_seconds": null,
+        "starts_timer": false,
+        "duration_is_stated": false,
+        "scalable_amounts": [],
+        "step_role": "drawdown",
+        "expressions": []
+      }
+    ]
+  },
+  "publish_projection": {
+    "user_recipe": {
+      "id": "usr-800792ab-c2ef-49f3-8d6a-c5dceaf71459-1776000000000",
+      "brewing_method_id": "chemex",
+      "coffee_amount": 30,
+      "water_amount": 500,
+      "water_temp": 96,
+      "brew_time": 270,
+      "vendor_id": "usr-800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+      "last_modified": "2026-04-12T13:20:00.000Z",
+      "import_id": null,
+      "is_imported": false,
+      "ispublic": false,
+      "is_deleted": false,
+      "needs_moderation_review": false
+    },
+    "user_recipe_localization": {
+      "id": "<random-uuid>",
+      "recipe_id": "usr-800792ab-c2ef-49f3-8d6a-c5dceaf71459-1776000000000",
+      "locale": "en",
+      "name": "Chemex 60g/L Half Liter",
+      "grind_size": "Medium-coarse",
+      "short_description": "Medium-coarse Chemex recipe using 30g coffee and 500g water."
+    },
+    "user_steps": [
+      {
+        "id": "<random-uuid>",
+        "recipe_id": "usr-800792ab-c2ef-49f3-8d6a-c5dceaf71459-1776000000000",
+        "step_order": 1,
+        "description": "Quick aside on filters -- a Chemex filter is noticeably heavier than a normal V60 filter, it actually weighs about 4.5 grams dry versus around 1.5 grams for a Hario paper, which is part of why the Chemex cup comes out so clean. Fold the filter, rinse it with hot water, and dose in (1 x <final_coffee_amount>)g of coffee.",
+        "time": "0",
+        "locale": "en"
+      },
+      {
+        "id": "<random-uuid>",
+        "recipe_id": "usr-800792ab-c2ef-49f3-8d6a-c5dceaf71459-1776000000000",
+        "step_order": 2,
+        "description": "In terms of the bloom, do exactly as the V60: (0.12 x <final_water_amount>)-(0.18 x <final_water_amount>)g of bloom water, and let that bloom for at least 45 seconds.",
+        "time": "45",
+        "locale": "en"
+      },
+      {
+        "id": "<random-uuid>",
+        "recipe_id": "usr-800792ab-c2ef-49f3-8d6a-c5dceaf71459-1776000000000",
+        "step_order": 3,
+        "description": "Once the bloom settles, start pouring in slow concentric circles, pretty controlled, maybe 3 grams a second, avoiding the filter walls, until you reach the full (1 x <final_water_amount>)g. You're gonna have four to five minute brew times brewing half a liter with the Chemex.",
+        "time": "55",
+        "locale": "en"
+      },
+      {
+        "id": "<random-uuid>",
+        "recipe_id": "usr-800792ab-c2ef-49f3-8d6a-c5dceaf71459-1776000000000",
+        "step_order": 4,
+        "description": "At the end, give it a little stir and a swirl to help the drawdown and keep a flat bed, then just let it finish draining completely.",
+        "time": "170",
+        "locale": "en"
+      }
+    ]
+  }
+}
