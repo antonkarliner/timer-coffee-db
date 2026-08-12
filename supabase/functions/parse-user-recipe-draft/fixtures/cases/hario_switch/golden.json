@@ -163,7 +163,7 @@
         "description_source": "We're gonna start the timer when we start our stir, so give it a good stir right as you hit start.",
         "description_template": "We're gonna start the timer when we start our stir, so give it a good stir right as you hit start.",
         "preview_text": "We're gonna start the timer when we start our stir, so give it a good stir right as you hit start.",
-        "duration_seconds": 40,
+        "duration_seconds": 15,
         "elapsed_seconds": 0,
         "starts_timer": true,
         "duration_is_stated": false,
@@ -191,7 +191,7 @@
         "description_source": "Let it fully steep and drain until about 1:25, then pull the Switch off the cup and you're done.",
         "description_template": "Let it fully steep and drain until about 1:25, then pull the Switch off the cup and you're done.",
         "preview_text": "Let it fully steep and drain until about 1:25, then pull the Switch off the cup and you're done.",
-        "duration_seconds": 30,
+        "duration_seconds": 55,
         "elapsed_seconds": null,
         "starts_timer": false,
         "duration_is_stated": false,
@@ -239,7 +239,7 @@
         "recipe_id": "usr-800792ab-c2ef-49f3-8d6a-c5dceaf71459-1776000000000",
         "step_order": 2,
         "description": "We're gonna start the timer when we start our stir, so give it a good stir right as you hit start.",
-        "time": "40",
+        "time": "15",
         "locale": "en"
       },
       {
@@ -255,7 +255,7 @@
         "recipe_id": "usr-800792ab-c2ef-49f3-8d6a-c5dceaf71459-1776000000000",
         "step_order": 4,
         "description": "Let it fully steep and drain until about 1:25, then pull the Switch off the cup and you're done.",
-        "time": "30",
+        "time": "55",
         "locale": "en"
       }
     ]

@@ -2747,9 +2747,19 @@ Deno.test("normalizes natural-language elapsed times and infers Chemex drawdown"
     requestId: "req-2he",
   });
 
+  // defect-1: the fourth pour (elapsed 190s) is the LAST timestamped step,
+  // so its duration was never actually known from the source — only its
+  // start time was (see isAnchoredBrewStep). Before the fix it was locked
+  // to a nominal 10s guess regardless of how much water it poured; now it
+  // is correctly treated as DERIVED and estimated from the 200g it itself
+  // adds (500 -> 700g) at the same ~8 g/s pour-rate model used for every
+  // other derived pour in this codebase (200 / 8 = 25s), and the
+  // synthetic "Wait for the complete drawdown" step absorbs the rest of
+  // the resolved 240s target (240 - 45 - 65 - 80 - 25 = 25) instead of a
+  // flat 40s. Both numbers change; the total (240) does not.
   assertEquals(
     result.draft.steps.map((step) => step.duration_seconds),
-    [0, 45, 65, 80, 10, 40],
+    [0, 45, 65, 80, 25, 25],
     "Expected prose elapsed times and finish target to become step durations.",
   );
   assertEquals(
@@ -2769,7 +2779,7 @@ Deno.test("normalizes natural-language elapsed times and infers Chemex drawdown"
   );
   assertEquals(
     result.publish_projection?.user_steps.map((step) => step.time),
-    ["0", "45", "65", "80", "10", "40"],
+    ["0", "45", "65", "80", "25", "25"],
     "Expected published step times to match normalized natural elapsed durations.",
   );
   assertEquals(
@@ -5353,6 +5363,309 @@ Deno.test("splits derived brew-step durations identically regardless of the mode
   );
 });
 
+// ---------------------------------------------------------------------
+// defect-1 (2026-08-12 live pass): a known START time was being treated as
+// a known DURATION. isAnchoredBrewStep used to anchor ANY step carrying a
+// non-null elapsed_seconds, but elapsed_seconds only records when a step
+// BEGAN, never how long it lasted. Four live runs of the same Hario Switch
+// transcript produced totals of 70 / 70 / 80 / 95 seconds against a
+// stated 90-100s target: the three short runs each had every brew step
+// carrying an elapsed_seconds (including the final drawdown), so under the
+// old logic every step looked anchored, derivedIndexes came back empty,
+// and splitDerivedBrewStepDurationsFromTarget bailed out entirely --
+// leaving the model's own inconsistent per-step guesses with no total
+// enforced at all. The fix: only a step whose duration was computed by
+// differencing two KNOWN elapsed timestamps (or one that states its own
+// duration) is anchored; a step whose elapsed_seconds has no successor to
+// difference against -- the common shape for a final drawdown that merely
+// records when it began -- is correctly left DERIVED so it can absorb
+// whatever the deterministic split leaves over.
+// ---------------------------------------------------------------------
+
+Deno.test("defect-1: enforces the stated total even when every brew step carries an elapsed_seconds (Hario Switch live-incident shape)", async () => {
+  // Mirrors the exact live-capture shape (captures e3dfca7d/abd725f2, both
+  // 70s totals against a 95s stated target): a stated-duration stir that
+  // starts the timer, a second stir whose start time is known but whose
+  // OWN duration was never stated, and a drawdown whose start time is
+  // known but whose duration is likewise never stated. Under the pre-fix
+  // logic, all three steps carried a non-null elapsed_seconds and were
+  // therefore all anchored, so the split bailed out and the total stayed
+  // at whatever the model happened to guess (40 + 20 + 10 = 70) instead of
+  // the stated 95.
+  const extraction: ExtractionResult = {
+    extracted_amounts: [],
+    detected_input_language: "en",
+    likely_brewing_method: "Hario Switch",
+    name: "Elapsed-Everywhere Hario Switch",
+    short_description: "Tests defect-1's start-time-vs-duration fix.",
+    grind_size: "Medium",
+    water_temp_celsius: 94,
+    coffee_amount_grams: 20,
+    water_amount: 260,
+    preparation: "Close the switch, add water and coffee.",
+    steps: [
+      {
+        title: null,
+        raw_text: "Start the timer and give it a good stir for 40 seconds.",
+        duration_seconds: 40,
+        elapsed_seconds: 0,
+        starts_timer: true,
+        duration_is_stated: true,
+        scalable_amounts: [],
+        step_role: "stir",
+      },
+      {
+        title: null,
+        raw_text: "At 40 seconds, open the switch.",
+        duration_seconds: 20,
+        elapsed_seconds: 40,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: null,
+      },
+      {
+        title: null,
+        raw_text: "At a minute, let it fully drain and finish.",
+        duration_seconds: 10,
+        elapsed_seconds: 60,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: "drawdown",
+      },
+    ],
+    notes: [],
+    total_brew_time_seconds: 95,
+  };
+  const normalized: NormalizedDraft = {
+    extracted_amounts: [],
+    detected_input_language: "en",
+    warnings: [],
+    recipe: {
+      brewing_method_id: "v60",
+      brewing_method_confidence: "high",
+      coffee_amount: 20,
+      water_amount: 260,
+      water_temp: 94,
+    },
+    localization: {
+      name: "Elapsed-Everywhere Hario Switch",
+      grind_size: "Medium",
+      short_description: "Tests defect-1's start-time-vs-duration fix.",
+    },
+    steps: [
+      {
+        kind: "preparation",
+        description_source: "Close the switch, add water and coffee.",
+        description_template: "Close the switch, add water and coffee.",
+        duration_seconds: 0,
+        elapsed_seconds: null,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: null,
+      },
+      {
+        kind: "brew",
+        description_source:
+          "Start the timer and give it a good stir for 40 seconds.",
+        description_template:
+          "Start the timer and give it a good stir for 40 seconds.",
+        duration_seconds: 40,
+        elapsed_seconds: 0,
+        starts_timer: true,
+        duration_is_stated: true,
+        scalable_amounts: [],
+        step_role: "stir",
+      },
+      {
+        kind: "brew",
+        description_source: "At 40 seconds, open the switch.",
+        description_template: "At 40 seconds, open the switch.",
+        duration_seconds: 20,
+        elapsed_seconds: 40,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: null,
+      },
+      {
+        kind: "brew",
+        description_source: "At a minute, let it fully drain and finish.",
+        description_template: "At a minute, let it fully drain and finish.",
+        duration_seconds: 10,
+        elapsed_seconds: 60,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: "drawdown",
+      },
+    ],
+  };
+
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction,
+        normalized,
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: "Mock Hario Switch recipe",
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Hario V60" },
+    ],
+    requestId: "req-defect1-elapsed-everywhere",
+  });
+
+  // The stated stir (duration_is_stated: true) stays anchored at 40s. The
+  // second stir and the drawdown both carry an elapsed_seconds but neither
+  // has a known successor to difference against (the drawdown is the
+  // last brew step; the second stir's only "successor" is the drawdown,
+  // whose OWN duration is unknown, not a differenceable timestamp pair),
+  // so both must be treated as derived and the 95s target must be enforced
+  // -- not silently left at the model's own guessed 70s.
+  assertEquals(
+    result.draft.recipe.brew_time_seconds,
+    95,
+    "Expected the stated 95s total to be enforced even though every brew step carries an elapsed_seconds.",
+  );
+  assertEquals(
+    result.draft.steps.map((step) => step.duration_seconds).reduce(
+      (sum, value) => sum + value,
+      0,
+    ),
+    95,
+    "Expected step durations to sum to exactly the stated 95s target.",
+  );
+  assertEquals(
+    result.draft.steps[1].duration_seconds,
+    40,
+    "Expected the duration_is_stated stir to survive the split untouched.",
+  );
+  assert(
+    result.warnings.some((warning) =>
+      warning.includes(
+        "split deterministically from the stated total brew time",
+      )
+    ),
+    "Expected the deterministic split to actually run (proving derivedIndexes was non-empty), not bail out silently.",
+  );
+});
+
+Deno.test("defect-1: a lone elapsed_seconds with no successor to difference against does not anchor a step's duration", async () => {
+  // Isolates the core distinction directly: a step whose ONLY timing
+  // signal is elapsed_seconds (a begins-at timestamp), with nothing to
+  // difference it against, must be treated exactly like a step with no
+  // elapsed_seconds at all for anchoring purposes -- its duration is
+  // unknown, not "known because it has a timestamp". Here the single brew
+  // step both starts AND (per the old bug) would appear to know its own
+  // duration merely by carrying elapsed_seconds: 0; the deterministic
+  // split must still recompute it from the resolved target rather than
+  // trust the model's arbitrary 5s guess.
+  const extraction: ExtractionResult = {
+    extracted_amounts: [],
+    detected_input_language: "en",
+    likely_brewing_method: "Cold Brew",
+    name: "Lone Timestamp Cold Brew",
+    short_description: "Tests that a lone elapsed_seconds never anchors.",
+    grind_size: "Coarse",
+    water_temp_celsius: 20,
+    coffee_amount_grams: 50,
+    water_amount: 800,
+    preparation: "Combine coffee and cold water.",
+    steps: [
+      {
+        title: null,
+        raw_text: "Start the timer and let it steep.",
+        duration_seconds: 5,
+        elapsed_seconds: 0,
+        starts_timer: true,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: null,
+      },
+    ],
+    notes: [],
+    total_brew_time_seconds: 120,
+  };
+  const normalized: NormalizedDraft = {
+    extracted_amounts: [],
+    detected_input_language: "en",
+    warnings: [],
+    recipe: {
+      brewing_method_id: "v60",
+      brewing_method_confidence: "high",
+      coffee_amount: 50,
+      water_amount: 800,
+      water_temp: 20,
+    },
+    localization: {
+      name: "Lone Timestamp Cold Brew",
+      grind_size: "Coarse",
+      short_description: "Tests that a lone elapsed_seconds never anchors.",
+    },
+    steps: [
+      {
+        kind: "preparation",
+        description_source: "Combine coffee and cold water.",
+        description_template: "Combine coffee and cold water.",
+        duration_seconds: 0,
+        elapsed_seconds: null,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: null,
+      },
+      {
+        kind: "brew",
+        description_source: "Start the timer and let it steep.",
+        description_template: "Start the timer and let it steep.",
+        duration_seconds: 5,
+        elapsed_seconds: 0,
+        starts_timer: true,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: null,
+      },
+    ],
+  };
+
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction,
+        normalized,
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: "Mock cold brew recipe",
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Hario V60" },
+    ],
+    requestId: "req-defect1-lone-timestamp",
+  });
+
+  assertEquals(
+    result.draft.steps.map((step) => step.duration_seconds),
+    [0, 120],
+    "Expected the lone step's elapsed_seconds:0 to NOT anchor its 5s guessed duration, so the deterministic split recomputes it to the full 120s target.",
+  );
+});
+
 Deno.test("treats a duration_is_stated step as anchored and excludes it from the derived split (cold brew)", async () => {
   // A step with duration_is_stated: true must survive the deterministic
   // split completely untouched, and must not be counted among the derived
@@ -7834,13 +8147,18 @@ Deno.test("splits correctly and does not warn when a non-English recipe's extrac
     requestId: "req-f28f-with-total",
   });
 
-  // The two timestamp-differenced steps and the last timestamped step's
-  // terminal default are unaffected (anchored via elapsed_seconds); the
-  // untimed final step is the only DERIVED step and absorbs the entire
-  // remainder: 180 - 30 - 30 - 10 = 110.
+  // The two timestamp-DIFFERENCED steps (0:00->0:30, 0:30->1:00) are
+  // genuinely anchored (30 each). defect-1: the third pour (elapsed 60s)
+  // is the LAST timestamped step, so — unlike the first two — its
+  // duration was never actually derived from two known timestamps, only
+  // its start time was known. It is now correctly DERIVED and estimated
+  // from the 150g it itself adds (150 -> 300g) at the ~8 g/s pour-rate
+  // model (150 / 8 = 19s) instead of a flat 10s guess, and the untimed
+  // final step ("Vollständig durchlaufen lassen") absorbs what remains of
+  // the resolved 180s target: 180 - 30 - 30 - 19 = 101.
   assertEquals(
     result.draft.steps.map((step) => step.duration_seconds),
-    [0, 30, 30, 10, 110],
+    [0, 30, 30, 19, 101],
     "Expected the untimed final step to absorb the remainder of the resolved 180s target.",
   );
   assertEquals(
@@ -8419,15 +8737,19 @@ Deno.test("reads step_role to identify the German drawdown step instead of letti
     requestId: "req-f29",
   });
 
-  // The two elapsed-timestamped pours anchor to 30 and 10 (0:30 -> 1:00
-  // interval, then the nominal last-timestamped-step duration). The bloom
-  // (labelled "bloom") gets the fixed 45s nominal bloom duration instead
-  // of the model's wrong 50s guess. The drawdown (labelled "drawdown",
-  // correctly recognized despite being pure German text) absorbs
-  // whatever is left: 180 - 30 - 10 - 45 = 95.
+  // The 0:30 -> 1:00 pour is genuinely timestamp-DIFFERENCED (30s, a real
+  // interval between two known timestamps) and stays anchored. defect-1:
+  // the 1:00 pour is the LAST timestamped step, so only its start time was
+  // known, never its duration — it is now correctly DERIVED and estimated
+  // from the ~100g it itself adds (200 -> 300g) at the ~8 g/s pour-rate
+  // model (100 / 8 = 13s) instead of a flat 10s guess. The bloom (labelled
+  // "bloom") still gets the fixed 45s nominal bloom duration instead of
+  // the model's wrong 50s guess. The drawdown (labelled "drawdown",
+  // correctly recognized despite being pure German text) absorbs whatever
+  // is left: 180 - 30 - 13 - 45 = 92.
   assertEquals(
     result.draft.steps.map((step) => step.duration_seconds),
-    [0, 45, 30, 10, 95],
+    [0, 45, 30, 13, 92],
     "Expected step_role to identify the bloom and the German drawdown step so the drawdown, not the bloom, absorbs the remainder.",
   );
   assert(
@@ -11585,5 +11907,249 @@ Deno.test("Aug 2026 Fix 2: a legitimate non-Latin unit (Chinese, no space before
   assert(
     step.preview_text.includes("水中搅拌。"),
     "Expected the trailing clause to survive intact in the rendered text.",
+  );
+});
+
+// ---------------------------------------------------------------------
+// defect-2 / F19 (2026-08-12 live pass): grind_size had no deterministic
+// handling anywhere in the parser — only prompt instructions — so a model
+// that grabbed the wrong clause of the source sailed through unchecked.
+// Live shapes: all four V60 runs stored an instruction sentence ("Grind
+// ... for a total brew time of 2 to 2.5 minutes.") instead of a grind
+// size; two of four Kalita runs stored ASR garbage ("pure wood grind
+// size", a mis-hearing of "pour-over"). The fix adds grind_size_is_stated
+// (a semantic-judgement extraction field, mirroring duration_is_stated)
+// plus a deterministic, English-only, WARN-not-block shape check for the
+// instruction-leak class. The ASR-garbage class is NOT covered by any
+// deterministic mechanism here — see the report for why — and is called
+// out explicitly rather than silently left untested.
+// ---------------------------------------------------------------------
+
+Deno.test("defect-2: warns when a suspiciously long, sentence-shaped grind_size looks like a leaked instruction", async () => {
+  // Reproduces the exact live shape: an instruction sentence about brew
+  // time, not a grind descriptor, ends up in grind_size.
+  const badGrindSize =
+    "Grind fine for a total brew time of 2 to 2.5 minutes.";
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction: {
+          ...createExtraction(),
+          detected_input_language: "en",
+          grind_size: badGrindSize,
+          grind_size_is_stated: true,
+        },
+        normalized: {
+          ...createNormalized(),
+          detected_input_language: "en",
+          localization: {
+            ...createNormalized().localization,
+            grind_size: badGrindSize,
+          },
+        },
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: "Mock recipe",
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [{ brewing_method_id: "v60", brewing_method: "Hario V60" }],
+    requestId: "req-defect2-instruction-leak",
+  });
+
+  assert(
+    result.warnings.some((warning) =>
+      warning.includes(badGrindSize) &&
+      warning.includes("reported as stated by the source")
+    ),
+    `Expected a warning naming the suspicious grind_size value. Got: ${
+      JSON.stringify(result.warnings)
+    }`,
+  );
+  assertEquals(
+    result.draft.localization.grind_size,
+    badGrindSize,
+    "Expected grind_size to be surfaced (warn), not blocked or silently altered.",
+  );
+  assertEquals(
+    result.validation.is_publishable,
+    true,
+    "Expected the suspicious grind_size to WARN, not block publishing — grind_size is legitimately inferable, unlike a coffee/water amount.",
+  );
+});
+
+Deno.test("defect-2: does not warn for a short, clean, stated grind_size", async () => {
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction: {
+          ...createExtraction(),
+          detected_input_language: "en",
+          grind_size: "Medium-fine",
+          grind_size_is_stated: true,
+        },
+        normalized: {
+          ...createNormalized(),
+          detected_input_language: "en",
+          localization: {
+            ...createNormalized().localization,
+            grind_size: "Medium-fine",
+          },
+        },
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: "Mock recipe",
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [{ brewing_method_id: "v60", brewing_method: "Hario V60" }],
+    requestId: "req-defect2-clean-grind-size",
+  });
+
+  assert(
+    !result.warnings.some((warning) => warning.includes("Grind size")),
+    `Expected no grind_size warning for a clean value. Got: ${
+      JSON.stringify(result.warnings)
+    }`,
+  );
+});
+
+Deno.test("defect-2: does not warn for a clean grind_size that was inferred rather than stated", async () => {
+  // grind_size_is_stated defaults to false/absent when a provider doesn't
+  // set it — must degrade to the "inferred" treatment, not silently
+  // become the "stated" (garbage-suspicious) treatment.
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction: {
+          ...createExtraction(),
+          detected_input_language: "en",
+          grind_size: "Medium",
+        },
+        normalized: {
+          ...createNormalized(),
+          detected_input_language: "en",
+          localization: {
+            ...createNormalized().localization,
+            grind_size: "Medium",
+          },
+        },
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: "Mock recipe",
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [{ brewing_method_id: "v60", brewing_method: "Hario V60" }],
+    requestId: "req-defect2-inferred-grind-size",
+  });
+
+  assert(
+    !result.warnings.some((warning) => warning.includes("Grind size")),
+    `Expected no grind_size warning when grind_size_is_stated is absent/false and the value is clean. Got: ${
+      JSON.stringify(result.warnings)
+    }`,
+  );
+});
+
+Deno.test("defect-2: warns (does not silently trust) a stated grind_size for a non-English recipe, since the shape check is English-only", async () => {
+  // The shape heuristic cannot run for non-English text (never
+  // internationalize the regex — see isSuspiciousGrindSizeText). Rather
+  // than silently trusting an unverifiable "stated" grind_size, this
+  // mirrors F28e's convention: an honest warning instead of a guess.
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction: {
+          ...createExtraction(),
+          detected_input_language: "de",
+          grind_size: "Mittelfein",
+          grind_size_is_stated: true,
+        },
+        normalized: {
+          ...createNormalized(),
+          detected_input_language: "de",
+          localization: {
+            ...createNormalized().localization,
+            grind_size: "Mittelfein",
+          },
+        },
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: "Mock-Rezept",
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [{ brewing_method_id: "v60", brewing_method: "Hario V60" }],
+    requestId: "req-defect2-non-english-stated",
+  });
+
+  assert(
+    result.warnings.some((warning) =>
+      warning.includes("Mittelfein") && warning.includes("cannot be automatically verified")
+    ),
+    `Expected an honest "cannot verify" warning for a stated non-English grind_size. Got: ${
+      JSON.stringify(result.warnings)
+    }`,
+  );
+});
+
+Deno.test("defect-2: does not warn for an inferred (not stated) grind_size on a non-English recipe", async () => {
+  // Symmetric to the extraction-only English-recipe case: an INFERRED
+  // value is expected to already be a short canonical phrase by
+  // construction, so there is nothing new to verify by warning about it,
+  // even though the shape check itself cannot run for this language.
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction: {
+          ...createExtraction(),
+          detected_input_language: "de",
+          grind_size: "Mittel",
+          grind_size_is_stated: false,
+        },
+        normalized: {
+          ...createNormalized(),
+          detected_input_language: "de",
+          localization: {
+            ...createNormalized().localization,
+            grind_size: "Mittel",
+          },
+        },
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: "Mock-Rezept",
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [{ brewing_method_id: "v60", brewing_method: "Hario V60" }],
+    requestId: "req-defect2-non-english-inferred",
+  });
+
+  assert(
+    !result.warnings.some((warning) => warning.includes("Grind size")),
+    `Expected no grind_size warning for a non-English inferred value. Got: ${
+      JSON.stringify(result.warnings)
+    }`,
   );
 });

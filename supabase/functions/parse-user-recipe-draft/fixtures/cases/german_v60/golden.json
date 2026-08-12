@@ -198,7 +198,7 @@
         "description_source": "Nach einer Minute auf 300g auffuellen.",
         "description_template": "Nach einer Minute auf (0.923077 x <final_water_amount>)g auffuellen.",
         "preview_text": "Nach einer Minute auf 300g auffuellen.",
-        "duration_seconds": 10,
+        "duration_seconds": 16,
         "elapsed_seconds": 60,
         "starts_timer": false,
         "duration_is_stated": false,
@@ -224,7 +224,7 @@
         "description_source": "Vollstaendig durchlaufen lassen.",
         "description_template": "Vollstaendig durchlaufen lassen.",
         "preview_text": "Vollstaendig durchlaufen lassen.",
-        "duration_seconds": 110,
+        "duration_seconds": 104,
         "elapsed_seconds": null,
         "starts_timer": false,
         "duration_is_stated": false,
@@ -288,7 +288,7 @@
         "recipe_id": "usr-800792ab-c2ef-49f3-8d6a-c5dceaf71459-1776000000000",
         "step_order": 4,
         "description": "Nach einer Minute auf (0.923077 x <final_water_amount>)g auffuellen.",
-        "time": "10",
+        "time": "16",
         "locale": "en"
       },
       {
@@ -296,7 +296,7 @@
         "recipe_id": "usr-800792ab-c2ef-49f3-8d6a-c5dceaf71459-1776000000000",
         "step_order": 5,
         "description": "Vollstaendig durchlaufen lassen.",
-        "time": "110",
+        "time": "104",
         "locale": "en"
       }
     ]

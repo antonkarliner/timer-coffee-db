@@ -114,6 +114,22 @@ export const extractionSchema = z.object({
   name: z.string().trim().min(1).nullable().default(null),
   short_description: z.string().trim().min(1).nullable().default(null),
   grind_size: z.string().trim().min(1).nullable().default(null),
+  // F19: mirrors extractedStepSchema.duration_is_stated's convention — a
+  // semantic judgement about what the source text actually contained,
+  // reported by the stage that read it, rather than reverse-engineered
+  // from the string's shape afterward. True only when the source text
+  // itself described a grind size; false (the default) when grind_size
+  // was inferred from the brewing method (see the extraction prompt's
+  // inference fallback) or the field predates this flag. Deliberately
+  // `.optional()` rather than `.default()`: unlike duration_is_stated
+  // (added when every call site was still under active development),
+  // this field is landing after ExtractionResult object literals already
+  // exist throughout this codebase's test suites — some of them (e.g.
+  // verify-user-recipe-draft/handler_test.ts) out of scope for this
+  // change — so the TS type must stay optional to avoid forcing every
+  // existing literal to add it. Always read via `?? false`, never assume
+  // presence; see buildGrindSizeWarnings below, the only consumer.
+  grind_size_is_stated: z.boolean().optional(),
   water_temp_celsius: z.number().nullable().default(null),
   coffee_amount_grams: z.number().positive().nullable().default(null),
   water_amount: z.number().positive().nullable().default(null),
@@ -1157,6 +1173,98 @@ function buildMissingNonEnglishTotalBrewTimeWarnings(input: {
   return [
     "No total brew time was extracted for a non-English recipe; step durations fall back to minimums and should be reviewed.",
   ];
+}
+
+// F19 (originally investigated, reopened by the 2026-08-12 live pass):
+// grind_size had no deterministic handling anywhere in the parser — only
+// prompt instructions — so a model that grabbed the wrong clause of the
+// source (an instruction, not a grind description) or mis-transcribed
+// audio garbage sailed straight through unchecked. Two live shapes:
+//   - "Grind ... for a total brew time of 2 to 2.5 minutes." — an
+//     instruction sentence, not a grind size.
+//   - "pure wood grind size" — ASR garbage (a mis-hearing of "pour-over")
+//     that happens to read as a grammatically normal noun phrase.
+// This SHAPE heuristic below only catches the first class: an
+// instruction/aside reads as unusually long, contains a full sentence
+// break, or names brew-time/instructional phrasing that a real grind
+// descriptor never would. It cannot catch the second class — ASR garbage
+// that is short and grammatically well-formed is indistinguishable from a
+// real (if odd-sounding) grind descriptor by shape alone; only the source
+// itself (via a provenance/quote check, which this pass does not add)
+// could catch that, and is left as a known gap — see the defect-2 section
+// of this change's report.
+//
+// ENGLISH-ONLY FALLBACK — do not internationalize this regex (same
+// rationale as parseCompletionTargetSeconds/isDrawdownLikeStep above):
+// that path never ends, and a false match against real non-English grind
+// vocabulary would be worse than silence. For a non-English recipe this
+// heuristic simply cannot run, which is exactly why grind_size_is_stated
+// exists: it lets a stated-but-unverifiable non-English grind_size still
+// surface an honest warning instead of being silently trusted.
+const SUSPICIOUS_GRIND_SIZE_MAX_LENGTH = 60;
+const SUSPICIOUS_GRIND_SIZE_REGEX =
+  /\bgrind\s+(?:to|for)\b|\bto achieve\b|\bbrew\s*time\b|\btotal\s+brew\b/i;
+
+function isSuspiciousGrindSizeText(grindSize: string): boolean {
+  if (grindSize.length > SUSPICIOUS_GRIND_SIZE_MAX_LENGTH) {
+    return true;
+  }
+  // A genuine grind descriptor is a short noun phrase ("Medium-fine",
+  // "Coarse, like sea salt"), not a full sentence — a sentence-ending
+  // punctuation mark is a strong signal that an instruction or aside was
+  // captured instead of a grind description.
+  if (/[.!?]/.test(grindSize)) {
+    return true;
+  }
+  return SUSPICIOUS_GRIND_SIZE_REGEX.test(grindSize);
+}
+
+// Decision: WARN, never block. Unlike a coffee/water amount — which must
+// be numerically exact for the recipe to function and is always
+// verifiable against extracted_amounts — grind_size is legitimately
+// INFERABLE from the brewing method when the source stays silent (the
+// extraction prompt explicitly allows this), and the shape heuristic
+// above is a blunt instrument that can false-positive on a genuinely
+// long, comma-separated grind description ("Medium-coarse, like kosher
+// salt, a touch finer for lighter roasts"). Blocking publication on a
+// heuristic with known false positives would make otherwise-good recipes
+// unpublishable; warning surfaces the same signal for operator review
+// without doing that, matching this file's established asymmetric
+// enforcement (amounts block, this — like G22's extract-mode timing warns
+// — does not).
+function buildGrindSizeWarnings(input: {
+  grindSize: string | null;
+  grindSizeIsStated: boolean;
+  detectedInputLanguage: string | null;
+}): string[] {
+  if (input.grindSize === null) {
+    return [];
+  }
+
+  if (!isEnglishLikeLanguage(input.detectedInputLanguage)) {
+    // The shape heuristic is English-only and cannot run here (see above).
+    // Only warn when the extraction stage itself claims this came from the
+    // source — an inferred value is expected to already be one of the
+    // prompt's short canonical phrases, so there is nothing new to verify
+    // by warning about it too.
+    return input.grindSizeIsStated
+      ? [
+        `Grind size "${input.grindSize}" was reported as stated by a non-English source, but this cannot be automatically verified (the shape check is English-only) — please review it before publishing.`,
+      ]
+      : [];
+  }
+
+  if (!isSuspiciousGrindSizeText(input.grindSize)) {
+    return [];
+  }
+
+  return input.grindSizeIsStated
+    ? [
+      `Grind size "${input.grindSize}" was reported as stated by the source, but its shape (length, sentence punctuation, or brew-time/instructional wording) suggests an unrelated instruction was captured instead of a grind description — please review before publishing.`,
+    ]
+    : [
+      `Grind size "${input.grindSize}" was inferred rather than stated by the source, but its shape looks wrong for a grind description — please review before publishing.`,
+    ];
 }
 
 function filterDiagnosticNotes(notes: string[]): string[] {
@@ -2271,6 +2379,8 @@ function buildExtractionSystemPrompt(): string {
     "scalable_amounts may be an empty array when a step has no genuine scalable coffee/water amount.",
     "Each step's step_role labels what that step DOES, independent of the language it is written in. Use 'preparation' for setup before brewing starts, 'bloom' for the initial wetting pour, 'pour' for any subsequent water addition, 'stir' for a stir/swirl/agitate action with no water added, 'drawdown' for waiting for the bed to drain after the last pour, and 'serve' for decanting, straining, or serving. Use null only when no role clearly applies.",
     "step_role describes the step's function, not its wording or language — for example a German step whose raw_text is 'Vollständig durchlaufen lassen.' (let it drain completely) is step_role 'drawdown', exactly like an English 'Let it fully draw down.' would be.",
+    "grind_size must be a SHORT grind descriptor only — a noun phrase like 'Medium-fine' or 'Coarse, like sea salt' — never a full sentence, an instruction, or a total-brew-time statement. It is easy to mis-grab a nearby sentence that merely mentions grinding: 'Grind fine for a total brew time of 2 to 2.5 minutes.' is an INSTRUCTION about brew time, not a grind size, even though it contains the word 'grind'. If the source does not clearly state what grind setting to use, leave grind_size null — do not guess, and do not copy in the surrounding sentence just to have something non-null.",
+    "grind_size_is_stated is true only when the source text itself explicitly described a grind size for this recipe (e.g. 'medium-fine grind' or 'like table salt'); it must be false whenever grind_size is null, and must also be false if you are not confident the exact words you captured describe grind size specifically (as opposed to brew time, brewing method, or an unrelated instruction).",
     ...AMOUNT_PROVENANCE_PROMPT_RULES,
   ].join(" ");
 }
@@ -2289,6 +2399,7 @@ function buildExtractionUserPrompt(input: {
         name: "string|null",
         short_description: "string|null",
         grind_size: "string|null",
+        grind_size_is_stated: "boolean",
         water_temp_celsius: "number|null",
         coffee_amount_grams: "number|null",
         water_amount: "number|null",
@@ -2502,8 +2613,8 @@ function buildRepairSystemPrompt(mode: RecipeDraftParserMode): string {
     "If any step description mentions temperature, normalize that mention to Celsius too.",
     "If recipe.water_temp is not mentioned in the source text, infer a sensible default from the brewing method: use 93 for most filter methods (pour-over, drip, Aeropress, Chemex, Moka), 96 for espresso, 100 for French press or hot immersion, 93 as a safe fallback for any other method.",
     "Exception to the water_temp default above: if the source text explicitly indicates cold, iced, or room-temperature water, or the brewing method is cold brew, do NOT apply a hot-method default (not 93, not 96, not 100). Cold brew is a form of immersion but is not HOT immersion, so the 'French press or hot immersion' rule above must not fire for it. In this case, return null for recipe.water_temp instead of guessing a temperature — a correct null is far better than a confidently wrong hot number, and null here is a reviewable outcome, not an error.",
-    "If localization.grind_size is not mentioned in the source text, infer from the brewing method: 'fine' for espresso or Moka, 'medium-fine' for pour-over or V60, 'medium' for drip or Aeropress, 'coarse' for French press or cold brew, 'medium' as a safe fallback for any other method.",
-    "Never return null for recipe.water_temp or localization.grind_size — always provide an inferred value if the source text is silent — EXCEPT the cold/iced/room-temperature/cold-brew case above, where recipe.water_temp must stay null rather than default to a hot temperature.",
+    "localization.grind_size must be a SHORT grind descriptor only — a noun phrase like 'Medium-fine' or 'Coarse, like sea salt' — never a full sentence, a brewing instruction, or a total-brew-time statement copied from a nearby part of the source text. If the source text does not clearly and specifically describe a grind SIZE (as opposed to brew time, brewing method, or an unrelated instruction that merely happens to be nearby), do not copy that other text in as a substitute: infer from the brewing method instead — 'fine' for espresso or Moka, 'medium-fine' for pour-over or V60, 'medium' for drip or Aeropress, 'coarse' for French press or cold brew, 'medium' as a safe fallback for any other method.",
+    "Never return null for recipe.water_temp or localization.grind_size — always provide a value (a stated grind description, or one of the short inferred phrases above) if the source text is silent — EXCEPT the cold/iced/room-temperature/cold-brew case above, where recipe.water_temp must stay null rather than default to a hot temperature.",
     "recipe.coffee_amount, recipe.water_amount, and recipe.brewing_method_id must come only from what the source text explicitly states. Never invent, estimate, or default these three fields, even when the brewing method makes a typical value obvious.",
     "If the source text does not state a coffee amount, water amount, or brewing method, return null for that specific field. Returning null for these three fields is correct and expected when the source is silent — do not treat it as an error to fix.",
     "short_description must be one concise recipe-level sentence, not a mini step list.",
@@ -3541,14 +3652,39 @@ function resolveTotalBrewTimeTargetSeconds(input: {
   return target > 0 ? target : null;
 }
 
-// Phase B2: a step's duration is ANCHORED — left completely alone by the
-// split below — when the source can be trusted for it. Everything else is
-// DERIVED, meaning no signal ties its duration to the source, so the value
-// currently sitting on it is just whatever a particular model run guessed
-// and must not survive into the final split.
-function isAnchoredBrewStep(step: DraftStep): boolean {
+// Phase B2 / defect-1 fix: a step's duration is ANCHORED — left completely
+// alone by the split below — when the source can be trusted for it.
+// Everything else is DERIVED, meaning no signal ties its duration to the
+// source, so the value currently sitting on it is just whatever a
+// particular model run guessed and must not survive into the final split.
+//
+// elapsed_seconds on its own is NOT such a signal: it is a begins-at
+// timestamp ("at 1:30, pour to 180g" has elapsed_seconds 90), which says
+// nothing about how long the step itself lasts. Treating "start time known"
+// as "duration known" was the defect — a Hario Switch transcript where
+// every brew step happens to carry a start timestamp (including the final
+// drawdown) made every step look anchored, so derivedIndexes came back
+// empty and the deterministic split bailed out entirely, leaving whatever
+// inconsistent durations that model run guessed with no total enforced.
+//
+// The one place a duration genuinely CAN be read off two elapsed
+// timestamps is by differencing them: step N's duration = step (N+1)'s
+// elapsed minus step N's elapsed, which is exactly what
+// normalizeAbsoluteTimestampDurations already computes for every
+// timestamped step that has a successor. That is a real source-derived
+// fact, on par with duration_is_stated, so those indices are anchored too.
+// The LAST timestamped step has no successor to difference against — its
+// duration is a nominal fallback guess (FINAL_TIMESTAMPED_STEP_DURATION_SECONDS),
+// not a source fact — so it must NOT be anchored; it competes for the
+// derived remainder like any other unstated step, which is precisely where
+// a source-stated total should end up being enforced.
+function isAnchoredBrewStep(
+  step: DraftStep,
+  index: number,
+  timestampDifferencedIndexes: ReadonlySet<number>,
+): boolean {
   return step.duration_is_stated === true ||
-    step.elapsed_seconds !== null ||
+    timestampDifferencedIndexes.has(index) ||
     // Defensive guard: this parser never itself infers a duration above the
     // cap, so a duration that exceeds it cannot be one of our own guesses —
     // it must have come from the source (e.g. an 18-hour cold brew steep).
@@ -3733,6 +3869,11 @@ function splitDerivedBrewStepDurationsFromTarget(input: {
   steps: DraftStep[];
   narrowedText: string;
   extractionTotalBrewTimeSeconds: number | null;
+  // Indices whose duration_seconds was computed by differencing two
+  // genuinely known elapsed timestamps (see normalizeAbsoluteTimestampDurations
+  // and the comment on isAnchoredBrewStep above) — as opposed to merely
+  // carrying a non-null elapsed_seconds, which only records a start time.
+  timestampDifferencedIndexes: ReadonlySet<number>;
 }): { steps: DraftStep[]; warnings: string[] } {
   const targetSeconds = resolveTotalBrewTimeTargetSeconds({
     extractionTotalBrewTimeSeconds: input.extractionTotalBrewTimeSeconds,
@@ -3766,7 +3907,7 @@ function splitDerivedBrewStepDurationsFromTarget(input: {
   let anchoredTotal = 0;
   const derivedIndexes: number[] = [];
   for (const { step, index } of brewSteps) {
-    if (isAnchoredBrewStep(step)) {
+    if (isAnchoredBrewStep(step, index, input.timestampDifferencedIndexes)) {
       anchoredTotal += step.duration_seconds;
     } else {
       derivedIndexes.push(index);
@@ -3810,7 +3951,32 @@ function splitDerivedBrewStepDurationsFromTarget(input: {
       isDrawdownLikeStep(input.steps[index])
     )
     .at(-1);
-  const drawdownIndex = matchedDrawdownIndex ?? derivedIndexes.at(-1)!;
+  const fallbackDrawdownIndex = derivedIndexes.at(-1)!;
+  // defect-1: the unconditional "last derived step" fallback above is only
+  // physically sound when that step actually IS the recipe's last brew
+  // step. Fixing isAnchoredBrewStep to stop treating a bare elapsed_seconds
+  // as duration-known can leave the LAST TIMESTAMPED brew step derived
+  // (its duration was never actually known — see
+  // normalizeAbsoluteTimestampDurations) even when a LATER step — e.g. "let
+  // it finish draining completely" — is already anchored and thus never
+  // entered derivedIndexes at all. In that shape the fallback would land on
+  // a mid-recipe pour that still adds water, with the recipe's true tail
+  // sitting untouched after it; forcing an open-ended remainder onto that
+  // pour is exactly the kind of unstated guess this split exists to
+  // eliminate, just relocated. When the fallback step both adds water AND
+  // is not the recipe's actual last brew step, there is no step here it
+  // would be sound to dump the remainder into, so bail out entirely rather
+  // than do that — this does not apply to matchedDrawdownIndex, which is
+  // trusted regardless of position because it reads as a real drawdown (by
+  // wording or step_role) rather than being picked by elimination.
+  if (
+    matchedDrawdownIndex === undefined &&
+    (waterAddedByIndex[fallbackDrawdownIndex] ?? 0) > 0 &&
+    fallbackDrawdownIndex !== brewSteps.at(-1)!.index
+  ) {
+    return { steps: input.steps, warnings: [] };
+  }
+  const drawdownIndex = matchedDrawdownIndex ?? fallbackDrawdownIndex;
   const otherDerivedIndexes = derivedIndexes.filter((index) =>
     index !== drawdownIndex
   );
@@ -3927,7 +4093,11 @@ function normalizeAbsoluteTimestampDurations(input: {
   // duration/elapsed_seconds normalization above it changes values in
   // place, never the count, so it stays on for both modes.
   preserveStepCount: boolean;
-}): { steps: DraftStep[]; warnings: string[] } {
+}): {
+  steps: DraftStep[];
+  warnings: string[];
+  timestampDifferencedIndexes: ReadonlySet<number>;
+} {
   const detectedTimestamped = input.steps
     .map((step, index) => ({
       index,
@@ -3955,6 +4125,7 @@ function normalizeAbsoluteTimestampDurations(input: {
     return {
       steps: input.steps,
       warnings: [],
+      timestampDifferencedIndexes: new Set(),
     };
   }
 
@@ -3966,6 +4137,7 @@ function normalizeAbsoluteTimestampDurations(input: {
     return {
       steps: input.steps,
       warnings: [],
+      timestampDifferencedIndexes: new Set(),
     };
   }
 
@@ -3979,6 +4151,14 @@ function normalizeAbsoluteTimestampDurations(input: {
     narrowedText: input.narrowedText,
   });
 
+  // defect-1: indices whose duration was computed by differencing this
+  // step's own timestamp against a KNOWN successor timestamp — a real
+  // source-derived fact, unlike the last timestamped step (no successor),
+  // whose duration below falls back to a nominal guess
+  // (FINAL_TIMESTAMPED_STEP_DURATION_SECONDS) that must NOT be anchored.
+  // See isAnchoredBrewStep for how this is consumed.
+  const timestampDifferencedIndexes = new Set<number>();
+
   const steps = input.steps.map((step, index) => {
     const timestamp = timestampByIndex.get(index);
     if (timestamp) {
@@ -3986,6 +4166,10 @@ function normalizeAbsoluteTimestampDurations(input: {
       const duration = nextTimestamp
         ? nextTimestamp.timestampSeconds - timestamp.timestampSeconds
         : FINAL_TIMESTAMPED_STEP_DURATION_SECONDS;
+
+      if (nextTimestamp && duration >= MIN_BREW_STEP_DURATION_SECONDS) {
+        timestampDifferencedIndexes.add(index);
+      }
 
       // Canonicalize elapsed_seconds to the resolved timestamp (which may
       // have come from regex text parsing, not just the field itself) so
@@ -4090,6 +4274,7 @@ function normalizeAbsoluteTimestampDurations(input: {
     warnings: adjusted
       ? ["Elapsed-time brew steps were converted to step durations."]
       : [],
+    timestampDifferencedIndexes,
   };
 }
 
@@ -5464,6 +5649,8 @@ function finalizeDraftResponse(input: {
         narrowedText,
         extractionTotalBrewTimeSeconds:
           input.extraction.total_brew_time_seconds,
+        timestampDifferencedIndexes:
+          timestampNormalizedDraftSteps.timestampDifferencedIndexes,
       },
     );
   const durationNormalizedDraftSteps = enforceMinimumStepDurations({
@@ -5511,6 +5698,18 @@ function finalizeDraftResponse(input: {
       detectedInputLanguage: input.detectedInputLanguage,
       extractionTotalBrewTimeSeconds: input.extraction.total_brew_time_seconds,
     });
+
+  // F19: checked against the FINAL published grind_size (post-normalization/
+  // repair, same "sees exactly what the user would be shown" requirement as
+  // G22's own checks below), but the stated/inferred provenance signal only
+  // ever comes from extraction — normalization is instructed to carry
+  // localization fields through rather than re-judge them.
+  const grindSizeWarnings = buildGrindSizeWarnings({
+    grindSize: normalizedWithBalancedCopy.localization.grind_size ??
+      input.extraction.grind_size,
+    grindSizeIsStated: input.extraction.grind_size_is_stated ?? false,
+    detectedInputLanguage: input.detectedInputLanguage,
+  });
 
   // G22: runs AFTER every LLM and deterministic transform above — folding,
   // running-water-total conversion, timestamp normalization, the duration
@@ -5616,6 +5815,7 @@ function finalizeDraftResponse(input: {
       ...validation.warnings,
       ...missingSourceOnlyFieldWarnings,
       ...missingNonEnglishTotalBrewTimeWarnings,
+      ...grindSizeWarnings,
       ...multiplierRepair.warnings,
       ...provenanceWarnings,
       ...timingWarnings,
