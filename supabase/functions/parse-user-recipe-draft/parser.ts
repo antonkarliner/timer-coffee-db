@@ -181,6 +181,44 @@ export const extractionSchema = z.object({
   // presence; see buildGrindSizeWarnings below, the only consumer.
   grind_size_is_stated: z.boolean().optional(),
   water_temp_celsius: z.number().nullable().default(null),
+  // Phase E (plan 020 D5). The extraction AND normalization stages were
+  // each independently doing Fahrenheit->Celsius arithmetic for a STATED
+  // RANGE and writing their own free-text warning describing what they
+  // did — and both were unreliable: `019`'s live run found the arithmetic
+  // wrong (195-205°F emitted as 96.1°C in 4/4, which is 205°F, the HIGH
+  // endpoint, not a midpoint as claimed) and the warning text confidently
+  // describing a computation that did not match the number produced. A
+  // wrong explanation is worse than an open question
+  // (HANDOFF-2026-08-12.md §7) because it stops a reviewer looking further.
+  //
+  // This field asks for literal transcription only — no arithmetic, no
+  // endpoint choice, mirroring amountProvenanceSchema.stated_range above —
+  // so the one thing the model was getting wrong (a subtraction, a
+  // multiplication, and a rounding) is instead done deterministically in
+  // code (see resolveWaterTempStatedRange/normalizeDraftTemperatures
+  // below), and the warning describing it is generated from that same
+  // computation so the two can never disagree.
+  //
+  // Nullable + `.optional()`, not `.default()`: every existing
+  // ExtractionResult object literal in this test suite AND in
+  // verify-user-recipe-draft/handler_test.ts (out of scope for this
+  // change — see plan 020 Phase E's file-ownership rule) predates this
+  // field, the same backward-compatibility reasoning as unit_kind/
+  // stated_range on amountProvenanceSchema above. Always read via
+  // `?? null`, never assume presence.
+  //
+  // Honesty note, same as amountProvenanceSchema.stated_range above: a
+  // prompted field does not bind any more reliably than any other prompt
+  // instruction. This does not guarantee the model transcribes the range
+  // instead of still trying to compute a single value itself — it only
+  // gives code a value to prefer WHEN the model does supply it, and
+  // whether it reliably does is unverifiable offline; see this phase's
+  // final report.
+  water_temp_stated_range: z.object({
+    low: z.number(),
+    high: z.number(),
+    unit: z.enum(["celsius", "fahrenheit"]),
+  }).nullable().optional(),
   coffee_amount_grams: z.number().positive().nullable().default(null),
   water_amount: z.number().positive().nullable().default(null),
   preparation: z.string().trim().min(1).nullable().default(null),
@@ -1105,9 +1143,116 @@ function normalizeTemperatureMentionsInText(
   };
 }
 
+// Phase E (plan 020 D5): resolves ExtractionResult.water_temp_stated_range
+// into a Celsius value using a policy declared explicitly here, in code,
+// because investigation found none declared anywhere before this phase —
+// not in the extraction/normalization prompts, not in any check.
+//
+// Policy: MIDPOINT. Chosen by the user (this phase surfaced the gap and
+// flagged the choice as one for a human to make, not a rediscovery of an
+// existing rule; the reasoning below is theirs, recorded here so the code
+// carries it). total_brew_time_seconds is the closest analogue already in
+// this codebase, and it already uses midpoint (see its rule in
+// buildExtractionSystemPrompt). Both total_brew_time_seconds and water
+// temperature are a stated TARGET BAND where one representative value is
+// required. That is different from coffee_amount_grams/water_amount, whose
+// low-endpoint-when-unresolved rule exists because an amount SCALES and
+// understating it is the conservative error — temperature has no such
+// asymmetry between its two endpoints. Concretely: 93.3°C (the midpoint of
+// 195-205°F) sits inside the conventional 92-96°C pour-over window, while
+// 90.6°C (that range's low endpoint) falls below it.
+function resolveWaterTempStatedRange(
+  range:
+    | { low: number; high: number; unit: "celsius" | "fahrenheit" }
+    | null
+    | undefined,
+): { celsius: number; sourceLabel: string } | null {
+  if (
+    !range || !Number.isFinite(range.low) || !Number.isFinite(range.high)
+  ) {
+    return null;
+  }
+
+  const statedLow = Math.min(range.low, range.high);
+  const statedHigh = Math.max(range.low, range.high);
+  const unitLabel = range.unit === "fahrenheit" ? "F" : "C";
+  const toCelsius = (value: number) =>
+    range.unit === "fahrenheit"
+      ? convertFahrenheitToCelsius(value)
+      : Number(value.toFixed(1));
+
+  // Average the two STATED endpoints first, then convert the single
+  // resulting midpoint — do not convert each endpoint and average the
+  // results. Fahrenheit->Celsius is an affine map (v => (v-32) * 5/9), so
+  // it commutes with averaging: both orders are mathematically identical.
+  // But averaging first means only ONE rounding step (inside
+  // convertFahrenheitToCelsius's own .toFixed(1)) instead of two. This
+  // matters because a Fahrenheit range with an odd-degree sum lands its
+  // midpoint on a half-degree — e.g. 205-210°F's midpoint is 207.5°F, not
+  // a whole number — and converting that single half-degree value once
+  // still rounds cleanly to one decimal (207.5°F -> 97.5°C exactly);
+  // converting 205°F and 210°F separately, rounding each to 1 decimal, and
+  // THEN averaging risks a rounding artifact shifting the last digit away
+  // from the true midpoint.
+  const statedMidpoint = (statedLow + statedHigh) / 2;
+
+  return {
+    celsius: toCelsius(statedMidpoint),
+    sourceLabel: `${formatTemperatureNumber(statedLow)}-${
+      formatTemperatureNumber(statedHigh)
+    }°${unitLabel}`,
+  };
+}
+
+// Any warning describing HOW a stated temperature range was converted is
+// the model's own free-text claim about a computation — the exact class of
+// claim `019` found self-contradictory (plan 020 D5: e.g. a warning naming
+// 96.1°C "the midpoint of 207.5°F", when 96.1°C cannot be that midpoint
+// under any policy). It is safe to filter on English keywords here, unlike
+// over source recipe text which may be any language: `warnings` is
+// diagnostic parser commentary the prompt explicitly tells the model it
+// may always write in English regardless of source language (see
+// buildNormalizationSystemPrompt's "warnings is diagnostic parser
+// commentary" rule), so this is bookkeeping over our own tool's
+// English-only commentary channel, not a semantic judgement about
+// multilingual recipe prose — the thing CLAUDE.md forbids regexing over.
+// And the failure mode of a missed/over-eager match here is bounded and
+// mild either way: at worst a stale-but-plausible warning stays (or a
+// harmless one is dropped) — never a wrong VALUE, since this regex never
+// touches water_temp itself, only which warnings accompany it.
+const WATER_TEMP_RANGE_CONVERSION_WARNING_PATTERN =
+  /\btemperature\b[^.]*\b(?:fahrenheit|°f|range)\b/i;
+
+function stripWaterTempRangeConversionWarnings(
+  warnings: string[],
+): string[] {
+  return warnings.filter((warning) =>
+    !WATER_TEMP_RANGE_CONVERSION_WARNING_PATTERN.test(warning)
+  );
+}
+
+function buildWaterTempRangeWarning(
+  resolved: { celsius: number; sourceLabel: string },
+): string {
+  return `Water temperature was normalized from the stated ${resolved.sourceLabel} range to its midpoint, ${
+    formatTemperatureNumber(resolved.celsius)
+  }°C.`;
+}
+
 function normalizeExtractionTemperatures(
   extraction: ExtractionResult,
 ): ExtractionResult {
+  const resolvedRange = resolveWaterTempStatedRange(
+    extraction.water_temp_stated_range ?? null,
+  );
+
+  if (resolvedRange) {
+    return {
+      ...extraction,
+      water_temp_celsius: resolvedRange.celsius,
+    };
+  }
+
   const normalizedTemperature = normalizeTemperatureToCelsius(
     extraction.water_temp_celsius,
   );
@@ -1120,7 +1265,38 @@ function normalizeExtractionTemperatures(
 
 function normalizeDraftTemperatures(
   normalized: NormalizedDraft,
+  extraction: ExtractionResult,
 ): NormalizedDraft {
+  const resolvedRange = resolveWaterTempStatedRange(
+    extraction.water_temp_stated_range ?? null,
+  );
+  const strippedWarnings = stripWaterTempRangeConversionWarnings(
+    normalized.warnings,
+  );
+
+  if (resolvedRange) {
+    // Deterministic path: the value and its warning both come from the
+    // SAME computation right here, so they cannot disagree (plan 020 D5).
+    return {
+      ...normalized,
+      warnings: uniqueStrings([
+        ...strippedWarnings,
+        buildWaterTempRangeWarning(resolvedRange),
+      ]),
+      recipe: {
+        ...normalized.recipe,
+        water_temp: resolvedRange.celsius,
+      },
+    };
+  }
+
+  // Fallback path: no structured range to verify against — every capture
+  // recorded before this phase, and any provider/response that predates
+  // the field, land here. Per plan 020 D5, an unverifiable claim about how
+  // a range was converted is stripped rather than trusted: an open
+  // question beats a confidently wrong explanation
+  // (HANDOFF-2026-08-12.md §7). The >120 heuristic below still catches a
+  // single (non-range) Fahrenheit value the model forgot to convert at all.
   const normalizedTemperature = normalizeTemperatureToCelsius(
     normalized.recipe.water_temp,
   );
@@ -1129,10 +1305,10 @@ function normalizeDraftTemperatures(
     ...normalized,
     warnings: normalizedTemperature.wasConverted
       ? uniqueStrings([
-        ...normalized.warnings,
+        ...strippedWarnings,
         "Water temperature was normalized to Celsius.",
       ])
-      : normalized.warnings,
+      : strippedWarnings,
     recipe: {
       ...normalized.recipe,
       water_temp: normalizedTemperature.value,
@@ -2410,6 +2586,7 @@ function buildExtractionSystemPrompt(): string {
     "Normalize all temperatures to Celsius before returning them.",
     "If the source text uses Fahrenheit, convert it to Celsius.",
     "Temperature fields must be bare JSON numbers only, never strings, never include units like C, F, °C, or °F.",
+    "If the source states water temperature as a RANGE (e.g. '195-205°F', '92-96°C', '92-96 Grad'), also fill water_temp_stated_range with the two endpoints EXACTLY AS STATED — do not convert them, do not average them, do not pick one: { low, high, unit }, where unit is 'fahrenheit' or 'celsius' matching whatever the source used, and low/high are the literal numbers from the source in that same original unit, regardless of which is numerically smaller. This is pure transcription, the same as stated_range on extracted_amounts below — a downstream step, not you, converts and picks an endpoint from these two numbers, so do not also try to compute water_temp_celsius as a clever conversion of the range; a plain best-effort single value there is fine as a fallback. Leave water_temp_stated_range null when the source states only a single water temperature, not a range.",
     "Use null for anything not clearly stated or safely inferable.",
     "Separate untimed preparation/setup content from timed brew steps.",
     "Notes are optional and should only contain parser-relevant caveats such as ambiguity, inference, conversion, or repair concerns.",
@@ -2454,6 +2631,8 @@ function buildExtractionUserPrompt(input: {
         grind_size: "string|null",
         grind_size_is_stated: "boolean",
         water_temp_celsius: "number|null",
+        water_temp_stated_range:
+          "{ low: number, high: number, unit: 'fahrenheit'|'celsius' }|null",
         coffee_amount_grams: "number|null",
         water_amount: "number|null",
         preparation: "string|null",
@@ -2497,6 +2676,7 @@ function buildExtractionUserPrompt(input: {
       ? `Source language hint: ${input.sourceLanguageHint}`
       : "Source language hint: none",
     "Return water_temp_celsius as a bare JSON number in Celsius only. Example: 96 or 96.1, not '96C'.",
+    "water_temp_stated_range is for a STATED RANGE only (e.g. '195-205°F'): transcribe low/high literally in the source's own unit, do not convert or compute anything for it. Leave it null for a single stated temperature.",
     "Recipe text:",
     input.text,
   ].join("\n\n");
@@ -6984,7 +7164,7 @@ export function replayFinalizeDraftResponseFromStageOutputs(input: {
       "no captured normalization attempt could be reconstructed (every attempt errored, was null, or failed normalizedDraftSchema re-validation) — cannot replay the gate for this capture.",
     );
   }
-  normalized = normalizeDraftTemperatures(normalized);
+  normalized = normalizeDraftTemperatures(normalized, extraction);
   normalized = applyExtractionFallbacks({ normalized, extraction });
 
   // --- repair: only "counts" once the SAME missing/malformed-field check
@@ -7006,6 +7186,7 @@ export function replayFinalizeDraftResponseFromStageOutputs(input: {
     }
     const repairedWithNormalizedTemperatures = normalizeDraftTemperatures(
       repaired,
+      extraction,
     );
     const repairedWithFallbacks = applyExtractionFallbacks({
       normalized: repairedWithNormalizedTemperatures,
@@ -7443,7 +7624,7 @@ export function createRecipeDraftParser(
         );
       }
 
-      normalized = normalizeDraftTemperatures(normalized);
+      normalized = normalizeDraftTemperatures(normalized, extraction);
       normalized = applyExtractionFallbacks({
         normalized,
         extraction,
@@ -7513,6 +7694,7 @@ export function createRecipeDraftParser(
               const repairedWithNormalizedTemperatures =
                 normalizeDraftTemperatures(
                   repaired,
+                  extraction,
                 );
               const repairedWithFallbacks = applyExtractionFallbacks({
                 normalized: repairedWithNormalizedTemperatures,

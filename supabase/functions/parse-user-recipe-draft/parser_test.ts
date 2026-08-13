@@ -2403,6 +2403,298 @@ Deno.test("normalizes Fahrenheit water temperatures to Celsius", async () => {
   );
 });
 
+// Phase E (plan 020 D5). Each test below feeds a WRONG water_temp/warning
+// pair shaped exactly like one of the four live captures `019` §4 found
+// (see plan 020's task brief table), alongside a water_temp_stated_range
+// carrying the LITERAL range those captures actually stated. The point is
+// not just "the number is right" — it is that the model's own
+// self-contradictory warning is replaced outright, never merged alongside
+// the correct one, and the surviving warning is built from the SAME number
+// the draft emits so the two can never disagree again.
+
+Deno.test("D5: 195-205°F range (French press shape) resolves deterministically to its midpoint, replacing a self-contradictory 'midpoint' warning", async () => {
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction: {
+          ...createExtraction(),
+          // Live capture 37daf1ec: raw water_temp_celsius came back 96.1,
+          // which is 205°F (the HIGH endpoint) converted, not a midpoint —
+          // even though the accompanying warning already claimed "midpoint".
+          water_temp_celsius: 96.1,
+          water_temp_stated_range: { low: 195, high: 205, unit: "fahrenheit" },
+        },
+        normalized: {
+          ...createNormalized(),
+          warnings: [
+            "Water temperature converted from the stated 195-205°F range; midpoint used.",
+          ],
+          recipe: {
+            ...createNormalized().recipe,
+            water_temp: 96.1,
+          },
+        },
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: "Use water between 195-205°F.",
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [{ brewing_method_id: "frenchpress", brewing_method: "French Press" }],
+    requestId: "req-d5-195-205",
+  });
+
+  // True midpoint of 195-205°F is 200°F = 93.3°C — NOT 96.1°C (that is the
+  // HIGH endpoint, 205°F, which is what the model actually emitted while
+  // mislabeling it "midpoint") and NOT 90.6°C (the low endpoint).
+  assertEquals(
+    result.draft.recipe.water_temp,
+    93.3,
+    "Expected the deterministic midpoint conversion of 195-205°F, not the model's own (wrong) arithmetic.",
+  );
+  assertEquals(
+    result.extraction.water_temp_celsius,
+    93.3,
+    "Expected extraction.water_temp_celsius to also reflect the deterministic conversion.",
+  );
+  assert(
+    result.warnings.includes(
+      "Water temperature was normalized from the stated 195-205°F range to its midpoint, 93.3°C.",
+    ),
+    "Expected a warning built from the value actually emitted.",
+  );
+  assert(
+    !result.warnings.includes(
+      "Water temperature converted from the stated 195-205°F range; midpoint used.",
+    ),
+    "Expected the model's own self-contradictory warning (right label, wrong number) to be replaced, not kept alongside the correct one.",
+  );
+});
+
+Deno.test("D5: 201-205°F range (flash-chilled shape) resolves deterministically to its midpoint, correcting a warning that already showed the arithmetic disagreeing with itself", async () => {
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction: {
+          ...createExtraction(),
+          // Live capture 2c6f58de: raw water_temp_celsius came back 95.6,
+          // with a warning that spelled out BOTH converted endpoints
+          // (93.9°C and 96.1°C) and claimed "midpoint used" — but the
+          // actual midpoint of 93.9 and 96.1 is 95.0, not 95.6. The
+          // warning's own numbers already disprove its own value.
+          water_temp_celsius: 95.6,
+          water_temp_stated_range: { low: 201, high: 205, unit: "fahrenheit" },
+        },
+        normalized: {
+          ...createNormalized(),
+          warnings: [
+            "Water temperature range 201-205°F converted to 93.9-96.1°C; midpoint used.",
+          ],
+          recipe: {
+            ...createNormalized().recipe,
+            water_temp: 95.6,
+          },
+        },
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: "Use water between 201-205°F.",
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [{ brewing_method_id: "v60", brewing_method: "Hario V60" }],
+    requestId: "req-d5-201-205",
+  });
+
+  // Midpoint of 201-205°F is 203°F = 95.0°C exactly; formatTemperatureNumber
+  // drops the trailing zero (the existing convention, unchanged by this
+  // phase), so both the numeric field and the warning read "95".
+  assertEquals(
+    result.draft.recipe.water_temp,
+    95,
+    "Expected the deterministic midpoint conversion of 201-205°F (203°F = 95.0°C), not the model's own 95.6°C.",
+  );
+  assert(
+    result.warnings.includes(
+      "Water temperature was normalized from the stated 201-205°F range to its midpoint, 95°C.",
+    ),
+    "Expected a warning built from the value actually emitted.",
+  );
+  assert(
+    !result.warnings.some((warning) => warning.includes("95.6")),
+    "Expected the model's wrong 95.6°C claim to be gone entirely.",
+  );
+});
+
+Deno.test("D5: 205-210°F range (moka pot shape) resolves deterministically to its midpoint, correcting a warning that named the right policy and the wrong number", async () => {
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction: {
+          ...createExtraction(),
+          // Live capture ce4ad3b0: raw water_temp_celsius came back 96.1,
+          // with a warning explicitly naming 96.1°C "the midpoint of
+          // 207.5°F" — but 207.5°F actually converts to 97.5°C. 96.1°C
+          // cannot be that midpoint under any policy (it is 205°F, the low
+          // endpoint) — the exact self-contradiction plan 020 D5 exists to
+          // remove.
+          water_temp_celsius: 96.1,
+          water_temp_stated_range: { low: 205, high: 210, unit: "fahrenheit" },
+        },
+        normalized: {
+          ...createNormalized(),
+          warnings: [
+            "Water temperature converted from the stated 205-210°F range using its midpoint (207.5°F).",
+          ],
+          recipe: {
+            ...createNormalized().recipe,
+            water_temp: 96.1,
+          },
+        },
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: "Use water between 205-210°F.",
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [{ brewing_method_id: "moka", brewing_method: "Moka Pot" }],
+    requestId: "req-d5-205-210",
+  });
+
+  // True midpoint of 205-210°F is 207.5°F = 97.5°C, not 96.1°C (205°F, the
+  // low endpoint — what the model actually emitted despite its own label).
+  assertEquals(
+    result.draft.recipe.water_temp,
+    97.5,
+    "Expected the deterministic midpoint conversion of 205-210°F (207.5°F = 97.5°C), correcting the model's arithmetic even though its stated policy (midpoint) was already the one this phase settled on.",
+  );
+  assert(
+    result.warnings.includes(
+      "Water temperature was normalized from the stated 205-210°F range to its midpoint, 97.5°C.",
+    ),
+    "Expected a warning built from the value actually emitted.",
+  );
+  assert(
+    !result.warnings.includes(
+      "Water temperature converted from the stated 205-210°F range using its midpoint (207.5°F).",
+    ),
+    "Expected the model's self-contradictory warning (96.1°C claimed as the midpoint of 207.5°F) to be gone entirely, not left alongside the correct 97.5°C warning.",
+  );
+});
+
+Deno.test("D5: a stated Celsius range also resolves to its midpoint (policy is unit-agnostic)", async () => {
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction: {
+          ...createExtraction(),
+          water_temp_celsius: 92,
+          water_temp_stated_range: { low: 92, high: 96, unit: "celsius" },
+        },
+        normalized: {
+          ...createNormalized(),
+          warnings: [],
+          recipe: {
+            ...createNormalized().recipe,
+            water_temp: 92,
+          },
+        },
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: "Use water between 92-96°C.",
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [{ brewing_method_id: "v60", brewing_method: "Hario V60" }],
+    requestId: "req-d5-92-96c",
+  });
+
+  // Midpoint of 92-96°C is 94°C. Note this is a deliberate DEPARTURE from
+  // plan 015's incidental (never enforced in code) 92-96°C -> 92°C
+  // behaviour — this phase's low-endpoint draft used that low-endpoint
+  // precedent as its rationale, but the policy actually chosen (see
+  // resolveWaterTempStatedRange's comment) is midpoint, matching
+  // total_brew_time_seconds's already-established rule for a stated target
+  // band instead.
+  assertEquals(
+    result.draft.recipe.water_temp,
+    94,
+    "Expected the midpoint of a Celsius-stated range.",
+  );
+  assert(
+    result.warnings.includes(
+      "Water temperature was normalized from the stated 92-96°C range to its midpoint, 94°C.",
+    ),
+    "Expected a warning built from the value actually emitted.",
+  );
+});
+
+Deno.test("D5: without a structured water_temp_stated_range, an unverifiable range-conversion warning is stripped rather than trusted, and the emitted value is left alone", async () => {
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction: {
+          ...createExtraction(),
+          water_temp_celsius: 96.1,
+          // No water_temp_stated_range — this is every capture recorded
+          // before this phase, and any provider response that predates
+          // the field.
+        },
+        normalized: {
+          ...createNormalized(),
+          warnings: [
+            "Water temperature converted from the stated 195-205°F range; midpoint used.",
+          ],
+          recipe: {
+            ...createNormalized().recipe,
+            water_temp: 96.1,
+          },
+        },
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: "Use water between 195-205°F.",
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [{ brewing_method_id: "frenchpress", brewing_method: "French Press" }],
+    requestId: "req-d5-fallback",
+  });
+
+  // No structured range to verify against, so the value is left exactly as
+  // the model produced it (96.1, not <= 120 so the >120 heuristic never
+  // fires either) — this phase does not claim to fix the NUMBER without
+  // live evidence that the model reliably fills the new field. Only the
+  // untrustworthy WARNING is removed.
+  assertEquals(
+    result.draft.recipe.water_temp,
+    96.1,
+    "Expected the value to pass through unchanged in the fallback (no structured range) path.",
+  );
+  assert(
+    !result.warnings.some((warning) => warning.includes("midpoint")),
+    "Expected the model's unverifiable range-conversion claim to be stripped even without a structured range to correct it against — an open question beats a confidently wrong explanation.",
+  );
+});
+
 Deno.test("normalizes temperature mentions inside step descriptions to Celsius", async () => {
   const parser = createRecipeDraftParser({
     providers: [
