@@ -14923,3 +14923,822 @@ Deno.test("Phase D: a record with no stated_range and no range_endpoint rule is 
     }`,
   );
 });
+
+// ---------------------------------------------------------------------
+// D10 (plan 020 §3, following 5cc31dc's "a known start time is not a known
+// duration" precedent): a drawdown step's elapsed_seconds equal to the
+// recipe's own resolved completion target is stating when the brew ENDS,
+// not when the drawdown BEGAN — a step that "begins" exactly when the
+// whole recipe ends would have zero duration left to occupy, which is
+// incoherent. normalizeAbsoluteTimestampDurations used to trust it as a
+// differencing partner anyway, so the step immediately before it absorbed
+// the gap between its own timestamp and the bogus "180s start" as its own
+// duration; the anchored chain then summed to exactly the target,
+// splitDerivedBrewStepDurationsFromTarget's `available === 0` bail-out
+// declined to touch anything else, and the leftover derived steps' raw
+// unreconciled guesses were left standing on top of the already-"complete"
+// total. Live effect (German V60, source states 180s): 250s and 260s
+// emitted across three captures; a fourth (same recipe, drawdown
+// elapsed_seconds: null) correctly landed on 180s throughout.
+//
+// isUntrustworthyDrawdownEndMarker (parser.ts) now disqualifies exactly
+// that one candidate as a differencing PARTNER — not from `timestamped`
+// altogether, so the step keeps every other consequence of being the last
+// timestamped step (its own nominal fallback duration, lastTimestamped
+// bookkeeping, elapsed_seconds canonicalization).
+// ---------------------------------------------------------------------
+
+Deno.test("D10: a drawdown's elapsed_seconds equal to the stated total is not trusted as a differencing partner, so the total lands on target (German round-3 live-incident shape)", async () => {
+  // Mirrors the live-capture shape exactly: bloom (elapsed 0), a pour
+  // differenced against it (elapsed 30), two further pours sharing the
+  // SAME elapsed_seconds (90 -- a landmark-resolution tie, not a stated
+  // zero-duration step), and a drawdown whose elapsed_seconds (180) equals
+  // the stated 180s total. Before this fix, the last pour (elapsed 90)
+  // differenced against the drawdown's bogus "start" at 180, producing a
+  // wrong 90s anchored duration; the anchored chain (30 + 60 + 90) summed
+  // to exactly 180, the split bailed out with nothing left to distribute,
+  // and the two untouched derived steps' raw guesses (60 + 10) landed on
+  // top: 250s against a stated 180s.
+  const extraction: ExtractionResult = {
+    extracted_amounts: [],
+    detected_input_language: "de",
+    likely_brewing_method: "V60",
+    name: "D10 German shape",
+    short_description: "Tests D10's drawdown-equals-target fix.",
+    grind_size: "Mittel",
+    water_temp_celsius: 93,
+    coffee_amount_grams: 20,
+    water_amount: 300,
+    preparation: "Filter spuelen und Kaffee hinzufuegen.",
+    steps: [
+      {
+        title: null,
+        raw_text: "Gieße 25g Wasser auf (Bloom).",
+        duration_seconds: 30,
+        elapsed_seconds: 0,
+        starts_timer: true,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: "bloom",
+      },
+      {
+        title: null,
+        raw_text: "Bei 0:30 weitere 50-70g Wasser aufgießen.",
+        duration_seconds: 60,
+        elapsed_seconds: 30,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: "pour",
+      },
+      {
+        title: null,
+        raw_text: "Auf insgesamt 175g aufgießen.",
+        duration_seconds: 60,
+        elapsed_seconds: 90,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: "pour",
+      },
+      {
+        title: null,
+        raw_text: "Nach einer weiteren Minute auf insgesamt 300g aufgießen.",
+        duration_seconds: 10,
+        elapsed_seconds: 90,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: "pour",
+      },
+      {
+        title: null,
+        raw_text: "Vollständig durchlaufen lassen.",
+        duration_seconds: 10,
+        elapsed_seconds: 180,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: "drawdown",
+      },
+    ],
+    notes: [],
+    total_brew_time_seconds: 180,
+  };
+  const normalized: NormalizedDraft = {
+    extracted_amounts: [],
+    detected_input_language: "de",
+    warnings: [],
+    recipe: {
+      brewing_method_id: "v60",
+      brewing_method_confidence: "high",
+      coffee_amount: 20,
+      water_amount: 300,
+      water_temp: 93,
+    },
+    localization: {
+      name: "D10 German shape",
+      grind_size: "Mittel",
+      short_description: "Tests D10's drawdown-equals-target fix.",
+    },
+    steps: [
+      {
+        kind: "preparation",
+        description_source: "Filter spuelen und Kaffee hinzufuegen.",
+        description_template: "Filter spuelen und Kaffee hinzufuegen.",
+        duration_seconds: 0,
+        elapsed_seconds: null,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: "preparation",
+      },
+      {
+        kind: "brew",
+        description_source: "Gieße 25g Wasser auf (Bloom).",
+        description_template: "Gieße 25g Wasser auf (Bloom).",
+        duration_seconds: 30,
+        elapsed_seconds: 0,
+        starts_timer: true,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: "bloom",
+      },
+      {
+        kind: "brew",
+        description_source: "Bei 0:30 weitere 50-70g Wasser aufgießen.",
+        description_template: "Bei 0:30 weitere 50g Wasser aufgießen.",
+        duration_seconds: 60,
+        elapsed_seconds: 30,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: "pour",
+      },
+      {
+        kind: "brew",
+        description_source: "Auf insgesamt 175g aufgießen.",
+        description_template: "Auf insgesamt 175g aufgießen.",
+        duration_seconds: 60,
+        elapsed_seconds: 90,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: "pour",
+      },
+      {
+        kind: "brew",
+        description_source:
+          "Nach einer weiteren Minute auf insgesamt 300g aufgießen.",
+        description_template:
+          "Nach einer weiteren Minute auf insgesamt 300g aufgießen.",
+        duration_seconds: 10,
+        elapsed_seconds: 90,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: "pour",
+      },
+      {
+        kind: "brew",
+        description_source: "Vollständig durchlaufen lassen.",
+        description_template: "Vollständig durchlaufen lassen.",
+        duration_seconds: 10,
+        elapsed_seconds: 180,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: "drawdown",
+      },
+    ],
+  };
+
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction,
+        normalized,
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: "Mock German V60 recipe",
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Hario V60" },
+    ],
+    requestId: "req-d10-german-shape",
+  });
+
+  assertEquals(
+    result.draft.recipe.brew_time_seconds,
+    180,
+    "Expected the stated 180s total to be enforced instead of the pre-fix 250s overshoot.",
+  );
+  assertEquals(
+    result.draft.steps.map((step) => step.duration_seconds).reduce(
+      (sum, value) => sum + value,
+      0,
+    ),
+    180,
+    "Expected brew step durations to sum to exactly the stated 180s target.",
+  );
+  for (const step of result.draft.steps.filter((s) => s.kind === "brew")) {
+    assert(
+      step.duration_seconds >= 10,
+      `Expected every brew step to stay at or above the 10s minimum. Got: ${
+        JSON.stringify(result.draft.steps.map((s) => s.duration_seconds))
+      }`,
+    );
+  }
+  assertEquals(
+    result.draft.steps[5].elapsed_seconds,
+    180,
+    "Expected the drawdown's own elapsed_seconds to be left exactly as reported (only its use as a differencing PARTNER is suppressed).",
+  );
+  assertEquals(
+    result.draft.steps[5].step_role,
+    "drawdown",
+    "Sanity check: this fixture's drawdown is genuinely labelled step_role drawdown.",
+  );
+  assertEquals(
+    result.validation.is_publishable,
+    true,
+    "Expected the corrected 180s total to no longer trip total_brew_time_mismatch.",
+  );
+  assert(
+    !result.validation.issues.some((issue) =>
+      issue.code === "total_brew_time_mismatch"
+    ),
+    `Expected no total_brew_time_mismatch issue. Got: ${
+      JSON.stringify(result.validation.issues)
+    }`,
+  );
+});
+
+Deno.test("D10: a drawdown with elapsed_seconds null is unaffected — behaves exactly as it did before this fix (control)", async () => {
+  // Identical German recipe to the test above, except the drawdown never
+  // carried an elapsed_seconds at all (mirrors the fourth live capture,
+  // which never hit this defect and already landed on 180s throughout).
+  // A null elapsed_seconds was never part of `timestamped` to begin with,
+  // so isUntrustworthyDrawdownEndMarker never has a candidate to consider
+  // for this shape — confirmed by diffing this test's output against the
+  // pre-D10 parser.ts: byte-identical.
+  const extraction: ExtractionResult = {
+    extracted_amounts: [],
+    detected_input_language: "de",
+    likely_brewing_method: "V60",
+    name: "D10 control null elapsed",
+    short_description: "Control: drawdown elapsed null.",
+    grind_size: "Mittel",
+    water_temp_celsius: 93,
+    coffee_amount_grams: 20,
+    water_amount: 300,
+    preparation: "Filter spuelen und Kaffee hinzufuegen.",
+    steps: [
+      {
+        title: null,
+        raw_text: "Gieße 25g Wasser auf (Bloom).",
+        duration_seconds: 30,
+        elapsed_seconds: 0,
+        starts_timer: true,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: "bloom",
+      },
+      {
+        title: null,
+        raw_text: "Bei 0:30 auf insgesamt 50-70g Wasser aufgießen.",
+        duration_seconds: 60,
+        elapsed_seconds: 30,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: "pour",
+      },
+      {
+        title: null,
+        raw_text: "Bei 1:30 auf insgesamt 175g Wasser aufgießen.",
+        duration_seconds: 13,
+        elapsed_seconds: 90,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: "pour",
+      },
+      {
+        title: null,
+        raw_text: "Auf insgesamt 300g Wasser aufgießen.",
+        duration_seconds: 16,
+        elapsed_seconds: 90,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: "pour",
+      },
+      {
+        title: null,
+        raw_text: "Vollständig durchlaufen lassen.",
+        duration_seconds: 61,
+        elapsed_seconds: null,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: "drawdown",
+      },
+    ],
+    notes: [],
+    total_brew_time_seconds: 180,
+  };
+  const normalized: NormalizedDraft = {
+    extracted_amounts: [],
+    detected_input_language: "de",
+    warnings: [],
+    recipe: {
+      brewing_method_id: "v60",
+      brewing_method_confidence: "high",
+      coffee_amount: 20,
+      water_amount: 300,
+      water_temp: 93,
+    },
+    localization: {
+      name: "D10 control null elapsed",
+      grind_size: "Mittel",
+      short_description: "Control: drawdown elapsed null.",
+    },
+    steps: [
+      {
+        kind: "preparation",
+        description_source: "Filter spuelen und Kaffee hinzufuegen.",
+        description_template: "Filter spuelen und Kaffee hinzufuegen.",
+        duration_seconds: 0,
+        elapsed_seconds: null,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: "preparation",
+      },
+      {
+        kind: "brew",
+        description_source: "Gieße 25g Wasser auf (Bloom).",
+        description_template: "Gieße 25g Wasser auf (Bloom).",
+        duration_seconds: 30,
+        elapsed_seconds: 0,
+        starts_timer: true,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: "bloom",
+      },
+      {
+        kind: "brew",
+        description_source: "Bei 0:30 auf insgesamt 50-70g Wasser aufgießen.",
+        description_template: "Bei 0:30 auf insgesamt 50g Wasser aufgießen.",
+        duration_seconds: 60,
+        elapsed_seconds: 30,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: "pour",
+      },
+      {
+        kind: "brew",
+        description_source: "Bei 1:30 auf insgesamt 175g Wasser aufgießen.",
+        description_template: "Bei 1:30 auf insgesamt 175g Wasser aufgießen.",
+        duration_seconds: 13,
+        elapsed_seconds: 90,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: "pour",
+      },
+      {
+        kind: "brew",
+        description_source: "Auf insgesamt 300g Wasser aufgießen.",
+        description_template: "Auf insgesamt 300g Wasser aufgießen.",
+        duration_seconds: 16,
+        elapsed_seconds: 90,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: "pour",
+      },
+      {
+        kind: "brew",
+        description_source: "Vollständig durchlaufen lassen.",
+        description_template: "Vollständig durchlaufen lassen.",
+        duration_seconds: 61,
+        elapsed_seconds: null,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: "drawdown",
+      },
+    ],
+  };
+
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction,
+        normalized,
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: "Mock German V60 recipe, null-elapsed drawdown",
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Hario V60" },
+    ],
+    requestId: "req-d10-control-null-elapsed",
+  });
+
+  assertEquals(
+    result.draft.steps.map((step) => step.duration_seconds),
+    [0, 30, 60, 16, 16, 58],
+    "Expected the exact same split this shape already produced before D10 (a null elapsed_seconds was never part of the differencing pool).",
+  );
+  assertEquals(
+    result.draft.recipe.brew_time_seconds,
+    180,
+    "Expected the stated 180s total, unaffected by this fix.",
+  );
+  assertEquals(
+    result.validation.is_publishable,
+    true,
+    "Expected this control to remain publishable, exactly as before.",
+  );
+});
+
+Deno.test("D10: two consecutive brew steps sharing the same elapsed_seconds are landmark-resolution noise, not a zero-duration anchor (unaffected by this fix)", async () => {
+  // Isolates the collision case named in plan 020 D10 explicitly: two
+  // steps resolving to the identical elapsed_seconds (a source landmark
+  // being restated, not two genuinely simultaneous actions) must not be
+  // read as "this step's duration is 0" and anchored at zero — the
+  // pre-existing `naturalDuration >= MIN_BREW_STEP_DURATION_SECONDS` guard
+  // already protects this, and no drawdown-equals-target marker is
+  // involved here at all, so this fixture's result must be byte-identical
+  // before and after the D10 fix (confirmed by diffing against the
+  // pre-fix parser.ts).
+  const extraction: ExtractionResult = {
+    extracted_amounts: [],
+    detected_input_language: "en",
+    likely_brewing_method: "V60",
+    name: "D10 landmark collision",
+    short_description: "Tests shared elapsed noise is not turned into a zero anchor.",
+    grind_size: "Medium",
+    water_temp_celsius: 93,
+    coffee_amount_grams: 18,
+    water_amount: 280,
+    preparation: "Rinse filter and add coffee.",
+    steps: [
+      {
+        title: null,
+        raw_text: "Bloom with water.",
+        duration_seconds: 30,
+        elapsed_seconds: 0,
+        starts_timer: true,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: "bloom",
+      },
+      {
+        title: null,
+        raw_text: "At 1:35 put the pitcher on.",
+        duration_seconds: 5,
+        elapsed_seconds: 95,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: "pour",
+      },
+      {
+        title: null,
+        raw_text: "At 1:40, pour to the top.",
+        duration_seconds: 40,
+        elapsed_seconds: 95,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: "pour",
+      },
+      {
+        title: null,
+        raw_text: "Let it draw down.",
+        duration_seconds: 10,
+        elapsed_seconds: null,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: "drawdown",
+      },
+    ],
+    notes: [],
+    total_brew_time_seconds: 150,
+  };
+  const normalized: NormalizedDraft = {
+    extracted_amounts: [],
+    detected_input_language: "en",
+    warnings: [],
+    recipe: {
+      brewing_method_id: "v60",
+      brewing_method_confidence: "high",
+      coffee_amount: 18,
+      water_amount: 280,
+      water_temp: 93,
+    },
+    localization: {
+      name: "D10 landmark collision",
+      grind_size: "Medium",
+      short_description:
+        "Tests shared elapsed noise is not turned into a zero anchor.",
+    },
+    steps: [
+      {
+        kind: "preparation",
+        description_source: "Rinse filter and add coffee.",
+        description_template: "Rinse filter and add coffee.",
+        duration_seconds: 0,
+        elapsed_seconds: null,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: "preparation",
+      },
+      {
+        kind: "brew",
+        description_source: "Bloom with water.",
+        description_template: "Bloom with water.",
+        duration_seconds: 30,
+        elapsed_seconds: 0,
+        starts_timer: true,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: "bloom",
+      },
+      {
+        kind: "brew",
+        description_source: "At 1:35 put the pitcher on.",
+        description_template: "At 1:35 put the pitcher on.",
+        duration_seconds: 5,
+        elapsed_seconds: 95,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: "pour",
+      },
+      {
+        kind: "brew",
+        description_source: "At 1:40, pour to the top.",
+        description_template: "At 1:40, pour to the top.",
+        duration_seconds: 40,
+        elapsed_seconds: 95,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: "pour",
+      },
+      {
+        kind: "brew",
+        description_source: "Let it draw down.",
+        description_template: "Let it draw down.",
+        duration_seconds: 10,
+        elapsed_seconds: null,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: "drawdown",
+      },
+    ],
+  };
+
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction,
+        normalized,
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: "Mock recipe with a shared elapsed landmark",
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Hario V60" },
+    ],
+    requestId: "req-d10-landmark-collision",
+  });
+
+  assertEquals(
+    result.draft.steps.map((step) => step.duration_seconds),
+    [0, 95, 15, 15, 25],
+    "Expected the tied-elapsed pair to both stay DERIVED (never a zero/sub-minimum anchor) and the total to still land on 150s.",
+  );
+  assert(
+    result.draft.steps[2].duration_seconds >= 10 &&
+      result.draft.steps[3].duration_seconds >= 10,
+    "Expected neither step of the tied-elapsed pair to fall below the 10s minimum.",
+  );
+  assertEquals(
+    result.draft.recipe.brew_time_seconds,
+    150,
+    "Expected the stated 150s total, unaffected by this fix.",
+  );
+});
+
+Deno.test("D10: a genuinely starved allocation (legitimate duration_is_stated anchors) still leaves the split declining to assign — the bail-out itself is untouched", async () => {
+  // Confirms this fix touches only the ANCHORING decision, not the
+  // pre-existing splitDerivedBrewStepDurationsFromTarget bail-out guard
+  // the plan explicitly says not to touch. Two duration_is_stated steps
+  // (bloom 30s, pour 120s = 150s) legitimately anchor themselves, leaving
+  // only 5s of a 155s target for two derived steps that each need at least
+  // the 10s minimum — a real (not falsely-manufactured) starved case, so
+  // the split must still decline exactly as it did before this fix. The
+  // two derived steps' raw guesses (5s each) survive the split's bail-out
+  // and are then bumped to the 10s floor by the separate, unrelated
+  // enforceMinimumStepDurations pass, landing on 170s against the stated
+  // 155s (blocked) — byte-identical before and after D10 (confirmed by
+  // diffing against the pre-fix parser.ts).
+  const extraction: ExtractionResult = {
+    extracted_amounts: [],
+    detected_input_language: "en",
+    likely_brewing_method: "V60",
+    name: "D10 starved allocation",
+    short_description:
+      "Tests the pre-existing bail-out still fires for a LEGITIMATE anchor.",
+    grind_size: "Medium",
+    water_temp_celsius: 93,
+    coffee_amount_grams: 18,
+    water_amount: 280,
+    preparation: "Rinse filter and add coffee.",
+    steps: [
+      {
+        title: null,
+        raw_text: "Bloom for 30 seconds.",
+        duration_seconds: 30,
+        elapsed_seconds: 0,
+        starts_timer: true,
+        duration_is_stated: true,
+        scalable_amounts: [],
+        step_role: "bloom",
+      },
+      {
+        title: null,
+        raw_text: "Pour for 120 seconds.",
+        duration_seconds: 120,
+        elapsed_seconds: null,
+        starts_timer: false,
+        duration_is_stated: true,
+        scalable_amounts: [],
+        step_role: "pour",
+      },
+      {
+        title: null,
+        raw_text: "Then quickly swirl.",
+        duration_seconds: 5,
+        elapsed_seconds: null,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: null,
+      },
+      {
+        title: null,
+        raw_text: "Let it draw down.",
+        duration_seconds: 5,
+        elapsed_seconds: null,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: "drawdown",
+      },
+    ],
+    notes: [],
+    total_brew_time_seconds: 155,
+  };
+  const normalized: NormalizedDraft = {
+    extracted_amounts: [],
+    detected_input_language: "en",
+    warnings: [],
+    recipe: {
+      brewing_method_id: "v60",
+      brewing_method_confidence: "high",
+      coffee_amount: 18,
+      water_amount: 280,
+      water_temp: 93,
+    },
+    localization: {
+      name: "D10 starved allocation",
+      grind_size: "Medium",
+      short_description:
+        "Tests the pre-existing bail-out still fires for a LEGITIMATE anchor.",
+    },
+    steps: [
+      {
+        kind: "preparation",
+        description_source: "Rinse filter and add coffee.",
+        description_template: "Rinse filter and add coffee.",
+        duration_seconds: 0,
+        elapsed_seconds: null,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: "preparation",
+      },
+      {
+        kind: "brew",
+        description_source: "Bloom for 30 seconds.",
+        description_template: "Bloom for 30 seconds.",
+        duration_seconds: 30,
+        elapsed_seconds: 0,
+        starts_timer: true,
+        duration_is_stated: true,
+        scalable_amounts: [],
+        step_role: "bloom",
+      },
+      {
+        kind: "brew",
+        description_source: "Pour for 120 seconds.",
+        description_template: "Pour for 120 seconds.",
+        duration_seconds: 120,
+        elapsed_seconds: null,
+        starts_timer: false,
+        duration_is_stated: true,
+        scalable_amounts: [],
+        step_role: "pour",
+      },
+      {
+        kind: "brew",
+        description_source: "Then quickly swirl.",
+        description_template: "Then quickly swirl.",
+        duration_seconds: 5,
+        elapsed_seconds: null,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: null,
+      },
+      {
+        kind: "brew",
+        description_source: "Let it draw down.",
+        description_template: "Let it draw down.",
+        duration_seconds: 5,
+        elapsed_seconds: null,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: "drawdown",
+      },
+    ],
+  };
+
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction,
+        normalized,
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: "Mock recipe with a genuinely starved allocation",
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Hario V60" },
+    ],
+    requestId: "req-d10-starved-allocation",
+  });
+
+  assertEquals(
+    result.draft.steps.map((step) => step.duration_seconds),
+    [0, 30, 120, 10, 10],
+    "Expected the two duration_is_stated anchors to survive untouched (30, 120) and the two derived steps to be bumped from their raw 5s guesses to the 10s minimum by enforceMinimumStepDurations — NOT reconciled to the 155s target, since the split's bail-out guard must still decline when there is genuinely no room.",
+  );
+  assertEquals(
+    result.draft.recipe.brew_time_seconds,
+    170,
+    "Expected brew_time_seconds to be the actual (mismatched) sum, 170s — every brew step is at or above the minimum by the time this is computed, so it is not null; it simply does not match the stated 155s target.",
+  );
+  assert(
+    result.validation.issues.some((issue) =>
+      issue.code === "total_brew_time_mismatch"
+    ),
+    "Expected the genuine 170s-vs-155s mismatch to still be flagged — this fix must not suppress a real mismatch.",
+  );
+});

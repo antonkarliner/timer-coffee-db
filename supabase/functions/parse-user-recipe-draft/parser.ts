@@ -4453,6 +4453,51 @@ function splitDerivedBrewStepDurationsFromTarget(input: {
   };
 }
 
+// D10 (plan 020 §3, following 5cc31dc's "a known start time is not a known
+// duration" precedent): a step's elapsed_seconds records when that step
+// BEGAN. A drawdown step whose elapsed_seconds happens to equal the
+// recipe's own resolved completion target cannot possibly be reporting its
+// own begins-at time — a step that began exactly when the whole recipe
+// ends would have zero duration left to occupy, which is incoherent. The
+// far more plausible reading is that the model captured the source's
+// END-of-brew marker ("done at 3:00") into elapsed_seconds instead of a
+// genuine start timestamp for the drawdown itself.
+//
+// Live effect (German V60, four captures, source states 180s): the
+// drawdown carried elapsed_seconds: 180, equal to the extracted total. The
+// step immediately before it then differenced ITS duration against that
+// bogus 180 "start", producing a real-looking but wrong anchored duration
+// (e.g. 90s from a 90->180 diff). The anchored chain summed to exactly the
+// 180s target, so splitDerivedBrewStepDurationsFromTarget's
+// `available === 0` bail-out declined to touch anything else, and the
+// derived steps' raw unreconciled guesses (a pour's guess plus the
+// drawdown's own nominal guess) were left standing on top of the already-
+// "complete" 180s total: 250s and 260s emitted against a stated 180s.
+//
+// This only disqualifies the marker as a DIFFERENCING PARTNER for the
+// step immediately before it — not from `timestamped` altogether. The
+// step keeps every other consequence of being the last timestamped step
+// (the FINAL_TIMESTAMPED_STEP_DURATION_SECONDS nominal fallback for its
+// own duration, lastTimestamped-based bookkeeping, elapsed_seconds
+// canonicalization); only the false "predecessor's duration = this
+// step's timestamp - predecessor's timestamp" read is suppressed.
+//
+// Steps 3 and 4 sharing an identical elapsed value (a landmark-resolution
+// coincidence, not a stated zero-duration step — the same class of noise
+// D7 gates on duration_is_stated for) are unaffected by this: that pairing
+// is already excluded from anchoring by the pre-existing
+// naturalDuration >= MIN_BREW_STEP_DURATION_SECONDS check, and neither of
+// those steps is a drawdown, so this function never even considers them.
+function isUntrustworthyDrawdownEndMarker(
+  item: { index: number; timestampSeconds: number },
+  steps: DraftStep[],
+  completionTargetSeconds: number | null,
+): boolean {
+  return completionTargetSeconds !== null &&
+    item.timestampSeconds === completionTargetSeconds &&
+    steps[item.index].step_role === "drawdown";
+}
+
 function normalizeAbsoluteTimestampDurations(input: {
   steps: DraftStep[];
   narrowedText: string;
@@ -4544,9 +4589,51 @@ function normalizeAbsoluteTimestampDurations(input: {
   // providers are commonly prompted to enforce the same floor themselves —
   // that coincidence is exactly why the drift went unabsorbed: nothing in
   // this function ever saw a value below the minimum to react to).
+  // D10: the reliable differencing partner for each timestamped step —
+  // `timestamped[order + 1]`, UNLESS that candidate is itself an
+  // untrustworthy drawdown end-marker (see isUntrustworthyDrawdownEndMarker
+  // above), in which case this step is treated exactly like the genuinely
+  // last timestamped step: no reliable successor to difference against.
+  // Computed once and reused below so the differenced-marking check further
+  // down can't disagree with the duration pass-1 actually used.
+  //
+  // NOTE (investigated and deliberately NOT narrowed further — see D10's
+  // implementation report): an earlier version of this fix additionally
+  // required the candidate to be this step's own immediate successor in
+  // the full step sequence (`candidate.index === item.index + 1`), to
+  // avoid touching a moka-pot capture whose "Start the timer" step
+  // differenced against a same-shaped drawdown-equals-target marker two
+  // steps later. That adjacency gate had to be reverted: two of the three
+  // required German captures (51bc8f5d, 39cface0) have their OWN
+  // intermediate pour steps carrying no elapsed_seconds at all, so their
+  // drawdown-marker candidate is likewise non-adjacent in the full step
+  // sequence — gating on adjacency silently left them unfixed (260s, still
+  // blocked). The untrustworthiness of a drawdown's elapsed_seconds equal
+  // to the stated total does not depend on how many un-timestamped steps
+  // separate it from its differencing partner, so this now applies
+  // unconditionally, matching the plan's own framing exactly.
+  const reliableNextByOrder = new Map<
+    number,
+    { index: number; timestampSeconds: number } | undefined
+  >();
+  timestamped.forEach((item, order) => {
+    const candidate = timestamped[order + 1];
+    reliableNextByOrder.set(
+      order,
+      candidate &&
+        !isUntrustworthyDrawdownEndMarker(
+          candidate,
+          input.steps,
+          completionTargetSeconds,
+        )
+        ? candidate
+        : undefined,
+    );
+  });
+
   const naturalDurationsByIndex = new Map<number, number>();
   timestamped.forEach((item, order) => {
-    const nextTimestamp = timestamped[order + 1];
+    const nextTimestamp = reliableNextByOrder.get(order);
     const duration = nextTimestamp
       ? nextTimestamp.timestampSeconds - item.timestampSeconds
       : FINAL_TIMESTAMPED_STEP_DURATION_SECONDS;
@@ -4611,7 +4698,14 @@ function normalizeAbsoluteTimestampDurations(input: {
   const steps = input.steps.map((step, index) => {
     const timestamp = timestampByIndex.get(index);
     if (timestamp) {
-      const nextTimestamp = timestamped[timestamp.order + 1];
+      // D10: must agree with the reliableNextByOrder used to compute
+      // naturalDurationsByIndex above — otherwise a step whose "natural"
+      // duration fell back to the nominal FINAL_TIMESTAMPED_STEP_DURATION_SECONDS
+      // (because its candidate successor was an untrustworthy drawdown end-
+      // marker) would still pass `naturalDuration >= MIN_BREW_STEP_DURATION_SECONDS`
+      // here — the nominal fallback and the minimum are the same constant —
+      // and get wrongly marked as genuinely timestamp-differenced anyway.
+      const nextTimestamp = reliableNextByOrder.get(timestamp.order);
       const naturalDuration = naturalDurationsByIndex.get(index)!;
 
       if (
