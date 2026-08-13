@@ -5502,12 +5502,37 @@ function buildRenderedTimingStepsFromDraftSteps(
 // (140s off, but a 4.5x contraction) and must block. Neither an absolute
 // floor nor a fixed-seconds ceiling can pass the first and block the
 // second — a floor loose enough to admit 1500s admits 140s too, and a
-// ceiling tight enough to catch 140s catches 1500s too. A RATIO catches
-// the 4.5x contraction without touching the 2.3% drift: factor-of-2 leaves
-// roughly an order of magnitude of headroom above every known-good case
-// (1500s off is only a 1.023x ratio) while sitting comfortably below the
-// known-bad one (180/40 = 4.5x).
-const TOTAL_BREW_TIME_BLOCKING_RATIO = 2;
+// ceiling tight enough to catch 140s catches 1500s too. A RATIO is the
+// right shape for the same reason it was originally chosen.
+//
+// D6 (plan 020 §3, retuning the original factor-of-2 pick): the factor-of-2
+// threshold was set from two data points and left most of a decade of
+// headroom unused. Live captures since (plan 020 §3 D6 table) gave five:
+//
+//   case            stated    emitted   ratio    verdict
+//   cold brew       64,800s   64,820s   1.0003   must pass  (live capture)
+//   cold_brew fixture 66,600s 65,100s   1.023    must pass  (golden, deterministic split)
+//   French press 4  480s      510s      1.06     defect, chosen to block
+//   moka pot 1      240s      270s      1.125    must block (defect, low-variance draw)
+//   moka pot 2-4    240s      490s      2.04     must block (defect, high-variance draw)
+//   Russian         180s      40s       4.5      must block
+//
+// The two known-good points cluster at 1.0003-1.023; the moka-pot defect's
+// OWN distribution spans 1.125-2.04 across four identical-input runs, so the
+// 1.125 draw is the *low end* of a single defect's variance, not a fixed
+// boundary — a future capture of the same contradiction could plausibly land
+// lower still (e.g. 260s/240s = 1.083) and must not slip through. A
+// threshold at 1.10 would clear the one 1.125 draw we captured by only 2.3%,
+// with no margin against that lower variance. 1.05 keeps ~2.7 percentage
+// points of clearance above the tightest known-good case (the 1.023 golden)
+// while covering the moka-pot distribution's plausible low end, and it
+// resolves French press's 1.06 deliberately rather than by omission: 30s
+// over an explicitly stated 480s total is proportionally smaller than the
+// moka-pot defect but is still a real contradiction of a stated figure, and
+// this check's job is exactly that class of contradiction, not only the
+// large ones. 1.05 is close to the natural gap in the data (1.023 known-good
+// vs 1.06 first defect) and does not carve out an exception for short brews.
+const TOTAL_BREW_TIME_BLOCKING_RATIO = 1.05;
 
 function isTotalBrewTimeMismatchSevere(
   statedSeconds: number,

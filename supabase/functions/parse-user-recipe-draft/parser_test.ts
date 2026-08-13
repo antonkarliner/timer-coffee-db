@@ -13402,6 +13402,103 @@ Deno.test("D5: a 0.05% stated-vs-emitted total brew time divergence stays a warn
 });
 
 // ---------------------------------------------------------------------
+// D6 (plan 020 §3 D6, §5 item 5): the factor-of-2 threshold above was
+// retuned to TOTAL_BREW_TIME_BLOCKING_RATIO = 1.05 from the full corpus of
+// live captures accumulated since 016, not just the original two points.
+// Every row of plan 020's table is exercised explicitly here so the next
+// person to touch this constant sees the whole distribution rather than
+// rediscovering it. See the comment above TOTAL_BREW_TIME_BLOCKING_RATIO in
+// parser.ts for the full rationale, including why French press (1.06) is
+// deliberately chosen to block and why 1.10 was rejected in favour of 1.05.
+// ---------------------------------------------------------------------
+
+async function assertTotalBrewTimeVerdict(
+  label: string,
+  statedSeconds: number,
+  emittedSeconds: number,
+  expectBlocked: boolean,
+): Promise<void> {
+  const half = Math.floor(emittedSeconds / 2);
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction: {
+          ...createExtraction(),
+          total_brew_time_seconds: statedSeconds,
+        },
+        normalized: {
+          ...createNormalized(),
+          steps: [
+            createNormalized().steps[0],
+            {
+              ...createNormalized().steps[1],
+              duration_seconds: half,
+              duration_is_stated: true,
+            },
+            {
+              ...createNormalized().steps[2],
+              duration_seconds: emittedSeconds - half,
+              duration_is_stated: true,
+            },
+          ],
+        },
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: `Mock recipe for D6 ratio case: ${label}.`,
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Hario V60" },
+    ],
+    requestId: `req-d6-${label.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}`,
+  });
+
+  const hasBlockingFinding = result.validation.issues.some((issue) =>
+    issue.code === "total_brew_time_mismatch"
+  );
+  assertEquals(
+    hasBlockingFinding,
+    expectBlocked,
+    `D6 ${label}: stated ${statedSeconds}s, emitted ${emittedSeconds}s (ratio ${
+      (Math.max(statedSeconds, emittedSeconds) /
+        Math.min(statedSeconds, emittedSeconds)).toFixed(4)
+    }). Expected blocking=${expectBlocked}, got issues: ${
+      JSON.stringify(result.validation.issues)
+    }`,
+  );
+  assertEquals(
+    result.validation.is_publishable,
+    !expectBlocked,
+    `D6 ${label}: expected is_publishable=${!expectBlocked}.`,
+  );
+}
+
+Deno.test("D6: cold brew 64,800s stated vs 64,820s emitted (ratio 1.0003) must pass — live-capture control", async () => {
+  await assertTotalBrewTimeVerdict("cold-brew-live-control", 64800, 64820, false);
+});
+
+Deno.test("D6: French press 480s stated vs 510s emitted (ratio 1.06) blocks under the 1.05 threshold", async () => {
+  await assertTotalBrewTimeVerdict("french-press-4", 480, 510, true);
+});
+
+Deno.test("D6: moka pot 240s stated vs 270s emitted (ratio 1.125, low-variance draw) must block", async () => {
+  await assertTotalBrewTimeVerdict("moka-pot-1", 240, 270, true);
+});
+
+Deno.test("D6: moka pot 240s stated vs 490s emitted (ratio 2.04, high-variance draw) must block", async () => {
+  await assertTotalBrewTimeVerdict("moka-pot-2-4", 240, 490, true);
+});
+
+Deno.test("D6: Russian 180s stated vs 40s emitted (ratio 4.5) must block", async () => {
+  await assertTotalBrewTimeVerdict("russian", 180, 40, true);
+});
+
+// ---------------------------------------------------------------------
 // D3'/Phase 2 (plan 016 §3 D3', §4 Phase 2): verify mode's whole contract
 // is that a submitted, already-well-formed recipe's wording is never
 // silently rewritten. Phase 0 found the actual (undocumented) source of
