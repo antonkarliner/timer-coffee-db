@@ -5535,6 +5535,51 @@ function isRecipeLevelScalarValue(
   return false;
 }
 
+// Phase D (plan 020 §3 D1, §4b): shared by findRangeEndpointCollapseIssues
+// (below) and expandCollapsedStatedRangeEndpoints (further down) — both need
+// the identical answer to "does this endpoint value already appear
+// somewhere in the rendered draft", and keeping one implementation means
+// the detector and the backstop that tries to fix what it detects can never
+// quietly disagree about what counts as preserved. Pulled out unchanged
+// from the pre-existing check `findRangeEndpointCollapseIssues` had inline
+// before this phase — same tolerance, same empty-unit carve-out, no
+// behaviour change for the detector.
+function isRangeEndpointValuePreserved(
+  renderedAmounts: RenderedAmount[],
+  value: number,
+  unit: string,
+): boolean {
+  const targetUnit = normalizeUnitForRangeCheck(unit);
+  return renderedAmounts.some((rendered) => {
+    if (Math.abs(rendered.value - value) > RANGE_ENDPOINT_MATCH_TOLERANCE) {
+      return false;
+    }
+
+    const renderedUnit = normalizeUnitForRangeCheck(rendered.unit);
+    if (renderedUnit === "") {
+      // B2 (plan 016 §3 D4′/D1-empty-unit, §4 Task B): a hyphenated
+      // range like "60-90g" renders through EXPRESSION_REGEX as two
+      // adjacent expressions sharing one trailing unit suffix — by
+      // design (see the EXPRESSION_REGEX comment further up; its
+      // allowlist anchoring is what fixed the Japanese "mlまで注ぐ。"
+      // corruption and must not be changed) — so the FIRST expression's
+      // rendered unit is legitimately "". This function only ever sees
+      // coffee/water records (see the header comment above:
+      // extracted_amounts is scoped to coffee/water by construction), so
+      // there is no other unit family a blank-unit rendered value here
+      // could belong to. Comparing on value alone when the rendered unit
+      // is empty is therefore a deliberate, narrow choice — not a
+      // guess — and it closes the same empty-unit gap D1 diagnosed in
+      // provenance.ts, for this local check, without reimplementing
+      // provenance.ts's general unit-compatibility lexicon (out of scope
+      // here, owned by provenance.ts's Phase 1a).
+      return true;
+    }
+
+    return renderedUnit === targetUnit;
+  });
+}
+
 function findRangeEndpointCollapseIssues(
   provenance: AmountProvenanceRecord[],
   renderedAmounts: RenderedAmount[],
@@ -5573,37 +5618,11 @@ function findRangeEndpointCollapseIssues(
     }
     const { low, high, otherValue } = trigger;
 
-    const otherEndpointUnit = normalizeUnitForRangeCheck(record.unit);
-    const preserved = renderedAmounts.some((rendered) => {
-      if (
-        Math.abs(rendered.value - otherValue) > RANGE_ENDPOINT_MATCH_TOLERANCE
-      ) {
-        return false;
-      }
-
-      const renderedUnit = normalizeUnitForRangeCheck(rendered.unit);
-      if (renderedUnit === "") {
-        // B2 (plan 016 §3 D4′/D1-empty-unit, §4 Task B): a hyphenated
-        // range like "60-90g" renders through EXPRESSION_REGEX as two
-        // adjacent expressions sharing one trailing unit suffix — by
-        // design (see the EXPRESSION_REGEX comment further up; its
-        // allowlist anchoring is what fixed the Japanese "mlまで注ぐ。"
-        // corruption and must not be changed) — so the FIRST expression's
-        // rendered unit is legitimately "". This function only ever sees
-        // coffee/water records (see the header comment above:
-        // extracted_amounts is scoped to coffee/water by construction), so
-        // there is no other unit family a blank-unit rendered value here
-        // could belong to. Comparing on value alone when the rendered unit
-        // is empty is therefore a deliberate, narrow choice — not a
-        // guess — and it closes the same empty-unit gap D1 diagnosed in
-        // provenance.ts, for this local check, without reimplementing
-        // provenance.ts's general unit-compatibility lexicon (out of scope
-        // here, owned by provenance.ts's Phase 1a).
-        return true;
-      }
-
-      return renderedUnit === otherEndpointUnit;
-    });
+    const preserved = isRangeEndpointValuePreserved(
+      renderedAmounts,
+      otherValue,
+      record.unit,
+    );
 
     if (!preserved) {
       issues.push({
@@ -5621,6 +5640,318 @@ function findRangeEndpointCollapseIssues(
   }
 
   return issues;
+}
+
+// ===========================================================================
+// Phase D (plan 020 §3 D1, §4b) — deterministic both-endpoint backstop.
+// ===========================================================================
+// CONFIRMED by diffing real captures across two deployed versions of this
+// file (see the task brief this phase was executed from): v47, BEFORE
+// stated_range existed, recorded a German step-level "50-70g" bloom as TWO
+// literal extracted_amounts records and rendered both endpoints —
+// "(0.166667 x <final_water_amount>)-(0.233333 x <final_water_amount>)g".
+// v48, AFTER stated_range was added specifically to let a collapsed range be
+// DETECTED (see the stated_range schema comment and
+// findRangeEndpointCollapseIssues above), recorded the SAME source text as
+// ONE literal record (value 50) plus stated_range {50,70} — and the
+// rendering collapsed to match: "(0.166667 x <final_water_amount>)g" alone.
+// Given a metadata slot for the range, the model stopped emitting a second
+// per-endpoint record, and the renderer — which only ever renders what
+// extraction/normalization/repair chose to emit — had nothing left to
+// render for the high end. findRangeEndpointCollapseIssues correctly
+// detects this (that is what it was built for); this backstop's job is to
+// make the correct rendering happen in the first place, deterministically,
+// from the SAME record the detector already reads, so the detector has
+// nothing left to fire on in the cases this can fix.
+//
+// Scoping is a hard requirement, not a suggestion (task brief: "if you
+// reconstruct both endpoints for a French-press dose, you have broken Phase
+// C"): a recipe-level scalar (coffee_amount / water_amount, or their
+// step-level restatement) is a single number by schema — "brew 60-70g" is
+// not representable as a range there, and reconstructing both endpoints
+// would be introducing a defect, not fixing one. This reuses Phase C's
+// isRecipeLevelScalarValue (and the step_index < 0 sentinel as
+// corroboration) — the EXACT SAME gate findRangeEndpointCollapseIssues
+// applies just above — rather than re-deriving a second notion of
+// "recipe-level" that could quietly drift from the detector's.
+function reconstructRangeEndpointStep(args: {
+  step: DraftStep;
+  stepIndex: number;
+  record: AmountProvenanceRecord;
+  low: number;
+  high: number;
+  coffeeAmount: number | null;
+  waterAmount: number | null;
+}): { step: DraftStep; warning: string; syntheticRecord: AmountProvenanceRecord } | null {
+  const { step, stepIndex, record, low, high, coffeeAmount, waterAmount } =
+    args;
+
+  const occurrences = findExpressionOccurrences(step.description_template);
+  if (occurrences.length === 0) {
+    // The collapsed endpoint was rendered as a bare literal number, not a
+    // scalable expression — no `<final_coffee_amount>`/`<final_water_amount>`
+    // placeholder exists here to derive a second multiplier from. Every
+    // confirmed live instance of this defect (German, Chemex, Spanish — see
+    // the module comment above) renders through an expression, so this is a
+    // defensive "leave it to the detector" exit, not an observed gap.
+    return null;
+  }
+
+  // Reuses F32's own compatibility gate (isRecordCompatibleWithPlaceholder,
+  // defined above for exactly this "does this record's unit_kind make sense
+  // for this placeholder" question) so a volume record can never anchor
+  // itself to <final_coffee_amount> here either — the same D2 defect shape,
+  // guarded the same way, rather than a second ad hoc rule.
+  const candidates = occurrences.filter((occurrence) => {
+    const base = occurrence.placeholder === "<final_coffee_amount>"
+      ? coffeeAmount
+      : waterAmount;
+    if (base === null || !Number.isFinite(base) || base === 0) {
+      return false;
+    }
+    if (!isRecordCompatibleWithPlaceholder(record, occurrence.placeholder)) {
+      return false;
+    }
+    return Math.abs(occurrence.multiplier * base - record.value) <=
+      RANGE_ENDPOINT_MATCH_TOLERANCE;
+  });
+
+  if (candidates.length !== 1) {
+    // Zero candidates: nothing in this step's template renders this
+    // record's own value, so there is no expression to anchor a
+    // reconstruction to. More than one: ambiguous which expression the
+    // record describes. Either way, never guess — same discipline
+    // planStepMultiplierRepairs applies above. The draft is left exactly as
+    // extraction/normalization/repair produced it; findRangeEndpointCollapseIssues
+    // still reports the block.
+    return null;
+  }
+  const [occurrence] = candidates;
+  const base = occurrence.placeholder === "<final_coffee_amount>"
+    ? coffeeAmount!
+    : waterAmount!;
+
+  // Which endpoint the kept record's value already represents determines
+  // reconstruction order: the source's low value is always rendered first,
+  // matching the natural reading order a genuine two-record range already
+  // renders in (v47's own "(low)-(⁠high)" shape, and every other hyphenated
+  // range this file already handles).
+  const existingIsLow = Math.abs(record.value - low) <=
+    RANGE_ENDPOINT_MATCH_TOLERANCE;
+  const otherValue = existingIsLow ? high : low;
+  const otherMultiplier = otherValue / base;
+  if (!Number.isFinite(otherMultiplier)) {
+    return null;
+  }
+
+  // G22 (provenance.ts's verifyAmountProvenance, out of this phase's file
+  // ownership) verifies every RENDERED amount traces to a provenance
+  // record — it has no notion of stated_range at all. Having just rendered
+  // a second amount (otherValue) with nothing in extracted_amounts naming
+  // it would otherwise fail G22's own check with `unverifiable_amount`,
+  // trading one block for another. buildRangeEndpointSyntheticRecord below
+  // constructs a sibling record with the same evidentiary basis as the one
+  // that triggered this reconstruction — mirroring what v47's real
+  // two-record extraction actually looked like. Computed BEFORE any
+  // template splicing so an unsafe case (see that function's own comment)
+  // bails out with the draft completely untouched, not partially rewritten.
+  const syntheticRecord = buildRangeEndpointSyntheticRecord(record, otherValue);
+  if (syntheticRecord === null) {
+    return null;
+  }
+  const otherMultiplierText = formatMultiplier(otherMultiplier);
+
+  // The existing occurrence's own multiplier TEXT (not a reformatted
+  // number) is preserved byte-for-byte — only the missing endpoint is new
+  // text, exactly as F32 above only ever splices in what it must. When the
+  // kept value is the low endpoint, its trailing unit (already part of
+  // matchText, since it was the sole endpoint) is moved to the new second
+  // expression instead, matching how a real two-expression range only
+  // carries the unit once, on the last expression.
+  const rangeText = existingIsLow
+    ? `(${occurrence.multiplierText} x ${occurrence.placeholder})-(${otherMultiplierText} x ${occurrence.placeholder})${occurrence.unit}`
+    : `(${otherMultiplierText} x ${occurrence.placeholder})-${occurrence.matchText}`;
+
+  const repairedTemplate = step.description_template.slice(
+    0,
+    occurrence.matchStart,
+  ) + rangeText + step.description_template.slice(
+    occurrence.matchStart + occurrence.matchText.length,
+  );
+
+  const repairedStep: DraftStep = {
+    ...step,
+    description_template: repairedTemplate,
+    preview_text: renderPreviewText(
+      repairedTemplate,
+      coffeeAmount,
+      waterAmount,
+    ),
+    expressions: extractExpressions(repairedTemplate, coffeeAmount, waterAmount),
+  };
+
+  const warning = `D1 backstop: step ${
+    stepIndex + 1
+  }'s stated range of ${low}-${high}${record.unit} had collapsed to a ` +
+    `single ${record.value}${record.unit} rendering; reconstructed the ` +
+    `missing endpoint (${otherValue}${record.unit}) from stated_range so ` +
+    `both endpoints survive into the draft.`;
+
+  return { step: repairedStep, warning, syntheticRecord };
+}
+
+// Builds the synthetic sibling record described in
+// reconstructRangeEndpointStep's own comment above — same evidentiary basis
+// as the record that triggered reconstruction, with `value` (and, for a
+// range_endpoint derivation, `rule_inputs.endpoint`) pointed at the OTHER
+// endpoint instead. Returns null when there is no SAFE way to do that,
+// rather than emitting a record that would fail G22's own verification for
+// a reason unrelated to whether the range genuinely collapsed:
+//
+//  - 'literal': G22's literal check (provenance.ts) only tests whether
+//    source_quote appears in the request text — never the numeric value —
+//    so cloning with value swapped is exactly as trustworthy as the
+//    original record already was for its own value.
+//  - 'derived' via the 'range_endpoint' rule: G22 RECOMPUTES the value from
+//    rule_inputs { low, high, endpoint } and requires it to match. A naive
+//    clone would keep the OLD endpoint selector and recompute back to the
+//    ORIGINAL value, not otherValue — flipping endpoint (0<->1) is what
+//    makes the recomputation agree with the value actually being
+//    reconstructed. This is exactly the rule_inputs shape
+//    resolveRangeEndpointTrigger's rule_inputs branch already required to
+//    fire in the first place (endpoint strictly 0 or 1 — a midpoint
+//    selection never reaches this function per that function's own
+//    comment), so the flip is always well-defined here.
+//  - Any other shape ('inferred', or 'derived' under a DIFFERENT rule that
+//    only reached this function via the stated_range fallback) has no
+//    known-safe transformation: recomputing under an unrelated rule (e.g.
+//    'concentration') against a value that rule was never meant to
+//    describe would almost certainly disagree, trading
+//    range_endpoint_collapsed for a DIFFERENT G22 finding. Left to the
+//    detector, same discipline as an ambiguous expression match above.
+function buildRangeEndpointSyntheticRecord(
+  record: AmountProvenanceRecord,
+  otherValue: number,
+): AmountProvenanceRecord | null {
+  if (record.provenance === "literal") {
+    return { ...record, value: otherValue };
+  }
+
+  if (
+    record.provenance === "derived" &&
+    record.rule === "range_endpoint" &&
+    record.rule_inputs &&
+    (record.rule_inputs.endpoint === 0 || record.rule_inputs.endpoint === 1)
+  ) {
+    return {
+      ...record,
+      value: otherValue,
+      rule_inputs: {
+        ...record.rule_inputs,
+        endpoint: record.rule_inputs.endpoint === 0 ? 1 : 0,
+      },
+    };
+  }
+
+  return null;
+}
+
+// Orchestrates reconstructRangeEndpointStep over every eligible record,
+// called from finalizeDraftResponse right after F32's multiplier repair and
+// before renderedAmounts/findRangeEndpointCollapseIssues are built — so a
+// step this successfully expands is never even reported as collapsed;
+// "prefer reconstructing over blocking" (plan 020 §3 D1) applied
+// deterministically rather than left to the model.
+//
+// renderedAmounts is rebuilt fresh on every iteration (not hoisted out of
+// the loop) because an earlier record in the SAME call can have already
+// rewritten the step whose rendering a later record's "is it already
+// preserved" check needs to see — two independent ranges in the same draft
+// must not both fire off a stale snapshot.
+//
+// Returns an AUGMENTED provenance array (original records plus one
+// synthetic record per successful reconstruction — see
+// reconstructRangeEndpointStep's own comment on syntheticRecord for why).
+// The caller must use this returned array, not the original input, for
+// every downstream check that reads what a rendered amount traces to
+// (verifyAmountProvenance, findRangeEndpointCollapseIssues) — otherwise the
+// newly-rendered endpoint has nothing to trace to and this backstop trades
+// one block (range_endpoint_collapsed) for another (unverifiable_amount).
+function expandCollapsedStatedRangeEndpoints(args: {
+  steps: DraftStep[];
+  provenance: AmountProvenanceRecord[];
+  coffeeAmount: number | null;
+  waterAmount: number | null;
+}): {
+  steps: DraftStep[];
+  provenance: AmountProvenanceRecord[];
+  warnings: string[];
+} {
+  let steps = args.steps;
+  const provenance = [...args.provenance];
+  const warnings: string[] = [];
+
+  for (const record of args.provenance) {
+    // Identical gate to findRangeEndpointCollapseIssues above — see that
+    // function's comment for the full D3 rationale. A record this gate
+    // exempts is a recipe-level scalar; collapsing it to one endpoint is
+    // correct, and reconstructing a second endpoint for it would be the
+    // exact regression the task brief warns against (French press).
+    if (
+      record.step_index < 0 ||
+      isRecipeLevelScalarValue(record, args.coffeeAmount, args.waterAmount)
+    ) {
+      continue;
+    }
+
+    const trigger = resolveRangeEndpointTrigger(record);
+    if (trigger === null) {
+      continue;
+    }
+
+    const stepIndex = record.step_index;
+    const step = steps[stepIndex];
+    if (!step) {
+      // Defensive only: foldRemappedExtractedAmounts (this function's
+      // caller) already remaps every step-level record through the same
+      // fold `steps` went through, so a record's step_index should always
+      // resolve. Never throw on a provenance record from an upstream stage.
+      continue;
+    }
+
+    const alreadyPreserved = isRangeEndpointValuePreserved(
+      buildRenderedAmountsFromDraftSteps(steps),
+      trigger.otherValue,
+      record.unit,
+    );
+    if (alreadyPreserved) {
+      // Nothing to reconstruct — either this record's high/low pair was
+      // never actually collapsed (a genuine two-record range, exactly what
+      // v47 always produced), or an earlier iteration already fixed it.
+      continue;
+    }
+
+    const result = reconstructRangeEndpointStep({
+      step,
+      stepIndex,
+      record,
+      low: trigger.low,
+      high: trigger.high,
+      coffeeAmount: args.coffeeAmount,
+      waterAmount: args.waterAmount,
+    });
+    if (result === null) {
+      continue;
+    }
+
+    steps = steps.map((candidate, index) =>
+      index === stepIndex ? result.step : candidate
+    );
+    warnings.push(result.warning);
+    provenance.push(result.syntheticRecord);
+  }
+
+  return { steps, provenance, warnings };
 }
 
 // A tolerance for "is the rendered multiplier already numerically correct"
@@ -6222,7 +6553,20 @@ function finalizeDraftResponse(input: {
       requestText: input.requestText,
     },
   );
-  const draftSteps = multiplierRepair.steps;
+  // Phase D (plan 020 §3 D1, §4b): runs immediately after F32's multiplier
+  // repair, on the exact same steps array, and BEFORE renderedAmounts/
+  // findRangeEndpointCollapseIssues are built further down — see
+  // expandCollapsedStatedRangeEndpoints above for the full rationale. Uses
+  // the same foldRemappedExtractedAmounts F32 just used, for the same
+  // reason: this is a step-indexed lookup against POST-fold `draftSteps`,
+  // so it needs provenance already remapped through the same fold.
+  const rangeEndpointExpansion = expandCollapsedStatedRangeEndpoints({
+    steps: multiplierRepair.steps,
+    provenance: foldRemappedExtractedAmounts,
+    coffeeAmount: normalizedWithBalancedCopy.recipe.coffee_amount,
+    waterAmount: normalizedWithBalancedCopy.recipe.water_amount,
+  });
+  const draftSteps = rangeEndpointExpansion.steps;
   const brewSteps = draftSteps.filter((step) => step.kind === "brew");
   const brewTimeSeconds = brewSteps.length > 0 &&
       brewSteps.every((step) =>
@@ -6273,18 +6617,24 @@ function finalizeDraftResponse(input: {
   // guard, a fixture predating this field would crash here instead of
   // correctly falling into verifyAmountProvenance's `unverified` path.
   const renderedAmounts = buildRenderedAmountsFromDraftSteps(draftSteps);
+  // Phase D: uses rangeEndpointExpansion.provenance (foldRemappedExtractedAmounts
+  // PLUS any synthetic sibling records the backstop added above), not
+  // foldRemappedExtractedAmounts directly — see
+  // expandCollapsedStatedRangeEndpoints's own comment for why a newly
+  // reconstructed endpoint needs a provenance record of its own to avoid
+  // trading range_endpoint_collapsed for unverifiable_amount.
   const provenanceResult = verifyAmountProvenance({
     requestText: input.requestText,
     renderedAmounts,
-    provenance: foldRemappedExtractedAmounts,
+    provenance: rangeEndpointExpansion.provenance,
   });
 
   // D4 (plan 016 Phase 3a): see findRangeEndpointCollapseIssues above.
-  // Reuses the exact same fold-remapped provenance array and renderedAmounts
-  // G22 already built for this response — no separate extraction pass, no
-  // new field.
+  // Reuses the exact same (Phase D-augmented) provenance array and
+  // renderedAmounts G22 just built for this response — no separate
+  // extraction pass, no new field.
   const rangeEndpointIssues = findRangeEndpointCollapseIssues(
-    foldRemappedExtractedAmounts,
+    rangeEndpointExpansion.provenance,
     renderedAmounts,
     normalizedWithBalancedCopy.recipe.coffee_amount,
     normalizedWithBalancedCopy.recipe.water_amount,
@@ -6413,6 +6763,7 @@ function finalizeDraftResponse(input: {
       ...missingNonEnglishTotalBrewTimeWarnings,
       ...grindSizeWarnings,
       ...multiplierRepair.warnings,
+      ...rangeEndpointExpansion.warnings,
       ...provenanceWarnings,
       ...timingWarnings,
     ]),

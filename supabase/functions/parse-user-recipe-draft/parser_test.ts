@@ -12764,12 +12764,23 @@ Deno.test("defect-2: does not warn for an inferred (not stated) grind_size on a 
 // ---------------------------------------------------------------------
 // D4 (plan 016 Phase 3a): a range_endpoint record collapsed to a single
 // rendered endpoint, with the other endpoint absent from the entire draft,
-// must block publication (Chemex 2/4, Spanish 4/4 from plans/015). A range
-// whose both endpoints survive somewhere in the draft (German V60 4/4)
-// must NOT be treated as a collapse.
+// used to block publication outright (Chemex 2/4, Spanish 4/4 from
+// plans/015). A range whose both endpoints survive somewhere in the draft
+// (German V60 4/4) must NOT be treated as a collapse — that half is
+// unchanged.
+//
+// Plan 020 Phase D supersedes the FIRST half of that: this is precisely
+// the shape CONFIRMED live as the Chemex/Spanish defect (plan 020 §3 D1,
+// the task brief's acceptance criteria) — a single-record step-level range
+// collapsed to its low endpoint, with stated_range carrying both. Phase D's
+// deterministic backstop (expandCollapsedStatedRangeEndpoints in parser.ts)
+// now reconstructs the missing endpoint's rendering instead of blocking,
+// which is the whole point of the backstop ("prefer reconstructing over
+// blocking", plan 020 §3 D1) — so this scenario is now expected to publish
+// with BOTH endpoints rendered, not to block.
 // ---------------------------------------------------------------------
 
-Deno.test("D4: a coffee/water range collapsed to its low endpoint blocks publication when the high endpoint appears nowhere in the draft (Chemex/Spanish shape)", async () => {
+Deno.test("D4 -> Phase D: a coffee/water range collapsed to its low endpoint is reconstructed to render both endpoints and stays publishable (Chemex/Spanish shape)", async () => {
   const requestText =
     "Rinse the filter and add 15g of coffee. Pour 60-90g of water and bloom for 30 seconds. Pour to 250g total and wait 90 seconds.";
   const parser = createRecipeDraftParser({
@@ -12798,9 +12809,11 @@ Deno.test("D4: a coffee/water range collapsed to its low endpoint blocks publica
             createNormalized().steps[0],
             {
               ...createNormalized().steps[1],
-              // Bug under test: the source stated a 60-90g range but the
-              // final draft only shows the low endpoint (60g) — the high
-              // endpoint (90) never appears anywhere else in the draft.
+              // The source stated a 60-90g range but the final draft only
+              // shows the low endpoint (60g) — the high endpoint (90) never
+              // appears anywhere else in the draft. Phase D's backstop must
+              // reconstruct the high endpoint's rendering from this
+              // record's own rule_inputs.
               description_template: "Pour 60g of water and bloom.",
             },
             createNormalized().steps[2],
@@ -12822,21 +12835,48 @@ Deno.test("D4: a coffee/water range collapsed to its low endpoint blocks publica
   });
 
   assert(
-    result.validation.issues.some((issue) =>
+    !result.validation.issues.some((issue) =>
       issue.code === "range_endpoint_collapsed"
     ),
-    `Expected a range_endpoint_collapsed validation issue when the high endpoint of a stated 60-90g range never appears in the draft. Got issues: ${
+    `Expected Phase D to reconstruct the missing high endpoint rather than report a collapse. Got issues: ${
       JSON.stringify(result.validation.issues)
     }`,
   );
   assertEquals(
     result.validation.is_publishable,
-    false,
-    "Expected a silently collapsed range (60-90g rendered as only 60g) to block publication.",
+    true,
+    "Expected the reconstructed rendering (both 60g and 90g) to stay publishable.",
   );
   assert(
-    result.publish_projection === undefined,
-    "Expected no publish_projection while the range-collapse issue blocks the draft.",
+    result.publish_projection !== undefined,
+    "Expected a publish_projection now that both endpoints render and nothing blocks the draft.",
+  );
+
+  const step1 = result.draft.steps[1];
+  assertEquals(
+    step1.expressions.length,
+    2,
+    `Expected the reconstructed step to carry two scalable expressions (one per range endpoint). Got: ${
+      JSON.stringify(step1.expressions)
+    }`,
+  );
+  assert(
+    step1.expressions.some((expression) =>
+      expression.preview_value !== null &&
+      Math.abs(expression.preview_value - 60) < 0.5
+    ),
+    `Expected the low endpoint (60) to still render. Got: ${
+      JSON.stringify(step1.expressions)
+    }`,
+  );
+  assert(
+    step1.expressions.some((expression) =>
+      expression.preview_value !== null &&
+      Math.abs(expression.preview_value - 90) < 0.5
+    ),
+    `Expected the reconstructed high endpoint (90) to render. Got: ${
+      JSON.stringify(step1.expressions)
+    }`,
   );
 });
 
@@ -13442,9 +13482,25 @@ Deno.test("B2: a real hyphenated range ('60-90g') whose first expression renders
 // collapsed high endpoint (90) was never assigned the range_endpoint rule
 // at all (recorded as a plain LITERAL 60, no rule, rule_inputs null), so
 // D4's original rule_inputs-only detection had nothing to find.
+//
+// Plan 020 Phase D supersedes the outcome (not the detection): CONFIRMED
+// live as the Chemex/Spanish defect itself (plan 020 §3 D1), this shape is
+// now expected to be RECONSTRUCTED — both endpoints rendered — rather than
+// blocked; see the D4 test above for the same flip and its rationale.
+//
+// source_quote is "60" here (a bare number), not "60g" — matching what a
+// literal record's source_quote actually looks like on every real capture
+// inspected for this phase (CONFIRMED: German round-3's literal 50/70 g
+// bloom recorded source_quote "50", not "50g"). A quote of "60g" is not a
+// literal substring of this test's own request text ("Pour 60-90g of
+// water..." contains "60-90g", not "60g") — that mismatch was harmless
+// under the old expectation (the draft blocked via range_endpoint_collapsed
+// regardless of whether the quote itself would separately verify) but
+// becomes load-bearing now that Phase D's reconstruction depends on the
+// quote genuinely passing G22's own literal check.
 // ---------------------------------------------------------------------
 
-Deno.test("Task C: stated_range on a LITERAL record (no range_endpoint rule at all) still triggers range_endpoint_collapsed when the other endpoint is missing (Chemex shape)", async () => {
+Deno.test("Task C -> Phase D: stated_range on a LITERAL record (no range_endpoint rule at all) is reconstructed to render both endpoints and stays publishable (Chemex shape)", async () => {
   const requestText =
     "Rinse the filter and add 15g of coffee. Pour 60-90g of water and bloom for 30 seconds. Pour to 250g total and wait 90 seconds.";
   const parser = createRecipeDraftParser({
@@ -13459,12 +13515,14 @@ Deno.test("Task C: stated_range on a LITERAL record (no range_endpoint rule at a
               // The Chemex shape from D4′: extraction recorded only the
               // literal 60, with NO rule and NO rule_inputs — the 90 would
               // be entirely invisible to the original D4 check. stated_range
-              // is the new, independent field that keeps it visible.
+              // is the field that keeps it visible, and Phase D's backstop
+              // is what turns that visibility into an actual reconstructed
+              // rendering.
               value: 60,
               unit: "g",
               step_index: 1,
               provenance: "literal",
-              source_quote: "60g",
+              source_quote: "60",
               rule: null,
               rule_source_quote: null,
               rule_inputs: null,
@@ -13499,17 +13557,30 @@ Deno.test("Task C: stated_range on a LITERAL record (no range_endpoint rule at a
   });
 
   assert(
-    result.validation.issues.some((issue) =>
+    !result.validation.issues.some((issue) =>
       issue.code === "range_endpoint_collapsed"
     ),
-    `Expected a range_endpoint_collapsed issue driven by stated_range alone (no range_endpoint rule present). Got issues: ${
+    `Expected Phase D to reconstruct the missing high endpoint rather than report a collapse. Got issues: ${
       JSON.stringify(result.validation.issues)
     }`,
   );
   assertEquals(
     result.validation.is_publishable,
-    false,
-    "Expected the Chemex-shaped stated_range collapse to block publication.",
+    true,
+    `Expected the Chemex-shaped stated_range collapse to be reconstructed and stay publishable. Got issues: ${
+      JSON.stringify(result.validation.issues)
+    }`,
+  );
+
+  const step1 = result.draft.steps[1];
+  assert(
+    step1.expressions.some((expression) =>
+      expression.preview_value !== null &&
+      Math.abs(expression.preview_value - 90) < 0.5
+    ),
+    `Expected the reconstructed high endpoint (90) to render. Got: ${
+      JSON.stringify(step1.expressions)
+    }`,
   );
 });
 
@@ -13751,5 +13822,390 @@ Deno.test("D3 decision: a step-level record whose collapsed value equals recipe.
     result.validation.is_publishable,
     true,
     "Expected a step-level range collapse that restates the recipe's own final water_amount to stay publishable, per D3's documented decision.",
+  );
+});
+
+// ---------------------------------------------------------------------
+// Phase D (plan 020 §3 D1, §4b): expandCollapsedStatedRangeEndpoints — the
+// deterministic backstop. CONFIRMED live (task brief): plan 016's
+// stated_range field, added so a collapsed range could be DETECTED, instead
+// induced the model to stop emitting a per-endpoint record, so v48 renders
+// only one endpoint where v47 (pre-stated_range) rendered two. This
+// reconstructs the v47 rendering deterministically from the SAME record
+// stated_range already carries, rather than leaving the fix to another
+// prompt change.
+// ---------------------------------------------------------------------
+
+Deno.test("Phase D: a step-level stated_range whose high endpoint collapsed out of the draft is reconstructed to render both endpoints (German 50-70g shape)", async () => {
+  const requestText =
+    "Rinse the filter and add 15g of coffee. Bei der 30-Sekunden-Marke gieße nun weitere 50-70g Wasser hinzu. Pour to 250g total and wait 90 seconds.";
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction: {
+          ...createExtraction(),
+          extracted_amounts: [
+            ...G22_BASE_AMOUNTS,
+            {
+              // Mirrors CONFIRMED production capture b2cf9abd (plan 020
+              // task brief): a literal record for the LOW endpoint only,
+              // with stated_range carrying both — source_quote is the bare
+              // number "50" (matching every real capture inspected for
+              // this phase, not "50g"; see the Task C test above for why
+              // that distinction matters).
+              value: 50,
+              unit: "g",
+              step_index: 1,
+              provenance: "literal",
+              source_quote: "50",
+              rule: null,
+              rule_source_quote: null,
+              rule_inputs: null,
+              unit_kind: "mass",
+              stated_range: { low: 50, high: 70 },
+            },
+          ],
+        },
+        normalized: {
+          ...createNormalized(),
+          steps: [
+            createNormalized().steps[0],
+            {
+              ...createNormalized().steps[1],
+              // A bare literal number, exactly like the D4/Task C fixtures
+              // above — buildDraftSteps' own deterministic literal-to-
+              // expression conversion (unrelated to this phase) turns this
+              // into a scalable "(0.2 x <final_water_amount>)g" BEFORE
+              // Phase D's backstop ever runs, which is what gives the
+              // backstop an expression to anchor a reconstruction to.
+              description_template: "Pour 50g of water and bloom.",
+            },
+            createNormalized().steps[2],
+          ],
+        },
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: requestText,
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Hario V60" },
+    ],
+    requestId: "req-phase-d-german-shape",
+  });
+
+  assert(
+    !result.validation.issues.some((issue) =>
+      issue.code === "range_endpoint_collapsed"
+    ),
+    `Expected the reconstructed rendering to clear range_endpoint_collapsed. Got issues: ${
+      JSON.stringify(result.validation.issues)
+    }`,
+  );
+  assertEquals(
+    result.validation.is_publishable,
+    true,
+    `Expected both endpoints (50 and 70) to render and the draft to stay publishable. Got issues: ${
+      JSON.stringify(result.validation.issues)
+    }`,
+  );
+
+  const step1 = result.draft.steps[1];
+  assertEquals(
+    step1.expressions.length,
+    2,
+    `Expected two scalable expressions (one per range endpoint) after reconstruction. Got: ${
+      JSON.stringify(step1.expressions)
+    }`,
+  );
+  assert(
+    step1.expressions.some((expression) =>
+      expression.preview_value !== null &&
+      Math.abs(expression.preview_value - 50) < 0.5
+    ),
+    `Expected the low endpoint (50) to still render. Got: ${
+      JSON.stringify(step1.expressions)
+    }`,
+  );
+  assert(
+    step1.expressions.some((expression) =>
+      expression.preview_value !== null &&
+      Math.abs(expression.preview_value - 70) < 0.5
+    ),
+    `Expected the reconstructed high endpoint (70) to render. Got: ${
+      JSON.stringify(step1.expressions)
+    }`,
+  );
+  assert(
+    result.warnings.some((warning) => warning.includes("D1 backstop")),
+    `Expected a warning documenting the reconstruction. Got warnings: ${
+      JSON.stringify(result.warnings)
+    }`,
+  );
+});
+
+Deno.test("Phase D: a recipe-level scalar's collapsed range is left alone — no reconstruction attempted (French-press 60-70g dose shape)", async () => {
+  // CONFIRMED production shape (plan 020 task brief, French-press captures
+  // 37daf1ec/372dc53f): the dose record's value equals the draft's own
+  // final recipe.coffee_amount, so isRecipeLevelScalarValue (Phase C)
+  // exempts it from findRangeEndpointCollapseIssues — and this same gate,
+  // reused unchanged by expandCollapsedStatedRangeEndpoints, must ALSO stop
+  // the backstop from ever touching this step's rendering. "Coffee: 60-70g"
+  // is a recipe-level scalar, not a step-level range — collapsing it to a
+  // single number is correct, and rendering "(1 x <final_coffee_amount>)-
+  // (1.16667 x <final_coffee_amount>)g" would be the exact regression the
+  // task brief warns against.
+  //
+  // Mirrors the D3 test above's own pattern (default createNormalized()'s
+  // v60/15g-coffee fixture, unchanged) rather than constructing a fresh
+  // French-press recipe context, to keep brewing-method resolution and
+  // every other unrelated field exactly as already proven to work.
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction: {
+          ...createExtraction(),
+          extracted_amounts: [
+            ...G22_BASE_AMOUNTS,
+            B1_BLOOM_LITERAL_AMOUNT,
+            {
+              // Same shape as the CONFIRMED French-press defect: the
+              // record's value (15) equals createNormalized()'s
+              // recipe.coffee_amount (15) exactly, with a genuine stated
+              // range (15-18g) and a step-level index — Phase C's
+              // value-match exemption applies regardless of step_index,
+              // and Phase D must inherit that exemption unchanged.
+              value: 15,
+              unit: "g",
+              step_index: 0,
+              provenance: "derived",
+              source_quote: null,
+              rule: "range_endpoint",
+              rule_source_quote: "15-18g",
+              rule_inputs: { low: 15, high: 18, endpoint: 0 },
+              unit_kind: "mass",
+              stated_range: { low: 15, high: 18 },
+            },
+          ],
+        },
+        normalized: createNormalized(),
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text:
+      "Rinse the filter and add 15g of coffee (a dose stated as 15-18g). Pour 50g of water and bloom for 30 seconds. Pour to 250g total and wait 90 seconds.",
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Hario V60" },
+    ],
+    requestId: "req-phase-d-frenchpress-shape",
+  });
+
+  assert(
+    !result.validation.issues.some((issue) =>
+      issue.code === "range_endpoint_collapsed"
+    ),
+    `Expected no range_endpoint_collapsed issue for a recipe-level scalar (Phase C's own exemption). Got issues: ${
+      JSON.stringify(result.validation.issues)
+    }`,
+  );
+  assertEquals(
+    result.validation.is_publishable,
+    true,
+    `Expected the single collapsed dose to stay publishable. Got issues: ${
+      JSON.stringify(result.validation.issues)
+    }`,
+  );
+
+  const step0 = result.draft.steps[0];
+  assertEquals(
+    step0.expressions.length,
+    1,
+    `Expected the recipe-level dose to stay a SINGLE expression — reconstructing a second endpoint here would be the exact French-press regression the task brief warns against. Got: ${
+      JSON.stringify(step0.expressions)
+    }`,
+  );
+  assert(
+    !result.warnings.some((warning) => warning.includes("D1 backstop")),
+    `Expected no D1 backstop warning — a recipe-level scalar must never be reconstructed. Got warnings: ${
+      JSON.stringify(result.warnings)
+    }`,
+  );
+});
+
+Deno.test("Phase D: a stated_range whose low and high are equal is never treated as a collapsed range (no-op)", async () => {
+  const requestText =
+    "Rinse the filter and add 15g of coffee. Pour 60g of water and bloom for 30 seconds. Pour to 250g total and wait 90 seconds.";
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction: {
+          ...createExtraction(),
+          extracted_amounts: [
+            ...G22_BASE_AMOUNTS,
+            {
+              value: 60,
+              unit: "g",
+              step_index: 1,
+              provenance: "literal",
+              source_quote: "60g",
+              rule: null,
+              rule_source_quote: null,
+              rule_inputs: null,
+              unit_kind: "mass",
+              // low === high: not a genuine range by any reasonable
+              // reading, even though the field is technically non-null.
+              // resolveRangeEndpointTrigger's own low !== high guard must
+              // keep this a no-op end to end — no detection, no
+              // reconstruction, no warning.
+              stated_range: { low: 60, high: 60 },
+            },
+          ],
+        },
+        normalized: {
+          ...createNormalized(),
+          steps: [
+            createNormalized().steps[0],
+            {
+              ...createNormalized().steps[1],
+              description_template: "Pour 60g of water and bloom.",
+            },
+            createNormalized().steps[2],
+          ],
+        },
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: requestText,
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Hario V60" },
+    ],
+    requestId: "req-phase-d-equal-range-noop",
+  });
+
+  assert(
+    !result.validation.issues.some((issue) =>
+      issue.code === "range_endpoint_collapsed"
+    ),
+    `Expected no range_endpoint_collapsed issue when stated_range.low === stated_range.high. Got issues: ${
+      JSON.stringify(result.validation.issues)
+    }`,
+  );
+  assertEquals(
+    result.validation.is_publishable,
+    true,
+    "Expected an equal-endpoint stated_range to publish exactly as an ordinary single amount would.",
+  );
+
+  const step1 = result.draft.steps[1];
+  assertEquals(
+    step1.expressions.length,
+    1,
+    `Expected exactly one expression — stated_range {60,60} must never trigger a reconstruction. Got: ${
+      JSON.stringify(step1.expressions)
+    }`,
+  );
+  assert(
+    !result.warnings.some((warning) => warning.includes("D1 backstop")),
+    `Expected no D1 backstop warning for a non-genuine (equal-endpoint) range. Got warnings: ${
+      JSON.stringify(result.warnings)
+    }`,
+  );
+});
+
+Deno.test("Phase D: a record with no stated_range and no range_endpoint rule is left exactly as before this phase", async () => {
+  const requestText =
+    "Rinse the filter and add 15g of coffee. Pour 60g of water and bloom for 30 seconds. Pour to 250g total and wait 90 seconds.";
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction: {
+          ...createExtraction(),
+          extracted_amounts: [
+            ...G22_BASE_AMOUNTS,
+            {
+              value: 60,
+              unit: "g",
+              step_index: 1,
+              provenance: "literal",
+              source_quote: "60g",
+              rule: null,
+              rule_source_quote: null,
+              rule_inputs: null,
+              // No unit_kind, no stated_range — the pre-Phase-D shape every
+              // fixture predating plan 016/020 still has.
+            },
+          ],
+        },
+        normalized: {
+          ...createNormalized(),
+          steps: [
+            createNormalized().steps[0],
+            {
+              ...createNormalized().steps[1],
+              description_template: "Pour 60g of water and bloom.",
+            },
+            createNormalized().steps[2],
+          ],
+        },
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: requestText,
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Hario V60" },
+    ],
+    requestId: "req-phase-d-no-stated-range-noop",
+  });
+
+  assert(
+    !result.validation.issues.some((issue) =>
+      issue.code === "range_endpoint_collapsed"
+    ),
+    `Expected no range_endpoint_collapsed issue. Got issues: ${
+      JSON.stringify(result.validation.issues)
+    }`,
+  );
+  assertEquals(
+    result.validation.is_publishable,
+    true,
+    "Expected a record with no stated_range/rule to publish exactly as before Phase D.",
+  );
+
+  const step1 = result.draft.steps[1];
+  assertEquals(
+    step1.expressions.length,
+    1,
+    `Expected exactly one expression, unchanged from what extraction/normalization produced. Got: ${
+      JSON.stringify(step1.expressions)
+    }`,
+  );
+  assert(
+    !result.warnings.some((warning) => warning.includes("D1 backstop")),
+    `Expected no D1 backstop warning when there is nothing to reconstruct from. Got warnings: ${
+      JSON.stringify(result.warnings)
+    }`,
   );
 });
