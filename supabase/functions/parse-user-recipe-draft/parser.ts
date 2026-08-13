@@ -57,6 +57,56 @@ const amountProvenanceSchema = z.object({
   rule: z.string().trim().min(1).nullable().default(null),
   rule_source_quote: z.string().trim().min(1).nullable().default(null),
   rule_inputs: z.record(z.number()).nullable().default(null),
+  // C1 (plan 016 §3 D1-vocabulary, §4 Phase 1b — an agreed cross-agent
+  // contract with provenance.ts's owner; this shape must match exactly).
+  // The model's own semantic classification of `unit`'s DIMENSION,
+  // independent of what word or script it wrote the unit in. Exists
+  // because provenance.ts's unit-comparison lexicon is English+Russian
+  // only, so an Arabic/Persian unit (جرام, گرم, میلی‌لیتر) fails to
+  // normalize against a rendered ASCII "g"/"ml" and reports as
+  // untraceable even when the amount is correct. Per CLAUDE.md, the model
+  // already read the (multilingual) source text and is the right place to
+  // resolve this — the lexicon in provenance.ts remains only as a labelled
+  // fallback for when this field is absent. mass and volume are mutually
+  // compatible (density≈1 precedent for water); time and percent are
+  // compatible with neither — see provenance.ts for the consuming logic
+  // (owned by a different agent; not touched here).
+  //
+  // Nullable + `.optional()` rather than `.default()`, deliberately: old
+  // captures, the six golden fixtures, and every existing ExtractionResult/
+  // NormalizedDraft object literal in this test suite predate this field
+  // and have neither key at all. `.optional()` lets the key be entirely
+  // absent (not just null) without failing parse, so an absent field can
+  // never make a previously-passing draft fail — the same backward-
+  // compatibility contract CLAUDE.md requires for this kind of addition.
+  unit_kind: z.enum(["mass", "volume", "time", "percent"]).nullable()
+    .optional(),
+  // C2 (plan 016 §3 D4′, §4 Task C). When the source states this amount as
+  // a range, both endpoints — prompted for regardless of which `rule` (if
+  // any) the model ultimately records the value under. Exists because a
+  // collapsed range does not reliably use the range_endpoint rule: a
+  // Chemex capture's "60-90g" bloom collapsed to a single LITERAL 60
+  // record with no rule at all, so rule_inputs (D4's original detection
+  // surface) had nothing to find — the 90 was simply absent from
+  // extracted_amounts. stated_range is prompted independently of
+  // provenance/rule so the high endpoint survives somewhere even when the
+  // rest of the pipeline collapses the rendered amount to one endpoint.
+  // See findRangeEndpointCollapseIssues below for the consuming check.
+  //
+  // Same backward-compatibility reasoning as unit_kind: `.nullable()
+  // .optional()`, never `.default()` — absent on every pre-existing
+  // capture and fixture, and must never fail a previously-passing draft.
+  //
+  // Honesty note (carried into this file's final report, not just here): a
+  // prompted field does not bind any more reliably than the range_endpoint
+  // rule did. This reduces how often the Chemex-shaped failure occurs; it
+  // does not guarantee catching it. A guarantee would require deterministic
+  // range detection over multilingual source prose, which is exactly the
+  // semantic-judgement-via-regex CLAUDE.md forbids.
+  stated_range: z.object({
+    low: z.number(),
+    high: z.number(),
+  }).nullable().optional(),
 });
 
 const extractedStepSchema = z.object({
@@ -2331,7 +2381,9 @@ function buildBrewingMethodsPrompt(methods: BrewingMethodOption[]): string {
 // as one block so the three stages never drift into inconsistent
 // definitions of what each provenance class means.
 const AMOUNT_PROVENANCE_PROMPT_RULES: string[] = [
-  "Every numeric coffee or water amount — recipe-level coffee_amount_grams/water_amount and every step's own amounts alike, including range endpoints and cumulative pour targets — must also get a matching record in extracted_amounts: { value, unit, step_index, provenance, source_quote, rule, rule_source_quote, rule_inputs }.",
+  "Every numeric coffee or water amount — recipe-level coffee_amount_grams/water_amount and every step's own amounts alike, including range endpoints and cumulative pour targets — must also get a matching record in extracted_amounts: { value, unit, step_index, provenance, source_quote, rule, rule_source_quote, rule_inputs, unit_kind, stated_range }.",
+  "unit_kind classifies what DIMENSION unit is, independent of what word or script you wrote it in: 'mass' (e.g. g, grams, جرام, گرم), 'volume' (e.g. ml, milliliters, میلی‌لیتر), 'time', or 'percent'. Set it for every record — this is what lets a non-English unit be verified even when the rendered recipe later shows the amount in plain ASCII 'g' or 'ml'. Use null only if the unit genuinely does not fit any of the four.",
+  "stated_range records the two endpoints whenever the source text states this amount as a range (e.g. '60-90 g', '20-24g'), as { low, high }, regardless of which single value you ultimately choose for the record's own value/rule. Set it even when provenance/rule is 'literal' or when rule is something other than range_endpoint — the point is to preserve BOTH endpoints somewhere even if the rest of the pipeline later collapses the amount to one of them. Use null when the source states a single value, not a range.",
   "step_index is the 0-based index into steps that the amount belongs to, or -1 for a recipe-level amount not tied to one specific step.",
   "provenance is exactly one of three values: 'literal', 'derived', or 'inferred'.",
   '\'literal\' means the value appears verbatim in the source text. source_quote must be the exact substring of the source text stating it — copy it character for character, do not paraphrase or reformat it. rule, rule_source_quote, and rule_inputs must be null. Worked example (English): the text \'Pour 50 g of water for the bloom.\' gives { value: 50, unit: "g", provenance: "literal", source_quote: "50 g", rule: null, rule_source_quote: null, rule_inputs: null }. Worked example (German, non-English): the text \'25g Kaffee aufgießen und quellen lassen.\' gives { value: 25, unit: "g", provenance: "literal", source_quote: "25g", rule: null, rule_source_quote: null, rule_inputs: null } — never translate source_quote into English.',
@@ -2339,7 +2391,8 @@ const AMOUNT_PROVENANCE_PROMPT_RULES: string[] = [
   'Worked example, multiple_of_coffee: \'Bloom with three times the dose of water\' for a 25 g dose gives { value: 75, unit: "g", provenance: "derived", source_quote: null, rule: "multiple_of_coffee", rule_source_quote: "three times the dose", rule_inputs: { multiplier: 3, coffee_amount: 25 } }.',
   'Worked example, concentration: \'Use a ratio of 60 grams per liter\' at a 500 ml water target gives the COFFEE mass, { value: 30, unit: "g", provenance: "derived", source_quote: null, rule: "concentration", rule_source_quote: "60 grams per liter", rule_inputs: { grams_per_litre: 60, millilitres: 500 } }. This rule only derives a coffee mass from a concentration and a water volume — it cannot derive a water amount, so never use it to justify a water figure.',
   'Worked example, concentration_water_from_coffee: the SAME \'Use a ratio of 60 grams per liter\' text, but now for a 30 g coffee dose, gives the WATER volume, { value: 500, unit: "ml", provenance: "derived", source_quote: null, rule: "concentration_water_from_coffee", rule_source_quote: "60 grams per liter", rule_inputs: { grams_per_litre: 60, coffee_grams: 30 } }. Never call this rule "concentration" and never pass the water figure you are trying to justify back in as one of its own rule_inputs — rule_inputs must hold only the OTHER facts (the concentration and the coffee dose), not the value being derived.',
-  'Worked example, range_endpoint: \'60-90 g of coffee\', when the recipe\'s own steps settle on the low end, gives { value: 60, unit: "g", provenance: "derived", source_quote: null, rule: "range_endpoint", rule_source_quote: "60-90 g", rule_inputs: { low: 60, high: 90, endpoint: 0 } }. endpoint is 0 for the low end, 1 for the high end, 0.5 for the midpoint.',
+  'Worked example, range_endpoint: \'60-90 g of coffee\', when the recipe\'s own steps settle on the low end, gives { value: 60, unit: "g", provenance: "derived", source_quote: null, rule: "range_endpoint", rule_source_quote: "60-90 g", rule_inputs: { low: 60, high: 90, endpoint: 0 }, unit_kind: "mass", stated_range: { low: 60, high: 90 } }. endpoint is 0 for the low end, 1 for the high end, 0.5 for the midpoint.',
+  'Worked example, stated_range on a LITERAL record: a bloom stated as \'Pour 60-90g of water and bloom.\' where you record only the literal 60 (because that is the number the step\'s own later text settles on) still gives { value: 60, unit: "g", provenance: "literal", source_quote: "60g", rule: null, rule_source_quote: null, rule_inputs: null, unit_kind: "mass", stated_range: { low: 60, high: 90 } } — stated_range is set even though this record is literal, not range_endpoint, so the 90 is not lost from extracted_amounts entirely.',
   'Worked example, cumulative_sum: five pours to running totals 60/120/180/240/300 ml — the step pouring to 180 ml gives { value: 180, unit: "ml", provenance: "derived", source_quote: null, rule: "cumulative_sum", rule_source_quote: "<the source phrase stating the running/cumulative total for that pour>", rule_inputs: { sum: 180 } }.',
   "'inferred' means there is no source basis for the value at all. inferred is PERMITTED ONLY for water temperature and grind size (never represented in extracted_amounts, since those are not coffee/water amounts) — it must NEVER be used for a coffee or water amount. If you cannot justify an amount as literal or derived per the rules above, do not invent one: leave it out of extracted_amounts rather than mark it inferred.",
   "extracted_amounts may be an empty array only when the source genuinely states no coffee or water amounts at all. Never omit a record for an amount you did extract.",
@@ -2429,6 +2482,8 @@ function buildExtractionUserPrompt(input: {
               "multiple_of_coffee|multiple_of_water|ratio_of_total|concentration|concentration_water_from_coffee|range_endpoint|cumulative_sum|null",
             rule_source_quote: "string|null",
             rule_inputs: "object of numeric operands, or null",
+            unit_kind: "mass|volume|time|percent|null",
+            stated_range: "{ low: number, high: number }|null",
           },
         ],
       },
@@ -2515,9 +2570,9 @@ function buildNormalizationSystemPrompt(mode: RecipeDraftParserMode): string {
   // step_index. Carrying it correctly means re-pointing step_index values
   // when a step is split or merged, not just copying the array unchanged.
   const provenanceCarryRules = [
-    "The extraction stage also produced extracted_amounts, a top-level array of provenance records (NOT nested inside individual steps): { value, unit, step_index, provenance, source_quote, rule, rule_source_quote, rule_inputs }. Carry every record through into your own extracted_amounts array.",
+    "The extraction stage also produced extracted_amounts, a top-level array of provenance records (NOT nested inside individual steps): { value, unit, step_index, provenance, source_quote, rule, rule_source_quote, rule_inputs, unit_kind, stated_range }. Carry every record through into your own extracted_amounts array.",
     "If you split one extracted step into several normalized steps, or merge several extracted steps into one, update each carried record's step_index so it still points at the correct normalized step (0-based index into your own steps array, or -1 for a recipe-level amount). Do not leave a record pointing at a step that no longer corresponds to where its amount actually appears.",
-    "Do not invent new extracted_amounts records for amounts the extraction stage did not already record, and do not change a carried record's value, unit, provenance, source_quote, rule, rule_source_quote, or rule_inputs — only step_index may need to change, and only to correct for a split or merge.",
+    "Do not invent new extracted_amounts records for amounts the extraction stage did not already record, and do not change a carried record's value, unit, provenance, source_quote, rule, rule_source_quote, rule_inputs, unit_kind, or stated_range — only step_index may need to change, and only to correct for a split or merge.",
     ...AMOUNT_PROVENANCE_PROMPT_RULES,
   ];
 
@@ -2579,6 +2634,8 @@ function buildNormalizationUserPrompt(input: {
               "multiple_of_coffee|multiple_of_water|ratio_of_total|concentration|concentration_water_from_coffee|range_endpoint|cumulative_sum|null",
             rule_source_quote: "string|null",
             rule_inputs: "object of numeric operands, or null",
+            unit_kind: "mass|volume|time|percent|null",
+            stated_range: "{ low: number, high: number }|null",
           },
         ],
       },
@@ -2666,8 +2723,8 @@ function buildRepairSystemPrompt(mode: RecipeDraftParserMode): string {
   ];
 
   const provenanceCarryRules = [
-    "The current normalized JSON also carries extracted_amounts, a top-level array of provenance records (NOT nested inside individual steps): { value, unit, step_index, provenance, source_quote, rule, rule_source_quote, rule_inputs }. Carry every record through into your own extracted_amounts array unchanged, including when you only repaired other fields.",
-    "If repairing requires you to split or merge a step, update each affected record's step_index so it still points at the correct step (0-based index into your own steps array, or -1 for a recipe-level amount). Otherwise leave every record exactly as given — repair never invents, drops, or edits an extracted_amounts record's value, unit, provenance, source_quote, rule, rule_source_quote, or rule_inputs.",
+    "The current normalized JSON also carries extracted_amounts, a top-level array of provenance records (NOT nested inside individual steps): { value, unit, step_index, provenance, source_quote, rule, rule_source_quote, rule_inputs, unit_kind, stated_range }. Carry every record through into your own extracted_amounts array unchanged, including when you only repaired other fields.",
+    "If repairing requires you to split or merge a step, update each affected record's step_index so it still points at the correct step (0-based index into your own steps array, or -1 for a recipe-level amount). Otherwise leave every record exactly as given — repair never invents, drops, or edits an extracted_amounts record's value, unit, provenance, source_quote, rule, rule_source_quote, rule_inputs, unit_kind, or stated_range.",
     ...AMOUNT_PROVENANCE_PROMPT_RULES,
   ];
 
@@ -3053,10 +3110,33 @@ function hasInvalidExpressionSyntax(template: string): boolean {
     hasDanglingExpressionMultiplier(template);
 }
 
+// D3'/Phase 2 (plan 016 §3 D3', §4 Phase 2): normalizeLeadingTimestampLabel,
+// normalizeCumulativeWaterWording and normalizeTemplateTextPolish (the
+// three passes chained just below) are the actual, deterministic source of
+// the "0:00 pour 50g" -> "Pour 50g" and "pour to" -> "Pour up to"
+// wording regressions observed in verify mode -- Phase 0 walked all four
+// stage_outputs for the affected captures and found the LLM repair and
+// cumulative_rewrite stages returned empty arrays (never invoked); this
+// function ran regardless of mode and rewrote the wording anyway. Extract
+// mode's use of these three is correct and desirable (stripping a
+// transcript timestamp, capitalizing, and tidying "pour to" phrasing is
+// exactly the cleanup a raw transcript needs) and MUST stay byte-identical
+// to before this change -- the six golden fixtures are the proof of that.
+// verify mode's entire contract is the opposite: the input is already a
+// well-formed, previously-generated recipe, and nothing about its wording
+// should be silently rewritten. The existing verify-mode prompt rules
+// (buildNormalizationSystemPrompt/buildRepairSystemPrompt's "description_
+// template must equal description_source verbatim") are aimed at the LLM
+// stages, which were never the culprit here -- they are left in place
+// because they reduce how often a rewrite reaches this function in the
+// first place (mirrors F32's "prompt rule stays, code enforces" shape),
+// but the actual guarantee now lives here, deterministically, gated on
+// mode rather than left to model compliance.
 function normalizeStepDescriptionTemplate(args: {
   step: NormalizedDraft["steps"][number];
   coffeeAmount: number | null;
   waterAmount: number | null;
+  mode: RecipeDraftParserMode;
 }): string {
   const normalizeCandidate = (candidate: string) => {
     const normalizedExpressionMathTemplate = normalizeExpressionLikeMath({
@@ -3075,6 +3155,10 @@ function normalizeStepDescriptionTemplate(args: {
       scalableAmounts: args.step.scalable_amounts,
       stepRole: args.step.step_role,
     });
+
+    if (args.mode === "verify") {
+      return normalizedTemplate;
+    }
 
     return normalizeTemplateTextPolish(
       normalizeCumulativeWaterWording(
@@ -3098,12 +3182,14 @@ function buildDraftSteps(input: {
   steps: NormalizedDraft["steps"];
   coffeeAmount: number | null;
   waterAmount: number | null;
+  mode: RecipeDraftParserMode;
 }): DraftStep[] {
   return input.steps.map((step, index) => {
     const normalizedTemplate = normalizeStepDescriptionTemplate({
       step,
       coffeeAmount: input.coffeeAmount,
       waterAmount: input.waterAmount,
+      mode: input.mode,
     });
 
     return {
@@ -3155,6 +3241,17 @@ function joinFoldedStepText(parts: string[]): string {
 // timer starts; if those land as timed brew steps, the app's on-screen
 // timer drifts ahead of the source recipe's own clock. Fold any such
 // pre-timer actions into the preparation step instead of timing them.
+//
+// Plan 016 §4 Phase 4: this fold is exactly the mechanism that produces the
+// Hario "20g was recorded for step 3 but appears on step 1" false block —
+// extracted_amounts records carry step_index values from BEFORE this pass
+// ran (see the comment on `remapStepIndex` below and provenance.ts's own
+// note on why a >1 drift is tolerated). The fold is deterministic and fully
+// invertible as an index mapping, so `remapStepIndex` is returned alongside
+// the folded steps and the caller applies it to extracted_amounts at the
+// same call site this fold runs from, keeping the two in lockstep. This is
+// NOT true of step splitting (see that mapping's own doc comment) — do not
+// generalize this pattern to splits.
 function foldPreTimerStepsIntoPreparation(
   input: {
     steps: DraftStep[];
@@ -3165,9 +3262,25 @@ function foldPreTimerStepsIntoPreparation(
     // than merely running it "safely".
     preserveStepCount: boolean;
   },
-): { steps: DraftStep[]; warnings: string[] } {
+): {
+  steps: DraftStep[];
+  warnings: string[];
+  /**
+   * Maps a PRE-fold 0-based step index (the step_index an extracted_amounts
+   * record carries) to its POST-fold 0-based index in `steps` above. Identity
+   * when nothing was folded (preserveStepCount, or no qualifying timer-start
+   * step found) — always safe to call unconditionally. A recipe-level
+   * `step_index: -1` sentinel happens to fall into the `stepIndex <= 0`
+   * branch below and comes back unchanged, but callers must still skip -1
+   * explicitly rather than rely on that — -1 is not a real step index (see
+   * the D4/D4′ range-collapse check, which already applies this same guard).
+   */
+  remapStepIndex: (stepIndex: number) => number;
+} {
+  const identityRemap = (stepIndex: number) => stepIndex;
+
   if (input.preserveStepCount) {
-    return { steps: input.steps, warnings: [] };
+    return { steps: input.steps, warnings: [], remapStepIndex: identityRemap };
   }
 
   const startsTimerIndex = input.steps.findIndex((step) =>
@@ -3178,7 +3291,7 @@ function foldPreTimerStepsIntoPreparation(
   // <= 1) — nothing to fold. This is the common case, so keep blast radius
   // small.
   if (startsTimerIndex === -1 || startsTimerIndex <= 1) {
-    return { steps: input.steps, warnings: [] };
+    return { steps: input.steps, warnings: [], remapStepIndex: identityRemap };
   }
 
   const preparationStep = input.steps[0];
@@ -3204,11 +3317,25 @@ function foldPreTimerStepsIntoPreparation(
     step_order: index + 1,
   }));
 
+  // old 0                      -> new 0
+  // old 1..startsTimerIndex-1  -> new 0        (folded into preparation)
+  // old i >= startsTimerIndex  -> new i - (startsTimerIndex - 1)
+  const remapStepIndex = (stepIndex: number): number => {
+    if (stepIndex <= 0) {
+      return stepIndex;
+    }
+    if (stepIndex < startsTimerIndex) {
+      return 0;
+    }
+    return stepIndex - (startsTimerIndex - 1);
+  };
+
   return {
     steps: remainingSteps,
     warnings: [
       "Pre-timer actions were folded into the preparation step.",
     ],
+    remapStepIndex,
   };
 }
 
@@ -5179,10 +5306,234 @@ function buildRenderedTimingStepsFromDraftSteps(
   }));
 }
 
+// D5 (plan 016 §4 Phase 3b, diagnosis D5): a proportional tolerance for
+// deciding whether a `total_brew_time_mismatch` finding from
+// verifyTimingProvenance (provenance.ts, "The source states a total brew
+// time of Ns, but the final brew steps sum to Ms.") is severe enough to
+// block EXTRACT-mode publication. verify mode already blocks on every
+// timing finding unconditionally via `preserveStepCount` and is untouched
+// by this — see the comment above the `preserveStepCount` usage further
+// down for why that split exists.
+//
+// An absolute-seconds threshold cannot separate the two controls this was
+// built against: the cold_brew fixture's deterministic split lands at
+// 65100s against a stated 66600s (1500s off, ~2.3%) and must stay a
+// warning, while the live Russian defect emitted 40s against a stated 180s
+// (140s off, but a 4.5x contraction) and must block. Neither an absolute
+// floor nor a fixed-seconds ceiling can pass the first and block the
+// second — a floor loose enough to admit 1500s admits 140s too, and a
+// ceiling tight enough to catch 140s catches 1500s too. A RATIO catches
+// the 4.5x contraction without touching the 2.3% drift: factor-of-2 leaves
+// roughly an order of magnitude of headroom above every known-good case
+// (1500s off is only a 1.023x ratio) while sitting comfortably below the
+// known-bad one (180/40 = 4.5x).
+const TOTAL_BREW_TIME_BLOCKING_RATIO = 2;
+
+function isTotalBrewTimeMismatchSevere(
+  statedSeconds: number,
+  emittedSeconds: number,
+): boolean {
+  if (statedSeconds <= 0 || emittedSeconds <= 0) {
+    // Defensive only, not expected on live traffic: extraction's schema
+    // already requires total_brew_time_seconds to be a positive integer
+    // when present (see extractionSchema above), and an emitted total of
+    // zero brew seconds is a different, already-covered failure (no brew
+    // steps meet MIN_BREW_STEP_DURATION_SECONDS, so brewTimeSeconds is
+    // null and publish_projection is withheld below regardless of this
+    // check). Treat "cannot form a meaningful ratio" as non-severe rather
+    // than dividing by zero.
+    return false;
+  }
+  const ratio = emittedSeconds >= statedSeconds
+    ? emittedSeconds / statedSeconds
+    : statedSeconds / emittedSeconds;
+  return ratio >= TOTAL_BREW_TIME_BLOCKING_RATIO;
+}
+
 // F32: mirrors provenance.ts's AmountProvenance shape, taken from the
 // normalized draft's own carried-through field rather than re-imported,
 // since that's the exact array this repair pass reads.
 type AmountProvenanceRecord = NormalizedDraft["extracted_amounts"][number];
+
+// D4 (plan 016 §4 Phase 3a, diagnosis D4): the G22 amount check above
+// (verifyAmountProvenance, called from finalizeDraftResponse below) only
+// ever verifies that an EMITTED amount traces back to a recorded value —
+// it has no opinion on a value that WAS recorded (a range_endpoint record,
+// rule_inputs { low, high, endpoint }) but whose other endpoint never got
+// emitted anywhere in the draft at all. That is exactly the Chemex/Spanish
+// defect: a stated "60-90 g" bloom collapsed to a single rendered "60 g",
+// silently losing the source's high endpoint, while G22 stayed green
+// because the low endpoint DID trace correctly to a matching record. This
+// check closes that gap: for every range_endpoint record with a genuine
+// low/high spread, the endpoint NOT selected must still appear somewhere
+// in the final draft (any step — a recipe may state the range once but
+// the draft can legitimately show its two endpoints in different places),
+// or the draft is not publishable.
+//
+// Scoped to coffee/water amounts by construction, not by an extra unit
+// filter here: extracted_amounts only ever carries coffee/water records
+// (see AMOUNT_PROVENANCE_PROMPT_RULES above — "Every numeric coffee or
+// water amount ... must also get a matching record in extracted_amounts").
+// total_brew_time_seconds is a separate top-level field that is never
+// represented in extracted_amounts, so the deliberate total-time-range-to-
+// midpoint conversion (see the extraction prompt rule above, "midpoint
+// rounded to the nearest 5 seconds") can never trip this check — there is
+// no total-time extracted_amounts record for it to inspect in the first
+// place.
+const RANGE_ENDPOINT_MATCH_TOLERANCE = 0.5;
+
+// g/ml are treated as interchangeable, mirroring the same water-density
+// assumption provenance.ts's own unit comparison already makes for the
+// exact same reason (g and ml are used interchangeably for water in coffee
+// recipes). This is a narrow, two-value equivalence for this one check —
+// not a re-implementation of D1's Arabic/Persian unit lexicon, which is
+// out of scope here and owned by provenance.ts.
+function normalizeUnitForRangeCheck(unit: string): string {
+  const normalized = normalizeExpressionUnit(unit).trim().toLowerCase();
+  if (normalized === "g" || normalized === "ml") {
+    return "mass_or_volume";
+  }
+  return normalized;
+}
+
+// C2 (plan 016 §3 D4′, §4 Task C): resolves, for a single provenance
+// record, whether the source stated a genuine two-sided range for this
+// amount and — if so — which value is the "other" endpoint that must
+// still appear somewhere in the draft. Two independent sources feed this,
+// tried in order:
+//
+// 1. The range_endpoint rule's own rule_inputs { low, high, endpoint } —
+//    the original D4 detection surface. Reliable when the model chose
+//    this rule, but Chemex-shaped captures show it is NOT reliably chosen
+//    even when the source states a genuine range.
+// 2. stated_range { low, high } — prompted for independently of which
+//    rule (if any) the record ends up under, specifically so a LITERAL
+//    record whose source stated a range still carries both endpoints.
+//    Because stated_range has no explicit endpoint selector (unlike
+//    rule_inputs.endpoint), the "other" value is inferred by matching
+//    record.value against whichever of low/high it's closest to — if it
+//    matches neither within tolerance, the record is left unchecked
+//    rather than guessed at.
+//
+// Both can independently disagree or be partially missing (schema-old
+// captures, model omission); this function tries rule_inputs first and
+// only falls back to stated_range when rule_inputs didn't resolve —
+// avoiding a double-count when both happen to describe the same range.
+function resolveRangeEndpointTrigger(
+  record: AmountProvenanceRecord,
+): { low: number; high: number; otherValue: number } | null {
+  if (record.rule === "range_endpoint" && record.rule_inputs) {
+    const { low, high, endpoint } = record.rule_inputs;
+    if (
+      typeof low === "number" && typeof high === "number" && low !== high
+    ) {
+      // Only a low- or high-endpoint selection has a single, unambiguous
+      // "other" value to look for. A midpoint selection (0.5) is never
+      // instructed for coffee/water amounts (only total_brew_time_seconds
+      // gets the midpoint treatment, and that field is never represented
+      // in extracted_amounts at all — see the header comment above) —
+      // left unchecked rather than guessed at.
+      if (endpoint === 0) return { low, high, otherValue: high };
+      if (endpoint === 1) return { low, high, otherValue: low };
+    }
+  }
+
+  const statedRange = record.stated_range;
+  if (
+    statedRange && typeof statedRange.low === "number" &&
+    typeof statedRange.high === "number" && statedRange.low !== statedRange.high
+  ) {
+    const { low, high } = statedRange;
+    if (Math.abs(record.value - low) <= RANGE_ENDPOINT_MATCH_TOLERANCE) {
+      return { low, high, otherValue: high };
+    }
+    if (Math.abs(record.value - high) <= RANGE_ENDPOINT_MATCH_TOLERANCE) {
+      return { low, high, otherValue: low };
+    }
+    // record.value matches neither stated endpoint — ambiguous (e.g. a
+    // midpoint-like value, or a data inconsistency between value and
+    // stated_range); left unchecked rather than guessed at.
+  }
+
+  return null;
+}
+
+function findRangeEndpointCollapseIssues(
+  provenance: AmountProvenanceRecord[],
+  renderedAmounts: RenderedAmount[],
+): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+
+  for (const record of provenance) {
+    // B1 (plan 016 §3 D4′, §4 Task B): step_index -1 is the recipe-level
+    // sentinel (e.g. coffee_amount, water_amount) rather than a specific
+    // step's amount. A recipe-level scalar is a single number by schema —
+    // "brew 20-24g" is not representable, so collapsing it to one endpoint
+    // is the CORRECT outcome, not a defect. Without this guard, a German
+    // capture's dose stated as "20-24g" (rule_inputs {low: 20, high: 24,
+    // endpoint: 0}, step_index: -1) trips this check and is falsely
+    // blocked — the very draft this plan exists to unblock. Step-level
+    // records (step_index >= 0, e.g. Spanish's collapsed bloom) are
+    // unaffected by this guard and are still checked below.
+    if (record.step_index < 0) {
+      continue;
+    }
+
+    const trigger = resolveRangeEndpointTrigger(record);
+    if (trigger === null) {
+      continue;
+    }
+    const { low, high, otherValue } = trigger;
+
+    const otherEndpointUnit = normalizeUnitForRangeCheck(record.unit);
+    const preserved = renderedAmounts.some((rendered) => {
+      if (
+        Math.abs(rendered.value - otherValue) > RANGE_ENDPOINT_MATCH_TOLERANCE
+      ) {
+        return false;
+      }
+
+      const renderedUnit = normalizeUnitForRangeCheck(rendered.unit);
+      if (renderedUnit === "") {
+        // B2 (plan 016 §3 D4′/D1-empty-unit, §4 Task B): a hyphenated
+        // range like "60-90g" renders through EXPRESSION_REGEX as two
+        // adjacent expressions sharing one trailing unit suffix — by
+        // design (see the EXPRESSION_REGEX comment further up; its
+        // allowlist anchoring is what fixed the Japanese "mlまで注ぐ。"
+        // corruption and must not be changed) — so the FIRST expression's
+        // rendered unit is legitimately "". This function only ever sees
+        // coffee/water records (see the header comment above:
+        // extracted_amounts is scoped to coffee/water by construction), so
+        // there is no other unit family a blank-unit rendered value here
+        // could belong to. Comparing on value alone when the rendered unit
+        // is empty is therefore a deliberate, narrow choice — not a
+        // guess — and it closes the same empty-unit gap D1 diagnosed in
+        // provenance.ts, for this local check, without reimplementing
+        // provenance.ts's general unit-compatibility lexicon (out of scope
+        // here, owned by provenance.ts's Phase 1a).
+        return true;
+      }
+
+      return renderedUnit === otherEndpointUnit;
+    });
+
+    if (!preserved) {
+      issues.push({
+        code: "range_endpoint_collapsed",
+        field: record.step_index >= 0
+          ? `steps[${record.step_index}].description_template`
+          : "extraction.range_endpoint",
+        message:
+          `The source states a range of ${low}-${high}${record.unit}, ` +
+          `but the final draft only shows ${record.value}${record.unit} — ` +
+          `the other endpoint (${otherValue}${record.unit}) does not ` +
+          `appear anywhere in the draft.`,
+      });
+    }
+  }
+
+  return issues;
+}
 
 // A tolerance for "is the rendered multiplier already numerically correct"
 // — needed because the multiplier arriving in description_template is
@@ -5597,11 +5948,38 @@ function finalizeDraftResponse(input: {
     steps: normalizedWithBalancedCopy.steps,
     coffeeAmount: normalizedWithBalancedCopy.recipe.coffee_amount,
     waterAmount: normalizedWithBalancedCopy.recipe.water_amount,
+    mode: input.mode,
   });
   const foldedDraftSteps = foldPreTimerStepsIntoPreparation({
     steps: builtDraftSteps,
     preserveStepCount,
   });
+  // Plan 016 §4 Phase 4 (D2): extracted_amounts records carry step_index
+  // values assigned by the LLM stages, which run BEFORE this deterministic
+  // fold and therefore never see it — a Hario pre-timer dose recorded at
+  // step_index 2 lands on the rendered draft's step 0 once folded, a drift
+  // of 2 that trips provenance.ts's >1 block even though the draft is
+  // correct. Remap every step-level record through the exact same mapping
+  // the fold just applied, right here, so verifyAmountProvenance and the
+  // D4 range-collapse check below both see records that already agree with
+  // `foldedDraftSteps`/`draftSteps`'s own indices. Recipe-level `step_index:
+  // -1` records are left untouched — -1 is a sentinel (coffee_amount/
+  // water_amount), not a position the fold could have moved.
+  //
+  // Splits are deliberately NOT remapped here: unlike the fold, step
+  // splitting happens inside the LLM stages, is not deterministic, and the
+  // normalization stage already re-emits split records with corrected
+  // indices (see foldPreTimerStepsIntoPreparation's own doc comment). The
+  // ±1 tolerance in provenance.ts exists to absorb whatever residual drift
+  // that LLM-side renumbering leaves — remapping split indices here as well
+  // would double-correct them and is out of scope for this fix.
+  const foldRemappedExtractedAmounts =
+    (normalizedWithBalancedCopy.extracted_amounts ?? []).map((record) =>
+      record.step_index < 0 ? record : {
+        ...record,
+        step_index: foldedDraftSteps.remapStepIndex(record.step_index),
+      }
+    );
   // The fold above merges plain text into steps[0]'s description; re-render
   // its preview text and re-extract its expressions so the merged content
   // is reflected (foldPreTimerStepsIntoPreparation itself only touches
@@ -5661,10 +6039,20 @@ function finalizeDraftResponse(input: {
   // renderedAmounts build below) and BEFORE verifyAmountProvenance, so G22
   // verifies the REPAIRED rendering rather than flagging a mismatch this
   // pass already fixed deterministically.
+  //
+  // Plan 016 §4 Phase 4: `steps` here (durationNormalizedDraftSteps) is
+  // POST-fold, so this needs the same fold-remapped provenance G22 uses
+  // below — matching a record by `record.step_index === stepIndex`
+  // (planStepMultiplierRepairs' call site) against raw, unremapped indices
+  // would pair a pre-fold record with whatever POST-fold step happens to
+  // share that same numeric index, which is a coincidence, not a
+  // correspondence. Using foldRemappedExtractedAmounts here keeps every
+  // consumer of extracted_amounts downstream of the fold in agreement about
+  // what "this step" means.
   const multiplierRepair = repairExpressionMultipliersAgainstLiteralProvenance(
     {
       steps: durationNormalizedDraftSteps.steps,
-      provenance: normalizedWithBalancedCopy.extracted_amounts ?? [],
+      provenance: foldRemappedExtractedAmounts,
       coffeeAmount: normalizedWithBalancedCopy.recipe.coffee_amount,
       waterAmount: normalizedWithBalancedCopy.recipe.water_amount,
       requestText: input.requestText,
@@ -5724,8 +6112,17 @@ function finalizeDraftResponse(input: {
   const provenanceResult = verifyAmountProvenance({
     requestText: input.requestText,
     renderedAmounts,
-    provenance: normalizedWithBalancedCopy.extracted_amounts ?? [],
+    provenance: foldRemappedExtractedAmounts,
   });
+
+  // D4 (plan 016 Phase 3a): see findRangeEndpointCollapseIssues above.
+  // Reuses the exact same fold-remapped provenance array and renderedAmounts
+  // G22 already built for this response — no separate extraction pass, no
+  // new field.
+  const rangeEndpointIssues = findRangeEndpointCollapseIssues(
+    foldRemappedExtractedAmounts,
+    renderedAmounts,
+  );
 
   // Enforcement is asymmetric by field and mode (plans/009-recipe-draft-
   // lab-transcript-robustness.md §"G22 — settled design", point 3):
@@ -5777,18 +6174,51 @@ function finalizeDraftResponse(input: {
     renderedSteps: renderedTimingSteps,
     landmarks: timingLandmarks,
   });
-  const timingValidationIssues: ValidationIssue[] = preserveStepCount
-    ? timingResult.findings.map((finding: TimingProvenanceFinding) => ({
+  // D5 (plan 016 Phase 3b): mirrors verifyTimingProvenance's own total-time
+  // sum exactly (provenance.ts, "1. Total brew time.") so the severity
+  // ratio below is judged against the identical figure the finding's own
+  // message already reports — a fresh sum over the same renderedTimingSteps
+  // input, never a regex over that message.
+  const emittedTotalBrewTimeSeconds = renderedTimingSteps
+    .filter((step) => step.kind === "brew")
+    .reduce((sum, step) => sum + step.duration_seconds, 0);
+  const statedTotalBrewTimeSeconds = input.extraction.total_brew_time_seconds;
+  const severeTotalBrewTimeMismatch = statedTotalBrewTimeSeconds !== null &&
+    isTotalBrewTimeMismatchSevere(
+      statedTotalBrewTimeSeconds,
+      emittedTotalBrewTimeSeconds,
+    );
+  // verify mode blocks on every timing finding unconditionally, exactly as
+  // before (preserveStepCount, untouched). Extract mode still only WARNS on
+  // an ordinary derived-duration/elapsed-landmark finding, exactly as
+  // before — but a total_brew_time_mismatch finding that is also
+  // proportionally severe (see isTotalBrewTimeMismatchSevere above) now
+  // blocks even in extract mode. This is a per-finding-code gate, not a
+  // change to preserveStepCount itself: flipping preserveStepCount would
+  // block every derived per-step duration too, which is exactly the
+  // "every ordinary transcript unpublishable" outcome the comment above
+  // this block warns against.
+  const isBlockingTimingFinding = (
+    finding: TimingProvenanceFinding,
+  ): boolean => {
+    if (preserveStepCount) {
+      return true;
+    }
+    return finding.code === "total_brew_time_mismatch" &&
+      severeTotalBrewTimeMismatch;
+  };
+  const timingValidationIssues: ValidationIssue[] = timingResult.findings
+    .filter(isBlockingTimingFinding)
+    .map((finding: TimingProvenanceFinding) => ({
       code: finding.code,
       field: finding.step_index >= 0
         ? `steps[${finding.step_index}].duration_seconds`
         : "extraction.total_brew_time_seconds",
       message: finding.message,
-    }))
-    : [];
-  const timingWarnings = preserveStepCount
-    ? []
-    : timingResult.findings.map((finding) => finding.message);
+    }));
+  const timingWarnings = timingResult.findings
+    .filter((finding) => !isBlockingTimingFinding(finding))
+    .map((finding) => finding.message);
 
   const response: ParseUserRecipeDraftResponse = {
     detected_input_language:
@@ -5823,10 +6253,12 @@ function finalizeDraftResponse(input: {
     validation: {
       is_publishable: validation.issues.length === 0 &&
         provenanceIssues.length === 0 &&
+        rangeEndpointIssues.length === 0 &&
         timingValidationIssues.length === 0,
       issues: [
         ...validation.issues,
         ...provenanceIssues,
+        ...rangeEndpointIssues,
         ...timingValidationIssues,
       ],
     },
@@ -5854,6 +6286,7 @@ function finalizeDraftResponse(input: {
   if (
     validation.issues.length === 0 &&
     provenanceIssues.length === 0 &&
+    rangeEndpointIssues.length === 0 &&
     timingValidationIssues.length === 0 &&
     brewTimeSeconds !== null
   ) {
@@ -6289,6 +6722,7 @@ export function createRecipeDraftParser(
         steps: normalized.steps,
         coffeeAmount: normalized.recipe.coffee_amount,
         waterAmount: normalized.recipe.water_amount,
+        mode: input.mode ?? "extract",
       });
       const detectedInputLanguage = getPrimaryLanguageSignal([
         input.sourceLanguageHint,

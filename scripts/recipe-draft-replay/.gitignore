@@ -1,0 +1,5 @@
+# Locally-fetched production capture rows. Regenerate with fetch.ts (needs
+# SUPABASE_SERVICE_ROLE_KEY) or via the Supabase MCP, per README/plan 016.
+# Not checked in: this repo is public, the file is ~500KB of derived
+# production data, and it is reproducible on demand.
+cache/

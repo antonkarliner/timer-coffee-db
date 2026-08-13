@@ -51,6 +51,26 @@ export type AmountProvenance = {
   rule_source_quote: string | null;
   /** Operands the rule was applied to, e.g. { multiplier: 3, coffee_amount: 25 }. */
   rule_inputs: Record<string, number> | null;
+  /**
+   * Plan 016 §4 Phase 1b: the extraction stage's own semantic judgement of
+   * what KIND of unit `unit` names. This is the durable mechanism per
+   * CLAUDE.md's "don't put semantic judgements in regexes" rule — the model
+   * is multilingual and has already read the source text, so a conclusive
+   * `unit_kind` is preferred outright over the unit-string lexicon in
+   * `normalizeUnitForComparison`.
+   *
+   * `mass` and `volume` are mutually compatible (the existing density~1
+   * precedent this file already applies). `time` and `percent` are
+   * compatible with neither, nor with each other.
+   *
+   * Optional and nullable for backward compatibility: every existing
+   * capture, every fixture, and any provider that ignores the field has no
+   * `unit_kind` at all. Absent (`undefined`) or explicitly `null` must fall
+   * back to the lexicon exactly as before this field existed — see
+   * `classifyRecordUnit`. A missing `unit_kind` must never itself change a
+   * previously-passing draft's outcome.
+   */
+  unit_kind?: "mass" | "volume" | "time" | "percent" | null;
 };
 
 /** One emitted amount, as it appears in the FINAL draft after every pass. */
@@ -106,30 +126,104 @@ function normalizeForQuoteSearch(value: string): string {
   return value.replace(/\s+/g, " ").trim();
 }
 
+// Defect 1 (plan 016 §3 D1, Aug 2026 live pass): this lexicon is an
+// English/Russian/Arabic/Persian-only FALLBACK — it is a unit vocabulary
+// (like the existing g/ml folding below), not a semantic judgement of
+// meaning, so it is not the English-only-regex antipattern CLAUDE.md warns
+// against. It cannot recognize a mass/volume word in any language it
+// doesn't explicitly list. `unit_kind` (see `classifyRecordUnit` below) is
+// the durable mechanism and is always preferred when present; this lexicon
+// is only reached when `unit_kind` is absent or null. Widen it only as a
+// labelled, best-effort supplement — never as the primary disambiguation
+// mechanism.
+//
+// Arabic and Persian forms added per plan 016 Phase 0's evidence: blocked
+// Arabic captures recorded `"unit": "جرام"` (source_quote "40 جرام") and
+// `"unit": "مل"`/`"مليلتر"`; blocked Persian captures recorded `"گرم"` and
+// `"میلی‌لیتر"` — while the RENDERED side is always plain ASCII "g"/"ml",
+// because the model writes the scalable-unit token in Latin script even
+// inside an otherwise-Arabic/Persian sentence. An unmatched native-script
+// unit normalized to itself and never equalled the rendered "g"/"ml", so
+// every amount in those captures flagged untraceable.
+const MASS_UNIT_WORDS = [
+  // English
+  "g",
+  "gr",
+  "gram",
+  "grams",
+  "gramme",
+  "grammes",
+  // Russian
+  "г",
+  "гр",
+  // Arabic — both "جرام" and "غرام" are in live use for "gram"; "جم" is a
+  // common abbreviated form (parallel to "g"/"gr" in English).
+  "جرام",
+  "جرامات",
+  "غرام",
+  "غرامات",
+  "جم",
+  // Persian
+  "گرم",
+  "گرمها",
+];
+
+const VOLUME_UNIT_WORDS = [
+  // English
+  "ml",
+  "mls",
+  "milliliter",
+  "milliliters",
+  "millilitre",
+  "millilitres",
+  // Russian
+  "мл",
+  // Arabic
+  "مل",
+  "مليلتر",
+  "ملليلتر",
+  "مليلترات",
+  // Persian. Only one spelling of "millilitre" is listed here — the ZWNJ-
+  // joined form "میلی‌لیتر", the plain-space form "میلی لیتر", and the
+  // unjoined form "میلیلیتر" all collapse to this same string once
+  // normalizeUnitForComparison strips whitespace and zero-width joiners
+  // below, so listing more than one would be redundant, not more thorough.
+  "میلیلیتر",
+];
+
+// Arabic combining diacritics (tashkeel) and the tatweel elongation
+// character. A model that emits fully-vocalized Arabic (e.g. "جَرَام"
+// instead of "جرام") is still naming the same unit — these marks change how
+// a word is rendered, never what it means.
+const ARABIC_DIACRITICS_AND_TATWEEL =
+  /[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06ED\u0640]/g;
+
 /**
  * Units are compared loosely on purpose. `g` and `ml` are treated as
  * equivalent because coffee recipes use them interchangeably for water
  * (density ~1), and flagging "300 g water" against "300 ml water" would be a
  * false positive. What this DOES catch is a mass/volume figure being matched
  * against a percentage or a time.
+ *
+ * This is the FALLBACK layer only — see `classifyRecordUnit`, which prefers
+ * the extraction stage's own `unit_kind` field when it is present and
+ * conclusive, and reaches this lexicon only when that field is absent, null,
+ * or (for the rendered side, which never carries `unit_kind` at all) always.
  */
 function normalizeUnitForComparison(unit: string): string {
-  const normalized = unit.trim().toLowerCase().replace(/[.\s]/g, "");
+  const normalized = unit
+    .trim()
+    .toLowerCase()
+    // Zero-width non-joiner/joiner: orthographically required in some
+    // Persian compound words (e.g. "میلی‌لیتر") but not meaningful for unit
+    // identity — see the VOLUME_UNIT_WORDS comment above.
+    .replace(/[\u200B\u200C]/g, "")
+    .replace(ARABIC_DIACRITICS_AND_TATWEEL, "")
+    .replace(/[.\s]/g, "");
 
   if (
-    ["g", "gr", "gram", "grams", "gramme", "grammes", "г", "гр"].includes(
-      normalized,
-    ) ||
-    [
-      "ml",
-      "mls",
-      "milliliter",
-      "milliliters",
-      "millilitre",
-      "millilitres",
-      "мл",
-    ]
-      .includes(normalized)
+    MASS_UNIT_WORDS.includes(normalized) ||
+    VOLUME_UNIT_WORDS.includes(normalized)
   ) {
     return "mass_or_volume";
   }
@@ -137,8 +231,71 @@ function normalizeUnitForComparison(unit: string): string {
   return normalized;
 }
 
-function unitsAreCompatible(left: string, right: string): boolean {
-  return normalizeUnitForComparison(left) === normalizeUnitForComparison(right);
+/**
+ * Classifies a provenance RECORD's unit into a comparison bucket. Prefers
+ * `unit_kind` (plan 016 Phase 1b) outright when present and conclusive;
+ * falls back to the unit-string lexicon exactly as before that field
+ * existed when it is absent or explicitly null. See `AmountProvenance.
+ * unit_kind`'s own doc comment for the backward-compatibility contract.
+ *
+ * There is no equivalent classifier for the RENDERED side: a rendered
+ * amount is text extracted from the assembled final draft, not a structured
+ * extraction-stage judgement, so it only ever has the lexicon to go on (see
+ * `unitsAreCompatible`).
+ */
+function classifyRecordUnit(record: AmountProvenance): string {
+  if (record.unit_kind === "mass" || record.unit_kind === "volume") {
+    return "mass_or_volume";
+  }
+  if (record.unit_kind === "time") {
+    return "time";
+  }
+  if (record.unit_kind === "percent") {
+    return "percent";
+  }
+  // unit_kind is undefined or null: fall back to the lexicon.
+  return normalizeUnitForComparison(record.unit);
+}
+
+/**
+ * Defect 2 (plan 016 §3 D1-German): a range's first expression is rendered
+ * WITHOUT a trailing unit by design — see EXPRESSION_REGEX's own comment in
+ * parser.ts ("a range's first expression ... legitimately has no unit of
+ * its own immediately after it"), which exists to keep that unit group
+ * anchored to an allowlist rather than reintroducing the denylist that
+ * corrupted Japanese output (Fix E). A source range like "50-70g" renders
+ * as one unit written once, after the SECOND half, so the first rendered
+ * expression's `unit` is legitimately `""`. Treating that as merely
+ * "incompatible with everything" is what produced the German false block:
+ * `Step 3 states 50, which does not trace to any amount recorded from the
+ * source.`
+ *
+ * The empty-unit policy: an empty rendered unit is compatible ONLY with a
+ * record that classifies as `mass_or_volume`. This is a deliberate,
+ * narrower rule than "match on value alone" — this module's own docstring
+ * above says what the loose g/ml folding DOES catch is "a mass/volume
+ * figure being matched against a percentage or a time," and a wildcard
+ * empty-unit match would silently defeat exactly that: a stray "50" that
+ * actually belongs to a time or percent record would pass against ANY
+ * mass/volume value in this recipe. Requiring the RECORD side to resolve to
+ * mass_or_volume (via `unit_kind` or the lexicon) before an empty rendered
+ * unit is accepted preserves the original guarantee while fixing the false
+ * block: a mass record with a unit-less rendering still passes, but a time
+ * or percent record with a unit-less rendering still fails, which is
+ * exactly this check's whole purpose.
+ */
+function unitsAreCompatible(
+  record: AmountProvenance,
+  rendered: RenderedAmount,
+): boolean {
+  const recordClass = classifyRecordUnit(record);
+  const renderedUnit = rendered.unit.trim();
+
+  if (renderedUnit === "") {
+    return recordClass === "mass_or_volume";
+  }
+
+  return recordClass === normalizeUnitForComparison(renderedUnit);
 }
 
 function quoteAppearsInSource(quote: string, requestText: string): boolean {
@@ -256,7 +413,7 @@ export function verifyAmountProvenance(
     const candidate = unconsumed.find((entry) =>
       !entry.consumed &&
       Math.abs(entry.record.value - rendered.value) <= RENDERED_TOLERANCE &&
-      unitsAreCompatible(entry.record.unit, rendered.unit)
+      unitsAreCompatible(entry.record, rendered)
     );
 
     if (!candidate) {

@@ -3804,6 +3804,170 @@ Deno.test("folds pre-timer actions into preparation for a Hario-Switch-shaped re
   );
 });
 
+// Plan 016 §4 Phase 4 (D2): the Hario-Switch-shaped fold above collapses
+// pre-timer steps 1..3 into step 0 and renumbers the rest. extracted_amounts
+// records still carry the PRE-fold step_index the LLM stages assigned
+// (before this deterministic pass ever ran), so an amount recorded on
+// pre-fold step 2 ("Add coffee...") lands, unremapped, 2 steps away from
+// where it is actually rendered (post-fold step 0) — tripping
+// provenance.ts's >1-step block even though the draft is correct. Three
+// real Hario full-transcript captures were blocked by exactly this shape.
+// This fixture reuses createHarioSwitchPreTimerExtraction/Normalized (same
+// fold: startsTimerIndex 4, steps 1-3 fold into 0, steps 4-5 shift to 1-2)
+// with extracted_amounts added for every amount the fold test above already
+// proved gets rendered: 200g (pre-fold step 1, folds to 0), 18g (pre-fold
+// step 2, folds to 0 — the 2-step-drift case), and 250g (pre-fold step 5,
+// shifts to 2).
+Deno.test("D2 (plan 016 §4 Phase 4): a pre-timer amount record folded 2 steps away from its extraction-time index is remapped, not falsely blocked (Hario Switch shape)", async () => {
+  const extractedAmounts = [
+    {
+      value: 200,
+      unit: "g",
+      step_index: 1,
+      provenance: "literal" as const,
+      source_quote: "200 grams of water",
+      rule: null,
+      rule_source_quote: null,
+      rule_inputs: null,
+    },
+    {
+      value: 18,
+      unit: "g",
+      step_index: 2,
+      provenance: "literal" as const,
+      source_quote: "18 grams of coffee",
+      rule: null,
+      rule_source_quote: null,
+      rule_inputs: null,
+    },
+    {
+      value: 250,
+      unit: "g",
+      step_index: 5,
+      provenance: "literal" as const,
+      source_quote: "250 grams total",
+      rule: null,
+      rule_source_quote: null,
+      rule_inputs: null,
+    },
+  ];
+
+  const extraction = {
+    ...createHarioSwitchPreTimerExtraction(),
+    extracted_amounts: extractedAmounts,
+  };
+  const normalized = {
+    ...createHarioSwitchPreTimerNormalized(),
+    extracted_amounts: extractedAmounts,
+  };
+
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction,
+        normalized,
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text:
+      "Fill the dripper with 200 grams of water. Add 18 grams of coffee. " +
+      "Pour up to 250 grams total water.",
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Hario V60" },
+      { brewing_method_id: "switch", brewing_method: "Hario Switch" },
+    ],
+    requestId: "req-fold-remap",
+  });
+
+  assert(
+    !result.validation.issues.some((issue) =>
+      issue.code === "amount_step_binding_mismatch"
+    ),
+    `Expected the fold remap to close the step-index drift; got issues: ${
+      JSON.stringify(result.validation.issues)
+    }`,
+  );
+  assertEquals(
+    result.validation.is_publishable,
+    true,
+    "Expected the Hario-Switch-shaped draft to be publishable once the fold remap closes the false step-drift block.",
+  );
+});
+
+// Mirror of the test above: verify mode skips the fold entirely
+// (preserveStepCount), so the remap must be an identity there too — a
+// record's pre-fold step_index is also its post-fold step_index, and this
+// must stay unblocked for the same reason (drift 0, not drift 2).
+Deno.test("D2 (plan 016 §4 Phase 4): the fold remap is inert in verify mode, where no fold ever runs", async () => {
+  const extractedAmounts = [
+    {
+      value: 18,
+      unit: "g",
+      step_index: 2,
+      provenance: "literal" as const,
+      source_quote: "18 grams of coffee",
+      rule: null,
+      rule_source_quote: null,
+      rule_inputs: null,
+    },
+  ];
+
+  const extraction = {
+    ...createHarioSwitchPreTimerExtraction(),
+    extracted_amounts: extractedAmounts,
+  };
+  const normalized = {
+    ...createHarioSwitchPreTimerNormalized(),
+    extracted_amounts: extractedAmounts,
+    // Verify mode's normalization stage receives (and must echo back) the
+    // submitted step descriptions verbatim; reuse the same six-step shape
+    // the extraction fixture already declares so preserveStepCount has
+    // nothing to reject.
+  };
+
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction,
+        normalized,
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: "Add 18 grams of coffee.",
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Hario V60" },
+    ],
+    requestId: "req-fold-remap-verify",
+    mode: "verify",
+  });
+
+  assertEquals(
+    result.draft.steps.length,
+    normalized.steps.length,
+    "Expected verify mode to preserve the submitted step count instead of folding.",
+  );
+  assert(
+    !result.validation.issues.some((issue) =>
+      issue.code === "amount_step_binding_mismatch"
+    ),
+    `Expected no step-drift finding in verify mode, where the record's step_index already equals its rendered step_index (no fold ran); got: ${
+      JSON.stringify(result.validation.issues)
+    }`,
+  );
+});
+
 Deno.test("filters generic extraction notes out of response warnings", async () => {
   const parser = createRecipeDraftParser({
     providers: [
@@ -12151,5 +12315,794 @@ Deno.test("defect-2: does not warn for an inferred (not stated) grind_size on a 
     `Expected no grind_size warning for a non-English inferred value. Got: ${
       JSON.stringify(result.warnings)
     }`,
+  );
+});
+
+// ---------------------------------------------------------------------
+// D4 (plan 016 Phase 3a): a range_endpoint record collapsed to a single
+// rendered endpoint, with the other endpoint absent from the entire draft,
+// must block publication (Chemex 2/4, Spanish 4/4 from plans/015). A range
+// whose both endpoints survive somewhere in the draft (German V60 4/4)
+// must NOT be treated as a collapse.
+// ---------------------------------------------------------------------
+
+Deno.test("D4: a coffee/water range collapsed to its low endpoint blocks publication when the high endpoint appears nowhere in the draft (Chemex/Spanish shape)", async () => {
+  const requestText =
+    "Rinse the filter and add 15g of coffee. Pour 60-90g of water and bloom for 30 seconds. Pour to 250g total and wait 90 seconds.";
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction: {
+          ...createExtraction(),
+          extracted_amounts: [
+            ...G22_BASE_AMOUNTS,
+            {
+              value: 60,
+              unit: "g",
+              step_index: 1,
+              provenance: "derived",
+              source_quote: null,
+              rule: "range_endpoint",
+              rule_source_quote: "60-90g",
+              rule_inputs: { low: 60, high: 90, endpoint: 0 },
+            },
+          ],
+        },
+        normalized: {
+          ...createNormalized(),
+          steps: [
+            createNormalized().steps[0],
+            {
+              ...createNormalized().steps[1],
+              // Bug under test: the source stated a 60-90g range but the
+              // final draft only shows the low endpoint (60g) — the high
+              // endpoint (90) never appears anywhere else in the draft.
+              description_template: "Pour 60g of water and bloom.",
+            },
+            createNormalized().steps[2],
+          ],
+        },
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: requestText,
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Hario V60" },
+    ],
+    requestId: "req-d4-collapse",
+  });
+
+  assert(
+    result.validation.issues.some((issue) =>
+      issue.code === "range_endpoint_collapsed"
+    ),
+    `Expected a range_endpoint_collapsed validation issue when the high endpoint of a stated 60-90g range never appears in the draft. Got issues: ${
+      JSON.stringify(result.validation.issues)
+    }`,
+  );
+  assertEquals(
+    result.validation.is_publishable,
+    false,
+    "Expected a silently collapsed range (60-90g rendered as only 60g) to block publication.",
+  );
+  assert(
+    result.publish_projection === undefined,
+    "Expected no publish_projection while the range-collapse issue blocks the draft.",
+  );
+});
+
+Deno.test("D4: a coffee/water range that preserves both endpoints in the draft is NOT treated as a collapse (German V60 non-regression)", async () => {
+  const requestText =
+    "Rinse the filter and add 15g of coffee. Pour 60-90g of water and bloom for 30 seconds. Pour to 250g total and wait 90 seconds.";
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction: {
+          ...createExtraction(),
+          extracted_amounts: [
+            ...G22_BASE_AMOUNTS,
+            {
+              value: 60,
+              unit: "g",
+              step_index: 1,
+              provenance: "derived",
+              source_quote: null,
+              rule: "range_endpoint",
+              rule_source_quote: "60-90g",
+              rule_inputs: { low: 60, high: 90, endpoint: 0 },
+            },
+            {
+              value: 90,
+              unit: "g",
+              step_index: 1,
+              provenance: "derived",
+              source_quote: null,
+              rule: "range_endpoint",
+              rule_source_quote: "60-90g",
+              rule_inputs: { low: 60, high: 90, endpoint: 1 },
+            },
+          ],
+        },
+        normalized: {
+          ...createNormalized(),
+          steps: [
+            createNormalized().steps[0],
+            {
+              ...createNormalized().steps[1],
+              // Both endpoints of the stated range survive into the
+              // rendered draft (unlike the collapse case above) — this
+              // must NOT trip the range-collapse check. Written as two
+              // separately-unitted amounts ("60g to 90g"), not a bare
+              // hyphen range ("60-90g"): the deterministic range-to-
+              // expression conversion attaches the shared unit suffix only
+              // to the SECOND expression in a hyphen chain, which is a
+              // pre-existing empty-rendered-unit gap (diagnosis D1, owned
+              // by provenance.ts's Phase 1a, not this check) — orthogonal
+              // to what this test is verifying.
+              description_template: "Pour 60g to 90g of water and bloom.",
+            },
+            createNormalized().steps[2],
+          ],
+        },
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: requestText,
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Hario V60" },
+    ],
+    requestId: "req-d4-preserved",
+  });
+
+  assert(
+    !result.validation.issues.some((issue) =>
+      issue.code === "range_endpoint_collapsed"
+    ),
+    `Expected no range_endpoint_collapsed issue when both endpoints of the range survive into the draft. Got issues: ${
+      JSON.stringify(result.validation.issues)
+    }`,
+  );
+  assertEquals(
+    result.validation.is_publishable,
+    true,
+    "Expected a range whose both endpoints are preserved in the draft to stay publishable.",
+  );
+  assert(
+    result.publish_projection !== undefined,
+    "Expected a publish_projection since nothing blocks this draft.",
+  );
+});
+
+// ---------------------------------------------------------------------
+// D5 (plan 016 Phase 3b): a stated total brew time contradicted by the
+// final emitted total must block in EXTRACT mode when the divergence is
+// proportionally severe (Russian 3/4 from plans/015: stated 180s, emitted
+// 40s, a 4.5x contraction), while an ordinary rounding-scale divergence
+// (the cold_brew fixture control: stated 64800s, emitted 64830s, ~0.05%)
+// must keep only warning. See isTotalBrewTimeMismatchSevere in parser.ts.
+// ---------------------------------------------------------------------
+
+Deno.test("D5: a stated total brew time contradicted by a 4.5x divergence in the emitted total blocks publication in extract mode (Russian shape)", async () => {
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction: {
+          ...createExtraction(),
+          total_brew_time_seconds: 180,
+        },
+        normalized: {
+          ...createNormalized(),
+          steps: [
+            createNormalized().steps[0],
+            {
+              ...createNormalized().steps[1],
+              duration_seconds: 20,
+              duration_is_stated: true,
+            },
+            {
+              ...createNormalized().steps[2],
+              duration_seconds: 20,
+              duration_is_stated: true,
+            },
+          ],
+        },
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: "Mock recipe with a source-stated 180s total brew time.",
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Hario V60" },
+    ],
+    requestId: "req-d5-severe",
+  });
+
+  assert(
+    result.validation.issues.some((issue) =>
+      issue.code === "total_brew_time_mismatch"
+    ),
+    `Expected a blocking total_brew_time_mismatch issue for a stated 180s total emitted as 40s (4.5x off). Got issues: ${
+      JSON.stringify(result.validation.issues)
+    }`,
+  );
+  assertEquals(
+    result.validation.is_publishable,
+    false,
+    "Expected a 4.5x stated-vs-emitted total brew time divergence to block publication in extract mode.",
+  );
+  assert(
+    result.publish_projection === undefined,
+    "Expected no publish_projection while the severe total-brew-time mismatch blocks the draft.",
+  );
+  assert(
+    !result.warnings.some((warning) => warning.includes("total brew time")),
+    `Expected the blocking finding to appear only in issues, not duplicated as a warning. Got warnings: ${
+      JSON.stringify(result.warnings)
+    }`,
+  );
+});
+
+Deno.test("D5: a 0.05% stated-vs-emitted total brew time divergence stays a warning and does not block (cold-brew control)", async () => {
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction: {
+          ...createExtraction(),
+          total_brew_time_seconds: 64800,
+        },
+        normalized: {
+          ...createNormalized(),
+          steps: [
+            createNormalized().steps[0],
+            {
+              ...createNormalized().steps[1],
+              duration_seconds: 64800,
+              duration_is_stated: true,
+            },
+            {
+              ...createNormalized().steps[2],
+              duration_seconds: 30,
+              duration_is_stated: true,
+            },
+          ],
+        },
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: "Mock recipe with an 18-hour cold brew steep, stated total 64800s.",
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Hario V60" },
+    ],
+    requestId: "req-d5-control",
+  });
+
+  assert(
+    !result.validation.issues.some((issue) =>
+      issue.code === "total_brew_time_mismatch"
+    ),
+    `Expected no blocking total_brew_time_mismatch issue for a 0.05% stated-vs-emitted divergence. Got issues: ${
+      JSON.stringify(result.validation.issues)
+    }`,
+  );
+  assertEquals(
+    result.validation.is_publishable,
+    true,
+    "Expected a 0.05% stated-vs-emitted total brew time divergence to stay publishable.",
+  );
+  assert(
+    result.publish_projection !== undefined,
+    "Expected a publish_projection since nothing blocks this draft.",
+  );
+  assert(
+    result.warnings.some((warning) =>
+      warning.includes("64800s") && warning.includes("64830s")
+    ),
+    `Expected the non-severe mismatch to still surface as a warning. Got warnings: ${
+      JSON.stringify(result.warnings)
+    }`,
+  );
+});
+
+// ---------------------------------------------------------------------
+// D3'/Phase 2 (plan 016 §3 D3', §4 Phase 2): verify mode's whole contract
+// is that a submitted, already-well-formed recipe's wording is never
+// silently rewritten. Phase 0 found the actual (undocumented) source of
+// the "0:00 pour 50g" -> "Pour 50g" and "pour to" -> "Pour up to"
+// regressions was NOT the LLM stages (their stage_outputs were empty
+// arrays, never invoked) but normalizeStepDescriptionTemplate's own
+// unconditional leading-timestamp-strip+capitalize and cumulative-water-
+// wording passes, which ran regardless of mode. These amounts are chosen
+// so neither step's text matches NUMERIC_SCALABLE_AMOUNT_REGEX (no bare
+// numeric coffee/water figure), isolating this test from the separate,
+// mode-independent numeric-to-expression conversion pass so the assertion
+// can be true byte-for-byte equality against description_source.
+// ---------------------------------------------------------------------
+
+Deno.test("Phase 2: verify mode preserves a leading-timestamp step and a 'pour to' step byte-identical to description_source", async () => {
+  const normalized: NormalizedDraft = {
+    ...createNormalized(),
+    steps: [
+      createNormalized().steps[0],
+      {
+        ...createNormalized().steps[1],
+        // Verify mode's own normalization prompt already instructs
+        // description_template === description_source verbatim — mocked
+        // here exactly as a compliant model would return it, so this test
+        // isolates the deterministic buildDraftSteps pass, not the prompt.
+        description_source: "0:00 pour water for the bloom.",
+        description_template: "0:00 pour water for the bloom.",
+      },
+      {
+        ...createNormalized().steps[2],
+        description_source: "Pour to the fill line and wait.",
+        description_template: "Pour to the fill line and wait.",
+      },
+    ],
+  };
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction: createExtraction(),
+        normalized,
+        cumulativeRewrite: { warnings: [], steps: normalized.steps },
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: "Mock recipe",
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Hario V60" },
+    ],
+    requestId: "req-phase2-verify-preserve",
+    mode: "verify",
+  });
+
+  assertEquals(
+    result.draft.steps[1].description_template,
+    "0:00 pour water for the bloom.",
+    "Expected verify mode to keep a leading timestamp and lowercase wording byte-identical to description_source instead of stripping the timestamp and capitalizing.",
+  );
+  assertEquals(
+    result.draft.steps[2].description_template,
+    "Pour to the fill line and wait.",
+    "Expected verify mode to keep 'pour to' wording byte-identical to description_source instead of rewriting it to 'pour up to'.",
+  );
+});
+
+// Mirror image of the guard test above (same pattern as the existing
+// pre-timer fold guard/mirror pair in this file): the SAME normalized
+// fixture, with no `mode` (defaulting to "extract"), must still apply
+// both deterministic rewrites — this proves the verify-mode preservation
+// above is scoped to verify mode, not an accidental behavior change for
+// extract mode. Extract-mode output must stay byte-identical to before
+// Phase 2's change; the six golden fixtures are the broader proof of
+// that, and this test additionally exercises the exact two rewrite
+// functions D3' identified.
+Deno.test("Phase 2 mirror: extract mode still strips a leading timestamp/capitalizes and still rewrites 'pour to' to 'pour up to'", async () => {
+  const normalized: NormalizedDraft = {
+    ...createNormalized(),
+    steps: [
+      createNormalized().steps[0],
+      {
+        ...createNormalized().steps[1],
+        description_source: "0:00 pour water for the bloom.",
+        description_template: "0:00 pour water for the bloom.",
+      },
+      {
+        ...createNormalized().steps[2],
+        description_source: "Pour to the fill line and wait.",
+        description_template: "Pour to the fill line and wait.",
+      },
+    ],
+  };
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction: createExtraction(),
+        normalized,
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: "Mock recipe",
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Hario V60" },
+    ],
+    requestId: "req-phase2-extract-mirror",
+  });
+
+  assertEquals(
+    result.draft.steps[1].description_template,
+    "Pour water for the bloom.",
+    "Expected extract mode to keep stripping a leading timestamp and capitalizing, unchanged from before Phase 2.",
+  );
+  assertEquals(
+    result.draft.steps[2].description_template,
+    "Pour up to the fill line and wait.",
+    "Expected extract mode to keep rewriting 'pour to' to 'pour up to', unchanged from before Phase 2.",
+  );
+});
+
+// ---------------------------------------------------------------------
+// B1 (plan 016 §3 D4′, §4 Task B): findRangeEndpointCollapseIssues must
+// skip step_index -1 (recipe-level) records entirely — collapsing a
+// recipe-level range like coffee_amount's "20-24g" is CORRECT (a single
+// number by schema), not a defect, and must not false-block a German
+// capture whose draft is otherwise correct.
+// ---------------------------------------------------------------------
+
+// Shared base for the B1 pair: G22_BASE_AMOUNTS only covers the 15g dose
+// (step 0) and the 250g final total (step 2) — createNormalized()'s
+// default step 1 also renders a literal 50g bloom that G22_BASE_AMOUNTS
+// does not cover, so every test below adds a matching literal record for
+// it. Without this, the unmatched 50g would itself produce an
+// unverifiable_amount finding and mask what each test is actually
+// checking.
+const B1_BLOOM_LITERAL_AMOUNT = {
+  value: 50,
+  unit: "g",
+  step_index: 1,
+  provenance: "literal" as const,
+  source_quote: "50g",
+  rule: null,
+  rule_source_quote: null,
+  rule_inputs: null,
+};
+const B1_REQUEST_TEXT =
+  "Rinse the filter and add 15g of coffee (a dose stated as 20-24g). Pour 50g of water and bloom for 30 seconds. Pour to 250g total and wait 90 seconds.";
+
+Deno.test("B1: a step_index -1 (recipe-level) range_endpoint record does not trip range_endpoint_collapsed, even though its other endpoint appears nowhere in the draft (German dose shape)", async () => {
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction: {
+          ...createExtraction(),
+          extracted_amounts: [
+            ...G22_BASE_AMOUNTS,
+            B1_BLOOM_LITERAL_AMOUNT,
+            {
+              // The German capture's coffee dose, stated as "20-24g",
+              // recorded at the recipe level (step_index: -1) with only
+              // the low endpoint (20) selected. 24 appears nowhere in the
+              // rendered draft — before B1's fix this false-blocked the
+              // exact draft this plan exists to unblock.
+              value: 20,
+              unit: "g",
+              step_index: -1,
+              provenance: "derived",
+              source_quote: null,
+              rule: "range_endpoint",
+              rule_source_quote: "20-24g",
+              rule_inputs: { low: 20, high: 24, endpoint: 0 },
+            },
+          ],
+        },
+        normalized: createNormalized(),
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: B1_REQUEST_TEXT,
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Hario V60" },
+    ],
+    requestId: "req-b1-recipe-level",
+  });
+
+  assert(
+    !result.validation.issues.some((issue) =>
+      issue.code === "range_endpoint_collapsed"
+    ),
+    `Expected no range_endpoint_collapsed issue for a step_index -1 (recipe-level) range record. Got issues: ${
+      JSON.stringify(result.validation.issues)
+    }`,
+  );
+  assertEquals(
+    result.validation.is_publishable,
+    true,
+    "Expected a recipe-level range collapse (coffee_amount is a single number by schema) to stay publishable.",
+  );
+});
+
+Deno.test("B1 contrast: a step_index >= 0 range_endpoint record with the same shape still blocks (Spanish shape, non-regression)", async () => {
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction: {
+          ...createExtraction(),
+          extracted_amounts: [
+            ...G22_BASE_AMOUNTS,
+            B1_BLOOM_LITERAL_AMOUNT,
+            {
+              // Endpoints (42/48) deliberately avoid colliding with any
+              // value already present in the default rendered draft
+              // (15, 50, 250) — a collision would make the "other"
+              // endpoint look coincidentally preserved and defeat the
+              // point of this contrast test.
+              value: 42,
+              unit: "ml",
+              step_index: 1,
+              provenance: "derived",
+              source_quote: null,
+              rule: "range_endpoint",
+              rule_source_quote: "42-48ml",
+              rule_inputs: { low: 42, high: 48, endpoint: 0 },
+            },
+          ],
+        },
+        normalized: createNormalized(),
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: `${B1_REQUEST_TEXT} (elsewhere stated as 42-48ml)`,
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Hario V60" },
+    ],
+    requestId: "req-b1-step-level",
+  });
+
+  assert(
+    result.validation.issues.some((issue) =>
+      issue.code === "range_endpoint_collapsed"
+    ),
+    `Expected a range_endpoint_collapsed issue for a step_index >= 0 range record whose other endpoint is missing from the draft. Got issues: ${
+      JSON.stringify(result.validation.issues)
+    }`,
+  );
+  assertEquals(
+    result.validation.is_publishable,
+    false,
+    "Expected a step-level range collapse to still block publication (B1 must not weaken this).",
+  );
+});
+
+// ---------------------------------------------------------------------
+// B2 (plan 016 §3 D4′/D1-empty-unit, §4 Task B): a hyphenated range like
+// "60-90g" renders through EXPRESSION_REGEX as two adjacent expressions
+// sharing one trailing unit suffix, so the FIRST rendered expression's
+// unit is legitimately "". This must not cause a false block when the
+// value is genuinely preserved. Replaces the prior agent's worked-around
+// test (which used "60g to 90g" to dodge the gap) with a real hyphen
+// range, per this task's explicit instruction.
+// ---------------------------------------------------------------------
+
+Deno.test("B2: a real hyphenated range ('60-90g') whose first expression renders with an empty unit is still recognized as preserving both endpoints", async () => {
+  const requestText =
+    "Rinse the filter and add 15g of coffee. Pour 60-90g of water and bloom for 30 seconds. Pour to 250g total and wait 90 seconds.";
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction: {
+          ...createExtraction(),
+          extracted_amounts: [
+            ...G22_BASE_AMOUNTS,
+            {
+              value: 60,
+              unit: "g",
+              step_index: 1,
+              provenance: "derived",
+              source_quote: null,
+              rule: "range_endpoint",
+              rule_source_quote: "60-90g",
+              rule_inputs: { low: 60, high: 90, endpoint: 0 },
+            },
+            {
+              value: 90,
+              unit: "g",
+              step_index: 1,
+              provenance: "derived",
+              source_quote: null,
+              rule: "range_endpoint",
+              rule_source_quote: "60-90g",
+              rule_inputs: { low: 60, high: 90, endpoint: 1 },
+            },
+          ],
+        },
+        normalized: {
+          ...createNormalized(),
+          steps: [
+            createNormalized().steps[0],
+            {
+              ...createNormalized().steps[1],
+              // A genuine hyphenated expression range against the default
+              // fixture's water_amount (250): 60/250 = 0.24, 90/250 = 0.36.
+              // EXPRESSION_REGEX renders this as "(0.24 x
+              // <final_water_amount>)-(0.36 x <final_water_amount>)g" — a
+              // shared trailing unit, so the FIRST rendered amount (60)
+              // carries an EMPTY unit. This is the real gap B2 fixes, not a
+              // worked-around substitute.
+              description_template:
+                "Pour (0.24 x <final_water_amount>)-(0.36 x <final_water_amount>)g of water and bloom.",
+            },
+            createNormalized().steps[2],
+          ],
+        },
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: requestText,
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Hario V60" },
+    ],
+    requestId: "req-b2-hyphen-range",
+  });
+
+  assert(
+    !result.validation.issues.some((issue) =>
+      issue.code === "range_endpoint_collapsed"
+    ),
+    `Expected no range_endpoint_collapsed issue when a real hyphenated range's first expression renders with an empty unit but the value is genuinely preserved. Got issues: ${
+      JSON.stringify(result.validation.issues)
+    }`,
+  );
+  assertEquals(
+    result.validation.is_publishable,
+    true,
+    "Expected a preserved hyphenated range with an empty-unit first expression to stay publishable.",
+  );
+});
+
+// ---------------------------------------------------------------------
+// Task C (plan 016 §3 D4′, §4 Task C): stated_range must work as an
+// ADDITIONAL trigger for findRangeEndpointCollapseIssues, independent of
+// rule_inputs/range_endpoint — this is exactly the Chemex shape, where the
+// collapsed high endpoint (90) was never assigned the range_endpoint rule
+// at all (recorded as a plain LITERAL 60, no rule, rule_inputs null), so
+// D4's original rule_inputs-only detection had nothing to find.
+// ---------------------------------------------------------------------
+
+Deno.test("Task C: stated_range on a LITERAL record (no range_endpoint rule at all) still triggers range_endpoint_collapsed when the other endpoint is missing (Chemex shape)", async () => {
+  const requestText =
+    "Rinse the filter and add 15g of coffee. Pour 60-90g of water and bloom for 30 seconds. Pour to 250g total and wait 90 seconds.";
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction: {
+          ...createExtraction(),
+          extracted_amounts: [
+            ...G22_BASE_AMOUNTS,
+            {
+              // The Chemex shape from D4′: extraction recorded only the
+              // literal 60, with NO rule and NO rule_inputs — the 90 would
+              // be entirely invisible to the original D4 check. stated_range
+              // is the new, independent field that keeps it visible.
+              value: 60,
+              unit: "g",
+              step_index: 1,
+              provenance: "literal",
+              source_quote: "60g",
+              rule: null,
+              rule_source_quote: null,
+              rule_inputs: null,
+              stated_range: { low: 60, high: 90 },
+            },
+          ],
+        },
+        normalized: {
+          ...createNormalized(),
+          steps: [
+            createNormalized().steps[0],
+            {
+              ...createNormalized().steps[1],
+              description_template: "Pour 60g of water and bloom.",
+            },
+            createNormalized().steps[2],
+          ],
+        },
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: requestText,
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Hario V60" },
+    ],
+    requestId: "req-taskc-stated-range-literal",
+  });
+
+  assert(
+    result.validation.issues.some((issue) =>
+      issue.code === "range_endpoint_collapsed"
+    ),
+    `Expected a range_endpoint_collapsed issue driven by stated_range alone (no range_endpoint rule present). Got issues: ${
+      JSON.stringify(result.validation.issues)
+    }`,
+  );
+  assertEquals(
+    result.validation.is_publishable,
+    false,
+    "Expected the Chemex-shaped stated_range collapse to block publication.",
+  );
+});
+
+Deno.test("Task C: stated_range is backward compatible — a record with neither unit_kind nor stated_range (old-shape fixture) behaves exactly as before", async () => {
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction: createExtraction(),
+        normalized: createNormalized(),
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: "Mock recipe",
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Hario V60" },
+    ],
+    requestId: "req-taskc-backward-compat",
+  });
+
+  assert(
+    !result.validation.issues.some((issue) =>
+      issue.code === "range_endpoint_collapsed"
+    ),
+    `Expected no range_endpoint_collapsed issue for a draft whose provenance records predate unit_kind/stated_range entirely. Got issues: ${
+      JSON.stringify(result.validation.issues)
+    }`,
+  );
+  assertEquals(
+    result.validation.is_publishable,
+    true,
+    "Expected an old-shape draft (no unit_kind/stated_range fields at all) to publish exactly as before Task C.",
   );
 });

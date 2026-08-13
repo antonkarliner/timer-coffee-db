@@ -1,12 +1,21 @@
 // Tests for provenance.ts (G22). Mirrors parser_test.ts's own style: plain
 // Deno.test blocks with small local assert helpers, no std/assert import.
 //
-// provenance.ts is treated as read-only here: its logic is already reviewed
-// and this file's job is to characterize its ACTUAL behaviour against the
-// eight production incidents it exists to catch, not to bend assertions to
-// whatever the code happens to emit. Where the code's behaviour diverges
+// Historically provenance.ts was treated as read-only here: its logic was
+// already reviewed and this file's job was to characterize its ACTUAL
+// behaviour against the eight production incidents it exists to catch, not
+// to bend assertions to whatever the code happened to emit. That principle
+// still governs every test below — an existing expectation is only ever
+// changed with a physical/semantic justification, never "that is what the
+// code emits now" (see HANDOFF-2026-08-12.md §7) — but it no longer means
+// the file is frozen: plan 016 §4 Phase 1a deliberately extends
+// provenance.ts's unit-comparison logic (Arabic/Persian lexicon coverage,
+// an explicit empty-rendered-unit policy, and consuming the extraction
+// stage's own `unit_kind` field), and the "Plan 016 §4 Phase 1a" section
+// below tests that extension directly. Where the code's behaviour diverges
 // from what its own docstring claims, that is called out explicitly in
-// comments rather than worked around — see the "KNOWN GAP" tests below.
+// comments rather than worked around — see the "KNOWN GAP" tests further
+// down.
 
 import {
   type AmountProvenance,
@@ -742,6 +751,410 @@ Deno.test("empty provenance array with no rendered amounts is not even unverifie
     result.unverified,
     false,
     "nothing was rendered, so there is nothing to warn about either",
+  );
+});
+
+// ---------------------------------------------------------------------
+// Plan 016 §4 Phase 1a — unit comparison.
+//
+// D1 (Arabic/Persian lexicon gap): live captures recorded native-script
+// units ("جرام", "گرم", "میلی‌لیتر") on the extraction record while the
+// RENDERED side stayed plain ASCII "g"/"ml" (the model writes the
+// scalable-unit token in Latin script even inside an otherwise-Arabic/
+// Persian sentence). Every amount in those captures flagged untraceable.
+//
+// D1-German (empty rendered unit): a range's first expression, e.g. the
+// "50" half of "50-70g", renders with NO unit — this is correct output,
+// not a bug (see EXPRESSION_REGEX's comment in parser.ts and Fix E). An
+// empty rendered unit must not become a wildcard, so it is accepted only
+// against a record that resolves to mass_or_volume.
+//
+// unit_kind (Phase 1b contract, parser.ts): a nullable/defaulted field on
+// each extraction record. Present+conclusive is preferred over the
+// lexicon; absent or null falls back to the lexicon unchanged.
+// ---------------------------------------------------------------------
+
+Deno.test("D1: Arabic record unit 'جرام' (gram) vs ASCII rendered 'g' is not a finding", () => {
+  const requestText = "أضف 40 جرام من القهوة إلى الفلتر.";
+  const provenance: AmountProvenance[] = [
+    {
+      value: 40,
+      unit: "جرام",
+      step_index: 1,
+      provenance: "literal",
+      source_quote: "40 جرام",
+      rule: null,
+      rule_source_quote: null,
+      rule_inputs: null,
+    },
+  ];
+  const renderedAmounts: RenderedAmount[] = [
+    { step_index: 1, value: 40, unit: "g", is_cumulative_water: false },
+  ];
+
+  const result = verifyAmountProvenance({ requestText, renderedAmounts, provenance });
+
+  assertEquals(
+    result.findings,
+    [],
+    "جرام (Arabic 'gram') and ASCII 'g' must fold to the same mass_or_volume " +
+      "bucket via the extended lexicon — this is the exact live-capture shape " +
+      "that flagged every Arabic amount as untraceable before the fix",
+  );
+});
+
+Deno.test("D1: reverse direction — ASCII record unit 'g' vs native-script Arabic rendered unit 'جرام' is not a finding", () => {
+  const requestText = "Add 40 g of coffee to the filter.";
+  const provenance: AmountProvenance[] = [
+    {
+      value: 40,
+      unit: "g",
+      step_index: 0,
+      provenance: "literal",
+      source_quote: "40 g",
+      rule: null,
+      rule_source_quote: null,
+      rule_inputs: null,
+    },
+  ];
+  const renderedAmounts: RenderedAmount[] = [
+    // Unusual but the comparison must be symmetric: the lexicon is applied
+    // to whichever side actually needs it, regardless of which side (record
+    // or rendered) carries the native-script word.
+    { step_index: 0, value: 40, unit: "جرام", is_cumulative_water: false },
+  ];
+
+  const result = verifyAmountProvenance({ requestText, renderedAmounts, provenance });
+
+  assertEquals(result.findings, [], "the comparison is symmetric in which side is native-script");
+});
+
+Deno.test("D1: Persian record unit 'گرم' (gram) vs ASCII rendered 'g' is not a finding", () => {
+  const requestText = "25 گرم قهوه اضافه کنید.";
+  const provenance: AmountProvenance[] = [
+    {
+      value: 25,
+      unit: "گرم",
+      step_index: 0,
+      provenance: "literal",
+      source_quote: "25 گرم",
+      rule: null,
+      rule_source_quote: null,
+      rule_inputs: null,
+    },
+  ];
+  const renderedAmounts: RenderedAmount[] = [
+    { step_index: 0, value: 25, unit: "g", is_cumulative_water: false },
+  ];
+
+  const result = verifyAmountProvenance({ requestText, renderedAmounts, provenance });
+
+  assertEquals(result.findings, [], "گرم (Persian 'gram') must fold to mass_or_volume against ASCII 'g'");
+});
+
+Deno.test("D1: reverse direction — ASCII record unit 'g' vs native-script Persian rendered unit 'گرم' is not a finding", () => {
+  const requestText = "Add 25 g of coffee.";
+  const provenance: AmountProvenance[] = [
+    {
+      value: 25,
+      unit: "g",
+      step_index: 0,
+      provenance: "literal",
+      source_quote: "25 g",
+      rule: null,
+      rule_source_quote: null,
+      rule_inputs: null,
+    },
+  ];
+  const renderedAmounts: RenderedAmount[] = [
+    { step_index: 0, value: 25, unit: "گرم", is_cumulative_water: false },
+  ];
+
+  const result = verifyAmountProvenance({ requestText, renderedAmounts, provenance });
+
+  assertEquals(result.findings, [], "the comparison is symmetric in which side is native-script");
+});
+
+Deno.test("D1: Persian record unit 'میلی‌لیتر' (millilitre, with ZWNJ) vs ASCII rendered 'g' is not a finding", () => {
+  // Deliberately compares a Persian VOLUME word against an ASCII MASS unit:
+  // both fold to mass_or_volume by the same density~1 precedent the loose
+  // g/ml folding already applies for English/Russian, and this is also the
+  // exact live-capture shape (Persian blocked captures recorded
+  // "میلی‌لیتر"). The ZWNJ (U+200C) inside the word is the point of this
+  // test — normalizeUnitForComparison must strip it defensively.
+  const requestText = "300 میلی‌لیتر آب اضافه کنید.";
+  const provenance: AmountProvenance[] = [
+    {
+      value: 300,
+      unit: "میلی‌لیتر",
+      step_index: 0,
+      provenance: "literal",
+      source_quote: "300 میلی‌لیتر",
+      rule: null,
+      rule_source_quote: null,
+      rule_inputs: null,
+    },
+  ];
+  const renderedAmounts: RenderedAmount[] = [
+    { step_index: 0, value: 300, unit: "g", is_cumulative_water: false },
+  ];
+
+  const result = verifyAmountProvenance({ requestText, renderedAmounts, provenance });
+
+  assertEquals(
+    result.findings,
+    [],
+    "the ZWNJ-joined Persian word for millilitre must normalize the same as " +
+      "its space-joined or unjoined spellings, and fold to mass_or_volume",
+  );
+});
+
+Deno.test("D1-German: a unit-less rendered amount matches a mass record — 'value alone' policy for empty rendered unit", () => {
+  // Reproduces the German live-capture shape exactly: a stated "50-70g"
+  // range's first expression renders as a bare "50" with no trailing unit
+  // (see EXPRESSION_REGEX's own comment in parser.ts — this is correct
+  // rendering, not a bug), while the extraction record still carries its
+  // real unit "g".
+  const requestText = "Gieße 50-70g Wasser über den Kaffee.";
+  const provenance: AmountProvenance[] = [
+    {
+      value: 50,
+      unit: "g",
+      step_index: 1,
+      provenance: "literal",
+      source_quote: "50",
+      rule: null,
+      rule_source_quote: null,
+      rule_inputs: null,
+    },
+  ];
+  const renderedAmounts: RenderedAmount[] = [
+    { step_index: 1, value: 50, unit: "", is_cumulative_water: false },
+  ];
+
+  const result = verifyAmountProvenance({ requestText, renderedAmounts, provenance });
+
+  assertEquals(
+    result.findings,
+    [],
+    "a legitimately unit-less rendering must not block against a record " +
+      "that resolves to mass_or_volume — this was the German false block " +
+      "('Step 3 states 50, which does not trace to any amount recorded')",
+  );
+});
+
+Deno.test("D1-German: a unit-less rendered amount does NOT match a time record — this is the check's whole purpose", () => {
+  // The empty-unit policy must not become a wildcard: it is only ever
+  // compatible with a record that resolves to mass_or_volume. A record
+  // that is conclusively 'time' (via unit_kind) must still fail against a
+  // unit-less rendering, or the check could no longer catch a mass figure
+  // being silently matched against a time or percent record — exactly what
+  // this module's own docstring says normalizeUnitForComparison exists to
+  // prevent.
+  const requestText = "Let it steep for 50 seconds.";
+  const provenance: AmountProvenance[] = [
+    {
+      value: 50,
+      unit: "s",
+      unit_kind: "time",
+      step_index: 0,
+      provenance: "literal",
+      source_quote: "50 seconds",
+      rule: null,
+      rule_source_quote: null,
+      rule_inputs: null,
+    },
+  ];
+  const renderedAmounts: RenderedAmount[] = [
+    { step_index: 0, value: 50, unit: "", is_cumulative_water: false },
+  ];
+
+  const result = verifyAmountProvenance({ requestText, renderedAmounts, provenance });
+
+  assertEquals(
+    findingCodes(result),
+    ["unverifiable_amount"],
+    "a time record must still fail against a unit-less rendering, even " +
+      "though a mass record with the identical shape passes",
+  );
+});
+
+Deno.test("D1-German: a unit-less rendered amount does NOT match a percent record, without any unit_kind at all", () => {
+  // Same guarantee as above, but exercised via the LEXICON path (no
+  // unit_kind at all) rather than unit_kind: the string '%' never appears
+  // in MASS_UNIT_WORDS/VOLUME_UNIT_WORDS, so normalizeUnitForComparison
+  // leaves it as '%', which is never mass_or_volume — the empty-unit
+  // policy correctly rejects it with no unit_kind involved.
+  const requestText = "Use a ratio of 2% by weight.";
+  const provenance: AmountProvenance[] = [
+    {
+      value: 2,
+      unit: "%",
+      step_index: 0,
+      provenance: "literal",
+      source_quote: "2%",
+      rule: null,
+      rule_source_quote: null,
+      rule_inputs: null,
+    },
+  ];
+  const renderedAmounts: RenderedAmount[] = [
+    { step_index: 0, value: 2, unit: "", is_cumulative_water: false },
+  ];
+
+  const result = verifyAmountProvenance({ requestText, renderedAmounts, provenance });
+
+  assertEquals(
+    findingCodes(result),
+    ["unverifiable_amount"],
+    "'%' never resolves to mass_or_volume through the lexicon, so a " +
+      "unit-less rendering must still fail against it",
+  );
+});
+
+Deno.test("unit_kind: present and conclusive overrides an unrecognized unit string the lexicon cannot classify", () => {
+  // 'oz' is not in MASS_UNIT_WORDS/VOLUME_UNIT_WORDS, so the lexicon alone
+  // would normalize it to the literal string 'oz' and never match ASCII
+  // 'g' — exactly the kind of false block the durable unit_kind mechanism
+  // exists to prevent for any unit the lexicon doesn't happen to list.
+  const requestText = "Add 2 oz of coffee.";
+  const provenance: AmountProvenance[] = [
+    {
+      value: 2,
+      unit: "oz",
+      unit_kind: "mass",
+      step_index: 0,
+      provenance: "literal",
+      source_quote: "2 oz",
+      rule: null,
+      rule_source_quote: null,
+      rule_inputs: null,
+    },
+  ];
+  const renderedAmounts: RenderedAmount[] = [
+    { step_index: 0, value: 2, unit: "g", is_cumulative_water: false },
+  ];
+
+  const result = verifyAmountProvenance({ requestText, renderedAmounts, provenance });
+
+  assertEquals(
+    result.findings,
+    [],
+    "unit_kind: 'mass' must be preferred over the lexicon outright, " +
+      "classifying 'oz' as mass_or_volume even though the lexicon alone " +
+      "would leave it as the unmatched literal string 'oz'",
+  );
+});
+
+Deno.test("unit_kind: absent (field omitted entirely) falls back to the lexicon unchanged", () => {
+  // No unit_kind property at all — every existing capture, fixture, and any
+  // provider that ignores the field looks exactly like this. Must behave
+  // identically to pre-Phase-1b: the lexicon alone resolves 'جرام' to
+  // mass_or_volume.
+  const requestText = "أضف 40 جرام من القهوة.";
+  const provenance: AmountProvenance[] = [
+    {
+      value: 40,
+      unit: "جرام",
+      step_index: 0,
+      provenance: "literal",
+      source_quote: "40 جرام",
+      rule: null,
+      rule_source_quote: null,
+      rule_inputs: null,
+      // unit_kind intentionally omitted.
+    },
+  ];
+  const renderedAmounts: RenderedAmount[] = [
+    { step_index: 0, value: 40, unit: "g", is_cumulative_water: false },
+  ];
+
+  const result = verifyAmountProvenance({ requestText, renderedAmounts, provenance });
+
+  assertEquals(result.findings, [], "an absent unit_kind must fall back to the lexicon, not fail open or closed");
+});
+
+Deno.test("unit_kind: explicitly null falls back to the lexicon exactly like absent", () => {
+  const requestText = "أضف 40 جرام من القهوة.";
+  const provenance: AmountProvenance[] = [
+    {
+      value: 40,
+      unit: "جرام",
+      unit_kind: null,
+      step_index: 0,
+      provenance: "literal",
+      source_quote: "40 جرام",
+      rule: null,
+      rule_source_quote: null,
+      rule_inputs: null,
+    },
+  ];
+  const renderedAmounts: RenderedAmount[] = [
+    { step_index: 0, value: 40, unit: "g", is_cumulative_water: false },
+  ];
+
+  const result = verifyAmountProvenance({ requestText, renderedAmounts, provenance });
+
+  assertEquals(
+    result.findings,
+    [],
+    "unit_kind: null must fall back to the lexicon exactly like an absent field",
+  );
+});
+
+Deno.test("unit_kind: 'volume' is compatible with a mass-classified rendered unit (mass/volume remain mutually compatible)", () => {
+  const requestText = "Pour 500 ml of water.";
+  const provenance: AmountProvenance[] = [
+    {
+      value: 500,
+      unit: "ml",
+      unit_kind: "volume",
+      step_index: 0,
+      provenance: "literal",
+      source_quote: "500 ml",
+      rule: null,
+      rule_source_quote: null,
+      rule_inputs: null,
+    },
+  ];
+  const renderedAmounts: RenderedAmount[] = [
+    { step_index: 0, value: 500, unit: "g", is_cumulative_water: false },
+  ];
+
+  const result = verifyAmountProvenance({ requestText, renderedAmounts, provenance });
+
+  assertEquals(
+    result.findings,
+    [],
+    "unit_kind 'volume' folds to the same mass_or_volume bucket as 'mass', " +
+      "preserving the existing density~1 precedent",
+  );
+});
+
+Deno.test("REGRESSION — existing mass_or_volume behaviour is unchanged: an ASCII 'g' record still folds against an ASCII 'ml' rendered unit with no unit_kind at all", () => {
+  const requestText = "Pour 300 g of water over the grounds.";
+  const provenance: AmountProvenance[] = [
+    {
+      value: 300,
+      unit: "g",
+      step_index: 0,
+      provenance: "literal",
+      source_quote: "300 g",
+      rule: null,
+      rule_source_quote: null,
+      rule_inputs: null,
+    },
+  ];
+  const renderedAmounts: RenderedAmount[] = [
+    { step_index: 0, value: 300, unit: "ml", is_cumulative_water: false },
+  ];
+
+  const result = verifyAmountProvenance({ requestText, renderedAmounts, provenance });
+
+  assertEquals(
+    result.findings,
+    [],
+    "g vs ml folding (density~1 for water) must be unchanged by this fix",
   );
 });
 
