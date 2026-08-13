@@ -6520,6 +6520,240 @@ function quoteAppearsInSourceLocal(
   return normalizeQuoteForSearchLocal(requestText).includes(needle);
 }
 
+// D9 (plan 020 §3, §4b): a rendered scalable expression can legitimately
+// scale off the water (or coffee) amount without itself BEING a coffee or
+// water amount — an ice quantity stated as "(0.5 x <final_water_amount>)g",
+// for instance. Extraction's own instructions scope extracted_amounts to
+// "every numeric COFFEE OR WATER amount" (see the G22 shared prompt block
+// above), so ice, milk, a rinse volume etc. never get a record there by
+// design. G22 (provenance.ts's verifyAmountProvenance) has no notion of "this
+// amount is allowed to be unexplained" — its rule 1 blocks ANY rendered
+// amount with no provenance record — so a correctly-scaled ice rendering was
+// blocked as unverifiable_amount even though the renderer had already done
+// the right thing (investigation: plan 020 §3 D9's capture table).
+//
+// Fix: give it a derived record off the SAME scalar the template already
+// multiplies, reusing the multiplier the renderer already computed — never
+// re-deriving it, and never asking the model for a new extraction field.
+// Plan 020's own D1 is the standing warning against reflexively adding one
+// (CLAUDE.md's "don't put semantic judgements in regexes" extends to "don't
+// put them in new schema fields either" when a deterministic structural
+// derivation already exists): the multiplier and which scalar it multiplies
+// are both already sitting in step.expressions, produced by the SAME
+// deterministic extractExpressions() every other rendered amount goes
+// through, not detected via any keyword.
+//
+// Scoping is deliberately narrow and PROBE-GATED, not "add a record for
+// every water/coffee expression": doing this unconditionally would add a
+// same-valued competing candidate next to every genuine pour in the recipe,
+// reintroducing the exact D4 collision Phase B fixed, just from the other
+// direction (two candidate RECORDS for one rendered amount instead of two
+// candidate rendered amounts for one record). So this calls the REAL G22
+// check first (verifyAmountProvenance, imported above, never reimplemented)
+// against the UNAUGMENTED provenance, and only adds a synthetic record for
+// an expression whose OWN rendered entry comes back unverifiable_amount in
+// that real result — i.e. only when G22 itself, with full knowledge of every
+// other candidate in the recipe, has already decided nothing else explains
+// this amount. A capture with no such finding is untouched by this function,
+// byte for byte.
+//
+// Correlating a finding back to the specific expression that caused it
+// avoids reimplementing provenance.ts's private matching internals
+// (matchRenderedAmountsToProvenance is not exported, and file ownership
+// keeps this file reading provenance.ts's public surface only, never
+// touching it): unverifiable_amount fires at most once per rendered entry,
+// and its message embeds `${value}${unit}` verbatim, in the exact same
+// stringification buildRenderedAmountsFromDraftSteps already produced —
+// step_index plus that substring uniquely identifies the entry for every
+// case this backstop is scoped to.
+//
+// rule_source_quote is required by G22 for any 'derived' record, and there
+// is no explicit "ice is half the water" ratio phrase in a typical source —
+// the multiplier is arithmetic the renderer already did over two separately-
+// stated literal facts, not a rule the text states in words. The step's own
+// description_source (carried through, same text as extraction's raw_text)
+// is reused instead: it is the raw sentence this step's amount came from,
+// not a fabricated citation, and quoteAppearsInSourceLocal (F33's own
+// duplicate of provenance.ts's real check, immediately above) confirms it
+// actually appears in the submitted text before this function trusts it. If
+// it does not — some steps are LLM-authored/merged text, not a guaranteed
+// verbatim excerpt — this fails closed: no record is added, and the amount
+// stays exactly as unverifiable as it was before this function ran. Never
+// worse than the status quo.
+const VOLUME_UNIT_HINTS_FOR_DERIVED_AMOUNTS = [
+  "ml",
+  "milliliter",
+  "milliliters",
+  "millilitre",
+  "millilitres",
+  "l",
+  "liter",
+  "liters",
+  "litre",
+  "litres",
+  "cup",
+  "cups",
+  "fl oz",
+  "floz",
+  "oz",
+];
+
+// Best-effort data quality only — NOT load-bearing for G22's own match.
+// Setting unit_kind makes provenance.ts's classifyRecordUnit resolve this
+// record via the unit_kind branch (mass/volume -> "mass_or_volume") rather
+// than its own unit-string lexicon; either path lands on the same bucket for
+// an ordinary "g"/"ml" unit, since the rendered side normalizes through the
+// identical string this record's own `unit` field is set from. Coffee is
+// always mass (D2's own rule, isRecordCompatibleWithPlaceholder above:
+// "Coffee is only ever weighed, never measured by volume, in any of this
+// project's recipes") — this is a closed unit vocabulary, not a semantic
+// judgement over free-form recipe prose, so it is not the English-only-regex
+// pattern CLAUDE.md warns against.
+function inferDerivedAmountUnitKind(
+  placeholder: DraftExpression["placeholder"],
+  unit: string,
+): "mass" | "volume" {
+  if (placeholder === "<final_coffee_amount>") {
+    return "mass";
+  }
+  const normalized = normalizeExpressionUnit(unit).trim().toLowerCase();
+  return VOLUME_UNIT_HINTS_FOR_DERIVED_AMOUNTS.includes(normalized)
+    ? "volume"
+    : "mass";
+}
+
+function deriveNonBrewAmountProvenance(args: {
+  steps: DraftStep[];
+  provenance: AmountProvenanceRecord[];
+  requestText: string;
+  coffeeAmount: number | null;
+  waterAmount: number | null;
+}): {
+  steps: DraftStep[];
+  provenance: AmountProvenanceRecord[];
+  warnings: string[];
+} {
+  if (args.provenance.length === 0) {
+    // G22 itself degrades an entirely-empty extracted_amounts to a single
+    // "provenance could not be verified" warning (verifyAmountProvenance's
+    // own backward-compatibility branch) rather than per-amount blocks —
+    // there is nothing here for this backstop to trace an ice-like amount
+    // off in that case either, and inventing a record would be a guess.
+    return { steps: args.steps, provenance: args.provenance, warnings: [] };
+  }
+
+  const probeRenderedAmounts = buildRenderedAmountsFromDraftSteps(args.steps);
+  if (probeRenderedAmounts.length === 0) {
+    return { steps: args.steps, provenance: args.provenance, warnings: [] };
+  }
+
+  const probe = verifyAmountProvenance({
+    requestText: args.requestText,
+    renderedAmounts: probeRenderedAmounts,
+    provenance: args.provenance,
+  });
+  const unverifiableFindings = probe.findings.filter((finding) =>
+    finding.code === "unverifiable_amount"
+  );
+  if (unverifiableFindings.length === 0) {
+    return { steps: args.steps, provenance: args.provenance, warnings: [] };
+  }
+
+  const provenance = [...args.provenance];
+  const warnings: string[] = [];
+
+  const steps = args.steps.map((step, stepIndex) => {
+    let scalableAmounts = step.scalable_amounts;
+    let scalableAmountsChanged = false;
+
+    for (const expression of step.expressions) {
+      if (expression.preview_value === null) {
+        continue;
+      }
+      const baseAmount = expression.placeholder === "<final_coffee_amount>"
+        ? args.coffeeAmount
+        : args.waterAmount;
+      if (
+        baseAmount === null || !Number.isFinite(baseAmount) ||
+        baseAmount === 0
+      ) {
+        continue;
+      }
+
+      const previewValue = expression.preview_value;
+      const renderedUnit = normalizeExpressionUnit(expression.unit);
+      const needle = `${previewValue}${renderedUnit}`;
+      const isUnexplained = unverifiableFindings.some((finding) =>
+        finding.step_index === stepIndex && finding.message.includes(needle)
+      );
+      if (!isUnexplained) {
+        continue;
+      }
+
+      const ruleSourceQuote = step.description_source.trim();
+      if (!quoteAppearsInSourceLocal(ruleSourceQuote, args.requestText)) {
+        continue;
+      }
+
+      const isCoffee = expression.placeholder === "<final_coffee_amount>";
+      const rule = isCoffee ? "multiple_of_coffee" : "multiple_of_water";
+      const ruleInputs: Record<string, number> = isCoffee
+        ? { multiplier: expression.multiplier, coffee_amount: baseAmount }
+        : { multiplier: expression.multiplier, water_amount: baseAmount };
+      const recordUnit = expression.unit.trim() || renderedUnit || "g";
+
+      provenance.push({
+        value: previewValue,
+        unit: recordUnit,
+        step_index: stepIndex,
+        provenance: "derived",
+        source_quote: null,
+        rule,
+        rule_source_quote: ruleSourceQuote,
+        rule_inputs: ruleInputs,
+        unit_kind: inferDerivedAmountUnitKind(
+          expression.placeholder,
+          expression.unit,
+        ),
+        stated_range: null,
+      });
+
+      warnings.push(
+        `D9 backstop: step ${
+          stepIndex + 1
+        }'s ${previewValue}${renderedUnit} has no coffee/water provenance ` +
+          `record (it is not itself a coffee or water amount) but renders ` +
+          `as ${
+            formatMultiplier(expression.multiplier)
+          } x the recipe's own ${
+            isCoffee ? "coffee" : "water"
+          } amount; traced it to that scalar so it verifies and scales ` +
+          `correctly.`,
+      );
+
+      if (
+        !scalableAmounts.some((amount) =>
+          normalizeExpressionUnit(amount.unit).trim().toLowerCase() ===
+            renderedUnit.trim().toLowerCase() &&
+          Math.abs(amount.value - previewValue) < 0.01
+        )
+      ) {
+        scalableAmounts = [
+          ...scalableAmounts,
+          { value: previewValue, unit: recordUnit },
+        ];
+        scalableAmountsChanged = true;
+      }
+    }
+
+    return scalableAmountsChanged
+      ? { ...step, scalable_amounts: scalableAmounts }
+      : step;
+  });
+
+  return { steps, provenance, warnings };
+}
+
 type ExpressionOccurrence = {
   // Position of this expression among all expressions in the step's
   // template, in left-to-right appearance order — the key used to look up
@@ -7096,7 +7330,20 @@ function finalizeDraftResponse(input: {
     coffeeAmount: normalizedWithBalancedCopy.recipe.coffee_amount,
     waterAmount: normalizedWithBalancedCopy.recipe.water_amount,
   });
-  const draftSteps = rangeEndpointExpansion.steps;
+  // D9 (plan 020 §3, §4b): runs after every other deterministic rewrite of
+  // description_template/extracted_amounts above, on the same steps/
+  // provenance rangeEndpointExpansion just produced — see
+  // deriveNonBrewAmountProvenance's own comment for why this must be
+  // probe-gated against the REAL G22 check rather than firing
+  // unconditionally.
+  const nonBrewAmountProvenance = deriveNonBrewAmountProvenance({
+    steps: rangeEndpointExpansion.steps,
+    provenance: rangeEndpointExpansion.provenance,
+    requestText: input.requestText,
+    coffeeAmount: normalizedWithBalancedCopy.recipe.coffee_amount,
+    waterAmount: normalizedWithBalancedCopy.recipe.water_amount,
+  });
+  const draftSteps = nonBrewAmountProvenance.steps;
   const brewSteps = draftSteps.filter((step) => step.kind === "brew");
   const brewTimeSeconds = brewSteps.length > 0 &&
       brewSteps.every((step) =>
@@ -7147,24 +7394,27 @@ function finalizeDraftResponse(input: {
   // guard, a fixture predating this field would crash here instead of
   // correctly falling into verifyAmountProvenance's `unverified` path.
   const renderedAmounts = buildRenderedAmountsFromDraftSteps(draftSteps);
-  // Phase D: uses rangeEndpointExpansion.provenance (foldRemappedExtractedAmounts
-  // PLUS any synthetic sibling records the backstop added above), not
-  // foldRemappedExtractedAmounts directly — see
-  // expandCollapsedStatedRangeEndpoints's own comment for why a newly
-  // reconstructed endpoint needs a provenance record of its own to avoid
-  // trading range_endpoint_collapsed for unverifiable_amount.
+  // Phase D + D9: uses nonBrewAmountProvenance.provenance
+  // (foldRemappedExtractedAmounts, PLUS any synthetic sibling records Phase
+  // D's range-endpoint backstop added, PLUS any synthetic non-brew-amount
+  // record D9's backstop just added above), not rangeEndpointExpansion.
+  // provenance directly — see expandCollapsedStatedRangeEndpoints's and
+  // deriveNonBrewAmountProvenance's own comments for why a newly
+  // reconstructed/derived amount needs a provenance record of its own to
+  // avoid trading range_endpoint_collapsed/unverifiable_amount for
+  // unverifiable_amount.
   const provenanceResult = verifyAmountProvenance({
     requestText: input.requestText,
     renderedAmounts,
-    provenance: rangeEndpointExpansion.provenance,
+    provenance: nonBrewAmountProvenance.provenance,
   });
 
   // D4 (plan 016 Phase 3a): see findRangeEndpointCollapseIssues above.
-  // Reuses the exact same (Phase D-augmented) provenance array and
+  // Reuses the exact same (Phase D/D9-augmented) provenance array and
   // renderedAmounts G22 just built for this response — no separate
   // extraction pass, no new field.
   const rangeEndpointIssues = findRangeEndpointCollapseIssues(
-    rangeEndpointExpansion.provenance,
+    nonBrewAmountProvenance.provenance,
     renderedAmounts,
     normalizedWithBalancedCopy.recipe.coffee_amount,
     normalizedWithBalancedCopy.recipe.water_amount,
@@ -7294,6 +7544,7 @@ function finalizeDraftResponse(input: {
       ...grindSizeWarnings,
       ...multiplierRepair.warnings,
       ...rangeEndpointExpansion.warnings,
+      ...nonBrewAmountProvenance.warnings,
       ...provenanceWarnings,
       ...timingWarnings,
     ]),

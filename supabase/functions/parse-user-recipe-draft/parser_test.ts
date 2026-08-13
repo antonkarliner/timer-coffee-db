@@ -11237,6 +11237,380 @@ Deno.test("G22: empty extracted_amounts degrades to one compatibility warning an
   );
 });
 
+// ---------------------------------------------------------------------
+// D9 (plan 020 §3, §4b): an ice amount is deliberately never recorded in
+// extracted_amounts — extraction's own scope is "every numeric COFFEE OR
+// WATER amount" — but the deterministic renderer still turns its literal
+// "150 g" into a scalable "(0.5 x <final_water_amount>)g" expression (the
+// SAME fallback-conversion path that runs when a step's scalable_amounts
+// is empty; see convertNumericValuesToExpressions above). Before this fix
+// G22 blocked that correctly-scaled amount as unverifiable_amount, since it
+// has no provenance record. Mirrors the live flash-chilled captures
+// (73d06a79 et al.) almost verbatim: same coffee/water amounts, same
+// "Add 150 g ice to the server. Rinse the filter and add coffee." wording
+// (the "Rinse" keyword close by is what resolves the amount to the water
+// base — see resolveAmountPlaceholder/WATER_CONTEXT_KEYWORDS above; this
+// is exercising the real deterministic path, not a contrived shortcut).
+// ---------------------------------------------------------------------
+
+const D9_ICE_REQUEST_TEXT =
+  "Add 150 g ice to the server. Rinse the filter and add coffee. " +
+  "Start the timer and bloom with 75 g water. Pour to a total of 300 g and wait.";
+
+function createD9IceExtraction(): ExtractionResult {
+  return {
+    extracted_amounts: [
+      {
+        value: 25,
+        unit: "g",
+        step_index: -1,
+        provenance: "literal",
+        source_quote: "coffee",
+        rule: null,
+        rule_source_quote: null,
+        rule_inputs: null,
+      },
+      {
+        value: 300,
+        unit: "g",
+        step_index: -1,
+        provenance: "literal",
+        source_quote: "300 g",
+        rule: null,
+        rule_source_quote: null,
+        rule_inputs: null,
+      },
+      {
+        value: 75,
+        unit: "g",
+        step_index: 1,
+        provenance: "literal",
+        source_quote: "75 g water",
+        rule: null,
+        rule_source_quote: null,
+        rule_inputs: null,
+      },
+      {
+        value: 300,
+        unit: "g",
+        step_index: 2,
+        provenance: "literal",
+        source_quote: "300 g",
+        rule: null,
+        rule_source_quote: null,
+        rule_inputs: null,
+      },
+    ],
+    detected_input_language: "en",
+    likely_brewing_method: "Hario V60",
+    name: "Flash Chilled Pour Over",
+    short_description: "Iced pour over",
+    grind_size: "Medium-fine",
+    water_temp_celsius: 94,
+    coffee_amount_grams: 25,
+    water_amount: 300,
+    preparation: "Add 150 g ice to the server. Rinse the filter and add coffee.",
+    steps: [
+      {
+        title: null,
+        raw_text: "Add 150 g ice to the server. Rinse the filter and add coffee.",
+        duration_seconds: null,
+        elapsed_seconds: null,
+        starts_timer: false,
+        duration_is_stated: false,
+        // Deliberately empty — extraction never lists ice, since it is not
+        // a coffee or water amount. See convertNumericValuesToExpressions'
+        // own F5 comment for the fallback this triggers.
+        scalable_amounts: [],
+        step_role: "preparation",
+      },
+      {
+        title: null,
+        raw_text: "Start the timer and bloom with 75 g water.",
+        duration_seconds: 45,
+        elapsed_seconds: 0,
+        starts_timer: true,
+        duration_is_stated: false,
+        scalable_amounts: [{ value: 75, unit: "g" }],
+        step_role: "bloom",
+      },
+      {
+        title: null,
+        raw_text: "Pour to a total of 300 g and wait.",
+        duration_seconds: 60,
+        elapsed_seconds: 45,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [{ value: 300, unit: "g" }],
+        step_role: "pour",
+      },
+    ],
+    notes: [],
+    total_brew_time_seconds: null,
+  };
+}
+
+function createD9IceNormalized(): NormalizedDraft {
+  return {
+    extracted_amounts: createD9IceExtraction().extracted_amounts,
+    detected_input_language: "en",
+    warnings: [],
+    recipe: {
+      brewing_method_id: "v60",
+      brewing_method_confidence: "high",
+      coffee_amount: 25,
+      water_amount: 300,
+      water_temp: 94,
+    },
+    localization: {
+      name: "Flash Chilled Pour Over",
+      grind_size: "Medium-fine",
+      short_description: "Iced pour over",
+    },
+    steps: [
+      {
+        kind: "preparation",
+        description_source:
+          "Add 150 g ice to the server. Rinse the filter and add coffee.",
+        // Matches the real captures: normalization already turns the
+        // coffee mention into an expression but leaves the ice's "150 g"
+        // as a bare literal — buildDraftSteps's own deterministic
+        // convertNumericValuesToExpressions is what converts THAT, exactly
+        // as it does live.
+        description_template:
+          "Add 150 g ice to the server. Rinse the filter and add (1 x <final_coffee_amount>)g coffee.",
+        duration_seconds: 0,
+        elapsed_seconds: null,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: "preparation",
+      },
+      {
+        kind: "brew",
+        description_source: "Start the timer and bloom with 75 g water.",
+        description_template: "Start the timer and bloom with 75g water.",
+        duration_seconds: 45,
+        elapsed_seconds: 0,
+        starts_timer: true,
+        duration_is_stated: false,
+        scalable_amounts: [{ value: 75, unit: "g" }],
+        step_role: "bloom",
+      },
+      {
+        kind: "brew",
+        description_source: "Pour to a total of 300 g and wait.",
+        description_template: "Pour to a total of 300g and wait.",
+        duration_seconds: 60,
+        elapsed_seconds: 45,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [{ value: 300, unit: "g" }],
+        step_role: "pour",
+      },
+    ],
+  };
+}
+
+Deno.test("D9: an ice amount with no coffee/water provenance record traces to the water scalar and no longer blocks as unverifiable_amount", async () => {
+  const calls: Array<{ provider: string; stage: string }> = [];
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction: createD9IceExtraction(),
+        normalized: createD9IceNormalized(),
+        calls,
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: D9_ICE_REQUEST_TEXT,
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Hario V60" },
+    ],
+    requestId: "req-d9-ice",
+  });
+
+  assert(
+    result.draft.steps[0].description_template.includes(
+      "(0.5 x <final_water_amount>)g",
+    ),
+    `Expected the ice to render as half the water scalar (mirrors the live ` +
+      `flash-chilled captures), got: ${result.draft.steps[0].description_template}`,
+  );
+  assert(
+    !result.validation.issues.some((issue) =>
+      issue.code === "unverifiable_amount"
+    ),
+    `Expected D9's backstop to trace the ice amount so it never blocks as ` +
+      `unverifiable_amount. Issues: ${JSON.stringify(result.validation.issues)}`,
+  );
+  assertEquals(
+    result.validation.is_publishable,
+    true,
+    "Expected the draft to be publishable once the ice amount traces.",
+  );
+  assert(
+    result.warnings.some((warning) =>
+      warning.startsWith("D9 backstop:") && warning.includes("150g")
+    ),
+    `Expected a D9 backstop warning documenting the traced amount, got: ${
+      JSON.stringify(result.warnings)
+    }`,
+  );
+});
+
+Deno.test("D9: the ice's derived record does not enter the recipe's water_amount or the pour steps' own cumulative targets", async () => {
+  const calls: Array<{ provider: string; stage: string }> = [];
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction: createD9IceExtraction(),
+        normalized: createD9IceNormalized(),
+        calls,
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: D9_ICE_REQUEST_TEXT,
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Hario V60" },
+    ],
+    requestId: "req-d9-ice-water-amount",
+  });
+
+  assertEquals(
+    result.draft.recipe.water_amount,
+    300,
+    "Expected the recipe's own water_amount to stay exactly what extraction/normalization stated (300g) — this fix must not fold ice into it.",
+  );
+  assert(
+    result.draft.steps[1].expressions.some((expression) =>
+      expression.placeholder === "<final_water_amount>" &&
+      expression.preview_value === 75
+    ),
+    `Expected the bloom step's own water target to stay 75g, got: ${
+      JSON.stringify(result.draft.steps[1].expressions)
+    }`,
+  );
+  assert(
+    result.draft.steps[2].expressions.some((expression) =>
+      expression.placeholder === "<final_water_amount>" &&
+      expression.preview_value === 300
+    ),
+    `Expected the final pour's own cumulative target to stay 300g, got: ${
+      JSON.stringify(result.draft.steps[2].expressions)
+    }`,
+  );
+  assertEquals(
+    result.validation.is_publishable,
+    true,
+    "Expected the draft to be publishable once the ice amount traces.",
+  );
+});
+
+Deno.test("D9: scalable_amounts on the ice's step is populated to match the amount the template already renders", async () => {
+  const calls: Array<{ provider: string; stage: string }> = [];
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction: createD9IceExtraction(),
+        normalized: createD9IceNormalized(),
+        calls,
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: D9_ICE_REQUEST_TEXT,
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Hario V60" },
+    ],
+    requestId: "req-d9-ice-scalable-amounts",
+  });
+
+  const preparationStep = result.draft.steps[0];
+  assert(
+    preparationStep.scalable_amounts.some((amount) =>
+      amount.unit === "g" && Math.abs(amount.value - 150) < 0.01
+    ),
+    `Expected the preparation step's scalable_amounts to include the 150g ` +
+      `ice amount, matching its own template's "(0.5 x <final_water_amount>)g" ` +
+      `expression. Got: ${JSON.stringify(preparationStep.scalable_amounts)}`,
+  );
+});
+
+Deno.test("D9: a recipe with no non-brew amount is completely unaffected by the backstop (no-op control)", async () => {
+  const calls: Array<{ provider: string; stage: string }> = [];
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction: {
+          ...createExtraction(),
+          extracted_amounts: [
+            ...G22_BASE_AMOUNTS,
+            {
+              value: 25,
+              unit: "g",
+              step_index: 1,
+              provenance: "literal",
+              source_quote: "25g",
+              rule: null,
+              rule_source_quote: null,
+              rule_inputs: null,
+            },
+          ],
+        },
+        normalized: {
+          ...createNormalized(),
+          steps: [
+            createNormalized().steps[0],
+            {
+              ...createNormalized().steps[1],
+              description_template: "Pour 25g of water and bloom.",
+            },
+            createNormalized().steps[2],
+          ],
+        },
+        calls,
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: G22_REQUEST_TEXT,
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Hario V60" },
+    ],
+    requestId: "req-d9-no-op",
+  });
+
+  assert(
+    !result.warnings.some((warning) => warning.startsWith("D9 backstop:")),
+    `Expected no D9 backstop warning when every rendered amount already ` +
+      `traces to a real record. Warnings: ${JSON.stringify(result.warnings)}`,
+  );
+  assertEquals(
+    result.validation.is_publishable,
+    true,
+    "Expected this control (identical to the pre-D9 'amount matches what renders' test) to stay publishable, unchanged by the backstop.",
+  );
+});
+
 Deno.test("Fix 1: extraction using concentration_water_from_coffee (not concentration) for a derived water amount recomputes correctly and stays publishable (Chemex-shaped, live incident)", async () => {
   // Live captures 5ee85b7e-6f38-4dbd-a19c-4700c3b166f0 and
   // ffd6a248-973c-4940-b160-f96e2d50f8d1 (Chemex, "60 grams per liter", 30g
