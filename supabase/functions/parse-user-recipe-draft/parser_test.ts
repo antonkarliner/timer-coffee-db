@@ -712,6 +712,154 @@ function createTooShortBrewDurationsNormalized(): NormalizedDraft {
   };
 }
 
+// D7 (plan 020 §3 D7, §4b decision) fixtures. All three share the same
+// recipe/localization shape as createTooShortBrewDurationsNormalized and
+// differ only in per-step duration_is_stated/duration_seconds, to isolate
+// enforceMinimumStepDurations's absorb-from-neighbour behaviour from
+// everything else in the pipeline. None of these steps carry elapsed_seconds,
+// so normalizeAbsoluteTimestampDurations's timestamp-differencing path never
+// engages (timestamped.length < 2) — enforceMinimumStepDurations is the only
+// pass that can touch these durations.
+function createStatedSubMinimumAbsorbableNormalized(): NormalizedDraft {
+  const base = createTooShortBrewDurationsNormalized();
+  return {
+    ...base,
+    steps: [
+      base.steps[0],
+      {
+        ...base.steps[1],
+        description_source: "Bloom for 10 seconds.",
+        description_template: "Bloom for 10 seconds.",
+        duration_seconds: 10,
+        duration_is_stated: true,
+      },
+      {
+        ...base.steps[1],
+        description_source: "Stir for 5 seconds.",
+        description_template: "Stir for 5 seconds.",
+        duration_seconds: 5,
+        duration_is_stated: true,
+      },
+      {
+        ...base.steps[2],
+        description_source: "Wait for 20 seconds.",
+        description_template: "Wait for 20 seconds.",
+        duration_seconds: 20,
+        duration_is_stated: true,
+      },
+    ],
+  };
+}
+
+function createStatedSubMinimumUnabsorbableNormalized(): NormalizedDraft {
+  const base = createTooShortBrewDurationsNormalized();
+  return {
+    ...base,
+    steps: [
+      base.steps[0],
+      {
+        ...base.steps[1],
+        description_source: "Bloom for 10 seconds.",
+        description_template: "Bloom for 10 seconds.",
+        duration_seconds: 10,
+        duration_is_stated: true,
+      },
+      {
+        ...base.steps[1],
+        description_source: "Stir for 4 seconds.",
+        description_template: "Stir for 4 seconds.",
+        duration_seconds: 4,
+        duration_is_stated: true,
+      },
+      {
+        ...base.steps[2],
+        description_source: "Wait for 15 seconds.",
+        description_template: "Wait for 15 seconds.",
+        // Natural duration 15 can't pay a 6-second delta and stay at or
+        // above the minimum (15 - 6 = 9 < 10), so this must NOT be treated
+        // as an eligible payer.
+        duration_seconds: 15,
+        duration_is_stated: true,
+      },
+    ],
+  };
+}
+
+function createStatedSubMinimumLastStepNormalized(): NormalizedDraft {
+  const base = createTooShortBrewDurationsNormalized();
+  return {
+    ...base,
+    steps: [
+      base.steps[0],
+      {
+        ...base.steps[1],
+        description_source: "Pour and wait 20 seconds.",
+        description_template: "Pour and wait 20 seconds.",
+        duration_seconds: 20,
+        duration_is_stated: true,
+      },
+      {
+        ...base.steps[2],
+        description_source: "Swirl for 3 seconds.",
+        description_template: "Swirl for 3 seconds.",
+        // Last step in the recipe — there is no following step to absorb
+        // the shortfall from.
+        duration_seconds: 3,
+        duration_is_stated: true,
+      },
+    ],
+  };
+}
+
+// D7, elapsed-timestamp path: mirrors the AeroPress WAC shape (plan 019 §A,
+// plan 020 §3 D7) where every step carries an explicit elapsed_seconds
+// landmark, so the fix lives in normalizeAbsoluteTimestampDurations rather
+// than enforceMinimumStepDurations. The stir's natural (diffed) duration is
+// 15 - 10 = 5s; the following pour step's natural duration is 45 - 15 = 30s,
+// which can afford the 5s delta and stay at or above the minimum.
+function createTimestampedStatedSubMinimumNormalized(): NormalizedDraft {
+  const base = createTooShortBrewDurationsNormalized();
+  return {
+    ...base,
+    steps: [
+      base.steps[0],
+      {
+        ...base.steps[1],
+        description_source: "Start the timer and add 50g water.",
+        description_template: "Start the timer and add 50g water.",
+        duration_seconds: 10,
+        elapsed_seconds: 0,
+        starts_timer: true,
+        duration_is_stated: true,
+      },
+      {
+        ...base.steps[1],
+        description_source: "Stir very gently.",
+        description_template: "Stir very gently.",
+        duration_seconds: 5,
+        elapsed_seconds: 10,
+        duration_is_stated: true,
+      },
+      {
+        ...base.steps[2],
+        description_source: "Pour up to 200g water.",
+        description_template: "Pour up to 200g water.",
+        duration_seconds: 30,
+        elapsed_seconds: 15,
+        duration_is_stated: true,
+      },
+      {
+        ...base.steps[2],
+        description_source: "Let it steep.",
+        description_template: "Let it steep.",
+        duration_seconds: 10,
+        elapsed_seconds: 45,
+        duration_is_stated: false,
+      },
+    ],
+  };
+}
+
 function createTetsuTimestampExtraction(): ExtractionResult {
   return {
     extracted_amounts: [],
@@ -2903,6 +3051,183 @@ Deno.test("normalizes brew-step durations below 10 seconds and keeps brew time e
       warning.includes("normalized to 10 seconds")
     ),
     "Expected duration normalization to be surfaced as a warning.",
+  );
+});
+
+Deno.test("D7: a stated sub-minimum brew step absorbs the shortfall from the following step, conserving the total", async () => {
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction: createExtraction(),
+        normalized: createStatedSubMinimumAbsorbableNormalized(),
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: "Quick V60 recipe",
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Hario V60" },
+    ],
+    requestId: "req-d7-absorb",
+  });
+
+  assertEquals(
+    result.draft.steps.map((step) => step.duration_seconds),
+    [0, 10, 10, 15],
+    "Expected the 5s stir to be bumped to 10s and the following 20s step " +
+      "to be shortened to 15s to pay for it, rather than the total growing.",
+  );
+  assertEquals(
+    result.draft.recipe.brew_time_seconds,
+    35,
+    "Expected the brew total to equal the ORIGINAL stated total " +
+      "(10 + 5 + 20 = 35), conserved rather than inflated by the minimum.",
+  );
+  assert(
+    result.warnings.some((warning) =>
+      warning.includes("shortening the following step by the same amount")
+    ),
+    "Expected the absorption to be surfaced as its own warning.",
+  );
+});
+
+Deno.test("D7 fallback: a stated sub-minimum step whose only neighbour can't afford the delta bumps without absorbing", async () => {
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction: createExtraction(),
+        normalized: createStatedSubMinimumUnabsorbableNormalized(),
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: "Quick V60 recipe",
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Hario V60" },
+    ],
+    requestId: "req-d7-fallback",
+  });
+
+  assertEquals(
+    result.draft.steps.map((step) => step.duration_seconds),
+    [0, 10, 10, 15],
+    "Expected the 4s stir to be bumped to 10s and the following 15s step " +
+      "to be left untouched, because paying 6s would drop it to 9s — " +
+      "below the minimum itself.",
+  );
+  assertEquals(
+    result.draft.recipe.brew_time_seconds,
+    35,
+    "Fallback is not conservative by design: 10 + 10 + 15 = 35, 6s more " +
+      "than the original stated 10 + 4 + 15 = 29 — no worse than pre-D7.",
+  );
+  assert(
+    result.warnings.some((warning) =>
+      warning.includes("normalized to 10 seconds")
+    ) &&
+      !result.warnings.some((warning) =>
+        warning.includes("shortening the following step")
+      ),
+    "Expected the plain (non-absorbing) minimum-duration warning, not the " +
+      "absorption warning.",
+  );
+});
+
+Deno.test("D7 fallback: a stated sub-minimum step that is last in the recipe has no neighbour to absorb from", async () => {
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction: createExtraction(),
+        normalized: createStatedSubMinimumLastStepNormalized(),
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: "Quick V60 recipe",
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Hario V60" },
+    ],
+    requestId: "req-d7-last-step",
+  });
+
+  assertEquals(
+    result.draft.steps.map((step) => step.duration_seconds),
+    [0, 20, 10],
+    "Expected the last step's 3s swirl to be bumped to 10s with no " +
+      "attempt to absorb — there is no following step to pay for it.",
+  );
+  assertEquals(
+    result.draft.recipe.brew_time_seconds,
+    30,
+    "20 + 10 = 30 seconds; the pre-existing (non-conservative) fallback " +
+      "behavior, unchanged by this phase.",
+  );
+});
+
+Deno.test("D7 (elapsed-timestamp path): an AeroPress-shaped stir absorbs from the following pour, keeping later landmarks aligned", async () => {
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction: createExtraction(),
+        normalized: createTimestampedStatedSubMinimumNormalized(),
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: "Quick AeroPress recipe",
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "aeropress", brewing_method: "AeroPress" },
+    ],
+    requestId: "req-d7-timestamped",
+  });
+
+  assertEquals(
+    result.draft.steps.map((step) => step.duration_seconds),
+    [0, 10, 10, 25, 10],
+    "Expected the 5s (10->15) stir to bump to 10s absorbed from the " +
+      "following 30s (15->45) pour, which becomes 25s.",
+  );
+  assertEquals(
+    result.draft.recipe.brew_time_seconds,
+    55,
+    "10 + 10 + 25 + 10 = 55, exactly the natural (pre-enforcement) total " +
+      "10 + 5 + 30 + 10 — nothing invented.",
+  );
+  assert(
+    !result.warnings.some((warning) =>
+      warning.includes("should begin at 45s elapsed")
+    ),
+    "Expected the final step's elapsed landmark (45s, preceded by " +
+      "10+10+25=45) to land exactly on the source-stated timestamp instead " +
+      "of being enumerated as shifted.",
+  );
+  assert(
+    result.warnings.some((warning) =>
+      warning.includes(
+        "A brew step's source-stated duration was below 10 seconds; it was normalized to 10 seconds by shortening the following step",
+      )
+    ),
+    "Expected the elapsed-timestamp absorption to be surfaced as its own warning.",
   );
 });
 

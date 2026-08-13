@@ -3623,48 +3623,116 @@ function convertWaterStepsToRunningTotals(input: {
   return { steps, warnings };
 }
 
+// D7 (plan 020 §3 D7, §4b decision — product decision made 2026-08-13: keep
+// the 10-second minimum, absorb the delta from an adjacent step rather than
+// silently inflating the timeline).
+//
+// Before this phase, a stated sub-minimum brew step (the AeroPress WAC
+// source's "0:10-0:15 stir very gently", a 5-second action) was simply
+// bumped to MIN_BREW_STEP_DURATION_SECONDS, MANUFACTURING seconds that
+// pushed every later elapsed landmark back by the delta — G22 then
+// enumerated each shifted landmark as a warning even though the recipe
+// stayed publishable. That is a symptom of the same root cause as the rest
+// of plan 020 (see §1): a deterministic pass rewrote the source's own
+// timeline instead of conserving it.
+//
+// The fix: when a step needs bumping, try to pay for the delta by shortening
+// the step immediately AFTER it, so the total is conserved and every later
+// landmark lands back where the source said it would.
+//
+// Why the FOLLOWING step pays. The step after the short one is the one whose
+// START was pushed back by the expansion — it is the landmark actually
+// being protected. Shortening it instead of, say, the preceding step keeps
+// the short step's own elapsed_seconds (its start) untouched and repairs
+// exactly the drift G22 was complaining about, in the step closest to the
+// discrepancy.
+//
+// Why NOT cascade. A payer is only used when it can afford the delta AND
+// remain at or above the minimum itself — never below. That is a structural
+// guarantee, not just a check: if step i-1 successfully absorbed from step
+// i, step i's post-payment duration is by construction >= the minimum, so
+// when this same left-to-right pass reaches step i it will not need
+// bumping and therefore will not go looking for a payer of its own. A
+// shortfall never propagates past its immediate neighbour.
+//
+// Fallback when no payer is available (the short step is last, the
+// following step isn't a brew step, or it cannot afford the delta without
+// itself dropping below the minimum): bump to the minimum WITHOUT
+// conservation, exactly as before this phase. That leaves the same drift
+// and warning behaviour the gate has always had — strictly no worse than
+// pre-D7, per plan 020 §3 D7.
+//
+// One accepted side effect (the trade-off the product decision was made
+// with, not a bug): if the payer step itself carries duration_is_stated,
+// shortening it means its OWN final duration_seconds no longer matches its
+// own source-stated figure, which will surface as a new (non-blocking in
+// extract mode) `stated_duration_changed` finding from verifyTimingProvenance
+// for the payer. That is intentional — the alternative was leaving every
+// LATER landmark wrong, which is strictly more findings, not fewer.
 function enforceMinimumStepDurations(input: {
   steps: DraftStep[];
 }): { steps: DraftStep[]; warnings: string[] } {
+  const steps = input.steps;
+  const durations = steps.map((step) => step.duration_seconds);
+
   let adjustedPreparation = false;
-  let adjustedBrew = false;
+  let adjustedBrewAbsorbed = false;
+  let adjustedBrewUnabsorbed = false;
 
-  const steps = input.steps.map((step) => {
+  steps.forEach((step, index) => {
     if (step.kind === "preparation") {
-      if (step.duration_seconds === 0) {
-        return step;
+      if (durations[index] !== 0) {
+        adjustedPreparation = true;
+        durations[index] = 0;
       }
-
-      adjustedPreparation = true;
-      return {
-        ...step,
-        duration_seconds: 0,
-      };
+      return;
     }
 
-    if (step.duration_seconds >= MIN_BREW_STEP_DURATION_SECONDS) {
-      return step;
+    if (durations[index] >= MIN_BREW_STEP_DURATION_SECONDS) {
+      return;
     }
 
-    adjustedBrew = true;
-    return {
-      ...step,
-      duration_seconds: MIN_BREW_STEP_DURATION_SECONDS,
-    };
+    const delta = MIN_BREW_STEP_DURATION_SECONDS - durations[index];
+    const payerIndex = index + 1;
+    const payer: DraftStep | undefined = steps[payerIndex];
+    const canAbsorb = payer !== undefined &&
+      payer.kind === "brew" &&
+      durations[payerIndex] - delta >= MIN_BREW_STEP_DURATION_SECONDS;
+
+    if (canAbsorb) {
+      durations[index] = MIN_BREW_STEP_DURATION_SECONDS;
+      durations[payerIndex] -= delta;
+      adjustedBrewAbsorbed = true;
+      return;
+    }
+
+    durations[index] = MIN_BREW_STEP_DURATION_SECONDS;
+    adjustedBrewUnabsorbed = true;
   });
+
+  const resultSteps = steps.map((step, index) =>
+    durations[index] === step.duration_seconds
+      ? step
+      : { ...step, duration_seconds: durations[index] }
+  );
 
   const warnings: string[] = [];
   if (adjustedPreparation) {
     warnings.push("Preparation step duration was normalized to 0 seconds.");
   }
-  if (adjustedBrew) {
+  if (adjustedBrewAbsorbed) {
+    warnings.push(
+      `Brew step durations below ${MIN_BREW_STEP_DURATION_SECONDS} seconds were normalized to ${MIN_BREW_STEP_DURATION_SECONDS} seconds, shortening the following step by the same amount so the total brew time and later timings are unaffected.`,
+    );
+  }
+  if (adjustedBrewUnabsorbed) {
     warnings.push(
       `Brew step durations below ${MIN_BREW_STEP_DURATION_SECONDS} seconds were normalized to ${MIN_BREW_STEP_DURATION_SECONDS} seconds.`,
     );
   }
 
   return {
-    steps,
+    steps: resultSteps,
     warnings,
   };
 }
@@ -4466,17 +4534,93 @@ function normalizeAbsoluteTimestampDurations(input: {
   // See isAnchoredBrewStep for how this is consumed.
   const timestampDifferencedIndexes = new Set<number>();
 
+  // D7 (plan 020 §3 D7, §4b decision): pass 1 computes each timestamped
+  // step's NATURAL duration — the raw elapsed-timestamp diff against its
+  // successor, or the nominal fallback for the last one — before any
+  // minimum enforcement. This is the ground truth the old single-pass
+  // version computed and then discarded the moment it came out below the
+  // minimum, silently keeping whatever duration_seconds the model already
+  // had (which is often already MIN_BREW_STEP_DURATION_SECONDS, because
+  // providers are commonly prompted to enforce the same floor themselves —
+  // that coincidence is exactly why the drift went unabsorbed: nothing in
+  // this function ever saw a value below the minimum to react to).
+  const naturalDurationsByIndex = new Map<number, number>();
+  timestamped.forEach((item, order) => {
+    const nextTimestamp = timestamped[order + 1];
+    const duration = nextTimestamp
+      ? nextTimestamp.timestampSeconds - item.timestampSeconds
+      : FINAL_TIMESTAMPED_STEP_DURATION_SECONDS;
+    naturalDurationsByIndex.set(item.index, duration);
+  });
+
+  // Pass 2: enforce the minimum against the natural durations, absorbing
+  // the delta from the immediately FOLLOWING timestamped step when
+  // possible — that step is the one whose own elapsed start this step's
+  // expansion would otherwise push back, so paying there is what keeps
+  // every later stated landmark on the timeline the source actually gave.
+  //
+  // Gated to steps carrying duration_is_stated === true: a natural
+  // duration below the minimum can also come from two source landmarks
+  // that legitimately resolve to the very same elapsed second (e.g. "at
+  // 1:35 put the pitcher on; at 1:40 flip the brewer" collapsed into one
+  // step anchored at 1:40, diffed against "press from 1:40" landing on
+  // exactly 0) — that is landmark-resolution noise, not a stated
+  // sub-minimum duration, and forcing an absorption there would shorten an
+  // unrelated neighbour to fix something that was never really 5 seconds
+  // in the first place. Only a step the model itself marked as carrying a
+  // real stated duration is D7's case; anything else keeps its prior
+  // pass-through behaviour untouched (handled below via the >= MIN guard,
+  // same as before this phase).
+  const finalDurationsByIndex = new Map(naturalDurationsByIndex);
+  let absorbedShortfall = false;
+  let unabsorbedShortfall = false;
+  timestamped.forEach((item, order) => {
+    const current = finalDurationsByIndex.get(item.index)!;
+    if (current >= MIN_BREW_STEP_DURATION_SECONDS) {
+      return;
+    }
+    if (!input.steps[item.index].duration_is_stated) {
+      return;
+    }
+
+    const delta = MIN_BREW_STEP_DURATION_SECONDS - current;
+    const payer = timestamped[order + 1];
+    const canAbsorb = payer !== undefined &&
+      finalDurationsByIndex.get(payer.index)! - delta >=
+        MIN_BREW_STEP_DURATION_SECONDS;
+
+    if (canAbsorb) {
+      finalDurationsByIndex.set(item.index, MIN_BREW_STEP_DURATION_SECONDS);
+      finalDurationsByIndex.set(
+        payer.index,
+        finalDurationsByIndex.get(payer.index)! - delta,
+      );
+      absorbedShortfall = true;
+    } else {
+      // No eligible payer — the step is last, the next step isn't
+      // timestamped, or it can't afford the delta without itself dropping
+      // below the minimum. Bump to the minimum without conservation,
+      // exactly as the pre-D7 pass-through behaviour left it (which, for a
+      // provider that already self-normalizes, is a no-op here). Strictly
+      // no worse than before this phase.
+      finalDurationsByIndex.set(item.index, MIN_BREW_STEP_DURATION_SECONDS);
+      unabsorbedShortfall = true;
+    }
+  });
+
   const steps = input.steps.map((step, index) => {
     const timestamp = timestampByIndex.get(index);
     if (timestamp) {
       const nextTimestamp = timestamped[timestamp.order + 1];
-      const duration = nextTimestamp
-        ? nextTimestamp.timestampSeconds - timestamp.timestampSeconds
-        : FINAL_TIMESTAMPED_STEP_DURATION_SECONDS;
+      const naturalDuration = naturalDurationsByIndex.get(index)!;
 
-      if (nextTimestamp && duration >= MIN_BREW_STEP_DURATION_SECONDS) {
+      if (
+        nextTimestamp && naturalDuration >= MIN_BREW_STEP_DURATION_SECONDS
+      ) {
         timestampDifferencedIndexes.add(index);
       }
+
+      const duration = finalDurationsByIndex.get(index)!;
 
       // Canonicalize elapsed_seconds to the resolved timestamp (which may
       // have come from regex text parsing, not just the field itself) so
@@ -4576,11 +4720,24 @@ function normalizeAbsoluteTimestampDurations(input: {
     });
   }
 
+  const warnings: string[] = [];
+  if (adjusted) {
+    warnings.push("Elapsed-time brew steps were converted to step durations.");
+  }
+  if (absorbedShortfall) {
+    warnings.push(
+      `A brew step's source-stated duration was below ${MIN_BREW_STEP_DURATION_SECONDS} seconds; it was normalized to ${MIN_BREW_STEP_DURATION_SECONDS} seconds by shortening the following step by the same amount, so the total brew time and later elapsed landmarks are unaffected.`,
+    );
+  }
+  if (unabsorbedShortfall) {
+    warnings.push(
+      `A brew step's source-stated duration was below ${MIN_BREW_STEP_DURATION_SECONDS} seconds and was normalized to ${MIN_BREW_STEP_DURATION_SECONDS} seconds; no adjacent step could absorb the difference, so later elapsed landmarks may be shifted by it.`,
+    );
+  }
+
   return {
     steps,
-    warnings: adjusted
-      ? ["Elapsed-time brew steps were converted to step durations."]
-      : [],
+    warnings,
     timestampDifferencedIndexes,
   };
 }
