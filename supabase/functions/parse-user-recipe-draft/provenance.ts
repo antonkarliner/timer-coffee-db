@@ -382,6 +382,160 @@ function recomputeDerivedValue(
   }
 }
 
+// Plan 020 D4 (flash-chilled 150 g ice / 150 g water collision, confirmed
+// on production capture 73d06a79-5e48-497f-bf71-ebd48426caa4): the matcher
+// used to be `unconsumed.find(...)`, taking the FIRST unconsumed candidate
+// in array order once value+unit matched. When a value legitimately repeats
+// in two different roles — 150 g of ice in the preparation step, and,
+// separately, a 150 g cumulative brew-water target three steps later — the
+// EARLIER-rendered occurrence (the ice, which the extraction stage
+// deliberately does not record, because ice is not brew water) consumed the
+// only 150 g record on record, which actually belonged to the later pour.
+// That produced two false findings at once: `amount_step_binding_mismatch`
+// on the ice's own step (the record's real step_index was "far" from where
+// array-order matching stuck it) and `unverifiable_amount` on the pour's
+// step (nothing was left to match against once the record was gone).
+//
+// The fix pairs every rendered amount with its nearest-by-step_index
+// unconsumed, value/unit-compatible record, decided GLOBALLY rather than by
+// processing rendered amounts one at a time in array order. A per-item
+// "take whichever unconsumed candidate is nearest" still fails this exact
+// case: when the ice (step 0) is considered before the pour (step 2), the
+// lone 150 g record is the ONLY candidate available at that moment, so it
+// gets consumed regardless of how "near" it actually is. Deciding all pairs
+// at once — sorted by distance, closest first — lets the pour's exact
+// (distance-0) match claim the record before the ice's more distant
+// (distance-2) one is ever considered, exactly reproducing what a human
+// reading the recipe would conclude. The ice's rendered amount is then
+// correctly left with no record to trace to (`unverifiable_amount` on its
+// own step, step 0) — which is honest: ice genuinely was never extracted —
+// rather than stealing the pour's record and reporting a fabricated
+// mismatch two steps away.
+//
+// Recipe-level records (`step_index: -1`) are a SENTINEL, not a position —
+// see `AmountProvenance.step_index`'s own doc comment. Feeding -1 into the
+// ordinary `Math.abs(record.step_index - rendered.step_index)` formula
+// would manufacture a fake distance that grows with how far into the recipe
+// the rendered amount happens to sit (a rendered amount on step 3 would
+// score "distance 4" against a -1 record, as if the record were one step
+// before step 0 — meaningless).
+//
+// `stepDistance` below treats a -1 on EITHER side as distance ZERO instead
+// — maximally compatible with every step, rather than maximally distant
+// from all of them. This was not the first design tried: distance-Infinity
+// (sentinel picked only as an absolute last resort) reads more
+// "conservative" on paper, but it regressed a real, previously-clean
+// capture (127f391d, "Hario full 4", replayed via
+// `scripts/recipe-draft-replay/replay.ts --all`) the moment it was checked
+// against the corpus. That capture's extraction/repair stage recorded the
+// SAME value twice — once at `step_index: -1` (the recipe-level dose) and
+// once more, redundantly, at a real but essentially arbitrary positional
+// step_index the value is never actually re-stated at — while the final
+// draft renders that value exactly once, in the preparation step. Infinity
+// made the redundant positional duplicate outrank the sentinel purely
+// because it named A step, even though that step was two and three
+// positions away from where the value actually rendered, fabricating a
+// two-step `amount_step_binding_mismatch` that did not exist before this
+// fix. Distance zero fixes it: a recipe-level fact has no wrong position,
+// so it is compatible with wherever it is rendered, and — being distance
+// zero rather than distance-of-the-actual-nearest-real-record — it also
+// never OUTRANKS an exact (distance-0) positional match, only ties with
+// one, which the tie rule below then resolves deterministically. This is
+// the direct application of D4's own mechanism in miniature: prefer the
+// pairing closest to how a human reading the recipe would actually
+// resolve it, not the one that is superficially "more specific" on paper.
+const SENTINEL_STEP_DISTANCE = 0;
+
+function stepDistance(
+  recordStepIndex: number,
+  renderedStepIndex: number,
+): number {
+  if (recordStepIndex === -1 || renderedStepIndex === -1) {
+    return SENTINEL_STEP_DISTANCE;
+  }
+  return Math.abs(recordStepIndex - renderedStepIndex);
+}
+
+// Tie rule (needed whenever two or more candidates land on the exact same
+// distance — including two sentinel candidates, or a sentinel tied with an
+// exact positional match, both at distance 0): prefer the candidate for the
+// EARLIER-appearing rendered amount, then the earlier-appearing provenance
+// record. This is arbitrary in the sense that no other rule is physically
+// forced by the data, but it is deterministic and it reduces to the
+// pre-fix `.find()` behaviour on the fully-degenerate case where every
+// pairing is equally (non-)specific — see `matchRenderedAmountsToProvenance`
+// and its test coverage in `provenance_test.ts`.
+
+type AmountMatchCandidate = {
+  renderedIndex: number;
+  recordIndex: number;
+  distance: number;
+};
+
+/**
+ * Decides, for every rendered amount, which (if any) provenance record it
+ * traces to — one record used at most once. See the D4 comment block above
+ * `stepDistance` for the full rationale; this is the "decide all pairs at
+ * once, nearest first" mechanism that makes the flash-chilled 150 g/150 g
+ * case resolve correctly regardless of which value happens to render first.
+ *
+ * Returns, for each index into `renderedAmounts`, the matched index into
+ * `provenance`, or `null` when no compatible record remains unconsumed.
+ */
+function matchRenderedAmountsToProvenance(
+  provenance: AmountProvenance[],
+  renderedAmounts: RenderedAmount[],
+): (number | null)[] {
+  const candidates: AmountMatchCandidate[] = [];
+
+  renderedAmounts.forEach((rendered, renderedIndex) => {
+    provenance.forEach((record, recordIndex) => {
+      if (
+        Math.abs(record.value - rendered.value) > RENDERED_TOLERANCE ||
+        !unitsAreCompatible(record, rendered)
+      ) {
+        return;
+      }
+      candidates.push({
+        renderedIndex,
+        recordIndex,
+        distance: stepDistance(record.step_index, rendered.step_index),
+      });
+    });
+  });
+
+  // Nearest first. Ties (including the all-sentinel case, where every
+  // distance is Infinity) fall back to rendered-array order, then
+  // provenance-array order — see the D4 comment block above for why.
+  // Compared with `<`/`!==` rather than subtraction so that comparing two
+  // Infinity distances (two sentinel candidates) never produces NaN.
+  candidates.sort((a, b) => {
+    if (a.distance !== b.distance) {
+      return a.distance < b.distance ? -1 : 1;
+    }
+    if (a.renderedIndex !== b.renderedIndex) {
+      return a.renderedIndex - b.renderedIndex;
+    }
+    return a.recordIndex - b.recordIndex;
+  });
+
+  const matchForRendered: (number | null)[] = renderedAmounts.map(() => null);
+  const recordConsumed: boolean[] = provenance.map(() => false);
+
+  for (const candidate of candidates) {
+    if (matchForRendered[candidate.renderedIndex] !== null) {
+      continue;
+    }
+    if (recordConsumed[candidate.recordIndex]) {
+      continue;
+    }
+    matchForRendered[candidate.renderedIndex] = candidate.recordIndex;
+    recordConsumed[candidate.recordIndex] = true;
+  }
+
+  return matchForRendered;
+}
+
 /**
  * Verifies that every emitted amount traces to a source fact.
  *
@@ -404,19 +558,15 @@ export function verifyAmountProvenance(
     };
   }
 
-  const unconsumed = args.provenance.map((record) => ({
-    record,
-    consumed: false,
-  }));
+  const matches = matchRenderedAmountsToProvenance(
+    args.provenance,
+    args.renderedAmounts,
+  );
 
-  for (const rendered of args.renderedAmounts) {
-    const candidate = unconsumed.find((entry) =>
-      !entry.consumed &&
-      Math.abs(entry.record.value - rendered.value) <= RENDERED_TOLERANCE &&
-      unitsAreCompatible(entry.record, rendered)
-    );
+  for (const [renderedIndex, rendered] of args.renderedAmounts.entries()) {
+    const recordIndex = matches[renderedIndex];
 
-    if (!candidate) {
+    if (recordIndex === null) {
       findings.push({
         code: "unverifiable_amount",
         step_index: rendered.step_index,
@@ -429,8 +579,7 @@ export function verifyAmountProvenance(
       continue;
     }
 
-    candidate.consumed = true;
-    const record = candidate.record;
+    const record = args.provenance[recordIndex];
 
     // Steps get folded (pre-timer preparation content absorbed into the
     // preparation step), split (one extraction step's two pour targets

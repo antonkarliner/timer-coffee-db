@@ -11205,6 +11205,449 @@ Deno.test("F32: a rendering that already matches its literal record is left unto
 });
 
 // ---------------------------------------------------------------------
+// D2 (plan 020 §3, §5 item 3) — F32 must consult unit_kind before binding a
+// literal provenance record to an expression: a "volume" record must never
+// repair a <final_coffee_amount> expression, however its value/step_index
+// line up. Reproduces the confirmed live defect (cold-brew capture
+// 5b3b8661-a22c-4088-9e8e-9cf45793dc9c): extracted_amounts carried a
+// step-0 { value: 4, unit: "cups", unit_kind: "volume" } record for "4
+// cups" of WATER alongside the real 82 g coffee dose, and the old
+// (unit_kind-blind) F32 matched the two by step_index/placeholder alone,
+// "repairing" a correct coffee multiplier of 1 down to 4/82 and rendering
+// "Grind 4g coffee" against an 82 g recipe.
+// ---------------------------------------------------------------------
+
+Deno.test("D2/F32: a step-level 'volume' record never repairs a <final_coffee_amount> expression (cold-brew shape)", async () => {
+  const calls: Array<{ provider: string; stage: string }> = [];
+  const normalizedBase = createF32Normalized({
+    coffeeAmount: 82,
+    waterAmount: 946,
+  });
+  // Already numerically correct: 1 x 82 = 82g, the real dose. Nothing here
+  // needs repairing — the only thing on offer is the wrong-kind "4 cups"
+  // record, and it must be refused.
+  const original =
+    "Grind (1 x <final_coffee_amount>)g coffee very coarse. Combine with cold filtered water in a large jar or pitcher.";
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction: {
+          ...createF32Extraction({ coffeeAmount: 82, waterAmount: 946 }),
+          extracted_amounts: [
+            {
+              value: 4,
+              unit: "cups",
+              step_index: 0,
+              provenance: "literal",
+              source_quote: "4 cups",
+              rule: null,
+              rule_source_quote: null,
+              rule_inputs: null,
+              unit_kind: "volume",
+            },
+            {
+              value: 82,
+              unit: "grams",
+              step_index: -1,
+              provenance: "literal",
+              source_quote: "82g coffee",
+              rule: null,
+              rule_source_quote: null,
+              rule_inputs: null,
+              unit_kind: "mass",
+            },
+          ],
+        },
+        normalized: {
+          ...normalizedBase,
+          steps: [
+            {
+              ...normalizedBase.steps[0],
+              description_template: original,
+            },
+            normalizedBase.steps[1],
+            normalizedBase.steps[2],
+          ],
+        },
+        calls,
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text:
+      "Grind 82g coffee very coarse. Combine with 4 cups cold filtered water in a large jar or pitcher.",
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Cold Brew" },
+    ],
+    requestId: "req-d2-cold-brew-volume-guard",
+  });
+
+  assertEquals(
+    result.draft.steps[0].description_template,
+    original,
+    "Expected the volume record to be refused, leaving the already-correct coffee expression untouched.",
+  );
+  assert(
+    result.draft.steps[0].expressions.some((expression) =>
+      expression.preview_value === 82
+    ),
+    `Expected the coffee expression to still preview as 82 (the real dose), got: ${
+      JSON.stringify(result.draft.steps[0].expressions)
+    }`,
+  );
+  assert(
+    !result.warnings.some((warning) => warning.includes("F32 repair")),
+    `Expected no F32 repair when the only candidate record is a volume record against a coffee-mass expression, got: ${
+      JSON.stringify(result.warnings)
+    }`,
+  );
+});
+
+Deno.test("D2/F32: a 'mass' unit_kind record still repairs a <final_water_amount> expression (water mass/volume equivalence preserved)", async () => {
+  const calls: Array<{ provider: string; stage: string }> = [];
+  const normalizedBase = createF32Normalized({
+    coffeeAmount: 20,
+    waterAmount: 300,
+  });
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction: {
+          ...createF32Extraction({ coffeeAmount: 20, waterAmount: 300 }),
+          extracted_amounts: [
+            {
+              value: 40,
+              unit: "g",
+              step_index: 1,
+              provenance: "literal",
+              source_quote: "40g",
+              rule: null,
+              rule_source_quote: null,
+              rule_inputs: null,
+              // Explicitly labelled "mass" (not absent) — this is the
+              // asymmetric half of D2's rule: mass is always an
+              // acceptable source-of-truth for a WATER expression, since
+              // water is legitimately measured in both g and ml at
+              // density ~= 1 (same equivalence unit_kind's schema comment
+              // and normalizeUnitForRangeCheck already document). German
+              // round-3 (fb41e2fc) and a Kalita capture both depend on
+              // exactly this direction still firing.
+              unit_kind: "mass",
+            },
+          ],
+        },
+        normalized: {
+          ...normalizedBase,
+          steps: [
+            normalizedBase.steps[0],
+            {
+              ...normalizedBase.steps[1],
+              description_template:
+                "Pour (0.2 x <final_water_amount>)g water and bloom.",
+            },
+            normalizedBase.steps[2],
+          ],
+        },
+        calls,
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text:
+      "Rinse the filter and add 20g of coffee. Add 40g water and bloom. Pour to 300g total and wait 90 seconds.",
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Hario V60" },
+    ],
+    requestId: "req-d2-mass-repairs-water",
+  });
+
+  assertEquals(
+    result.draft.steps[1].description_template,
+    "Pour (0.133333 x <final_water_amount>)g water and bloom.",
+    "Expected the mass literal to still repair the water expression to 40/300 = 0.133333.",
+  );
+  assert(
+    result.warnings.some((warning) =>
+      warning.includes("F32 repair") && warning.includes("0.133333")
+    ),
+    `Expected the usual F32 repair warning, got: ${
+      JSON.stringify(result.warnings)
+    }`,
+  );
+});
+
+Deno.test("D2/F32: backward compatibility — a record with no unit_kind field at all repairs a coffee expression exactly as before this fix", async () => {
+  // This is the mandatory backward-compat case (plan 020 "Backward
+  // compatibility is required"): unit_kind is optional/nullable, and old
+  // captures / all six golden fixtures predate it entirely. An absent
+  // field must never change an existing outcome — including this one,
+  // where the pre-fix behavior (no unit_kind to consult) is to accept
+  // the record. This is deliberately the OLD behavior, preserved on
+  // purpose for the absent-field case; it is not a re-introduction of
+  // D2, because D2 only ever reproduces once unit_kind: "volume" is
+  // actually present and ignored, which the two tests above cover.
+  const calls: Array<{ provider: string; stage: string }> = [];
+  const normalizedBase = createF32Normalized({
+    coffeeAmount: 82,
+    waterAmount: 946,
+  });
+  const original =
+    "Grind (1 x <final_coffee_amount>)g coffee very coarse. Combine with cold filtered water in a large jar or pitcher.";
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction: {
+          ...createF32Extraction({ coffeeAmount: 82, waterAmount: 946 }),
+          extracted_amounts: [
+            {
+              value: 4,
+              unit: "cups",
+              step_index: 0,
+              provenance: "literal",
+              source_quote: "4 cups",
+              rule: null,
+              rule_source_quote: null,
+              rule_inputs: null,
+              // No unit_kind key at all — the old-shape record.
+            },
+          ],
+        },
+        normalized: {
+          ...normalizedBase,
+          steps: [
+            {
+              ...normalizedBase.steps[0],
+              description_template: original,
+            },
+            normalizedBase.steps[1],
+            normalizedBase.steps[2],
+          ],
+        },
+        calls,
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text:
+      "Grind 82g coffee very coarse. Combine with 4 cups cold filtered water in a large jar or pitcher.",
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Cold Brew" },
+    ],
+    requestId: "req-d2-backward-compat-no-unit-kind",
+  });
+
+  assertEquals(
+    result.draft.steps[0].description_template,
+    "Grind (0.0487805 x <final_coffee_amount>)g coffee very coarse. Combine with cold filtered water in a large jar or pitcher.",
+    "Expected the pre-existing (unit_kind-blind) repair behavior to be preserved exactly when unit_kind is absent.",
+  );
+  assert(
+    result.warnings.some((warning) =>
+      warning.includes("F32 repair") && warning.includes("0.0487805")
+    ),
+    `Expected the usual F32 repair warning when unit_kind is absent, got: ${
+      JSON.stringify(result.warnings)
+    }`,
+  );
+});
+
+Deno.test("D2/F32: a 'time' unit_kind record never repairs a coffee OR water expression (a stray duration is not an amount)", async () => {
+  // Same defect shape as the cold-brew "4 cups" case, just a different
+  // wrong kind: a stated duration ("30 seconds") happens to collide in
+  // value with a step's already-correct rendered mass/volume, and F32
+  // must not treat the duration as the amount's source-of-truth. Exercises
+  // BOTH placeholders in one draft: step 0's coffee expression and step
+  // 1's water expression each have their own colliding time record.
+  const calls: Array<{ provider: string; stage: string }> = [];
+  const normalizedBase = createF32Normalized({
+    coffeeAmount: 20,
+    waterAmount: 300,
+  });
+  const coffeeOriginal = "Grind (1 x <final_coffee_amount>)g coffee.";
+  const waterOriginal = "Pour (0.2 x <final_water_amount>)g water and bloom.";
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction: {
+          ...createF32Extraction({ coffeeAmount: 20, waterAmount: 300 }),
+          extracted_amounts: [
+            {
+              value: 20,
+              unit: "s",
+              step_index: 0,
+              provenance: "literal",
+              source_quote: "20 seconds",
+              rule: null,
+              rule_source_quote: null,
+              rule_inputs: null,
+              unit_kind: "time",
+            },
+            {
+              value: 60,
+              unit: "s",
+              step_index: 1,
+              provenance: "literal",
+              source_quote: "60 seconds",
+              rule: null,
+              rule_source_quote: null,
+              rule_inputs: null,
+              unit_kind: "time",
+            },
+          ],
+        },
+        normalized: {
+          ...normalizedBase,
+          steps: [
+            {
+              ...normalizedBase.steps[0],
+              description_template: coffeeOriginal,
+            },
+            {
+              ...normalizedBase.steps[1],
+              description_template: waterOriginal,
+            },
+            normalizedBase.steps[2],
+          ],
+        },
+        calls,
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text:
+      "Grind coffee for 20 seconds. Pour water and bloom for 60 seconds. Pour to 300g total and wait 90 seconds.",
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Hario V60" },
+    ],
+    requestId: "req-d2-time-kind-refused",
+  });
+
+  assertEquals(
+    result.draft.steps[0].description_template,
+    coffeeOriginal,
+    "Expected a 'time' record to be refused against <final_coffee_amount>, leaving the correct rendering untouched.",
+  );
+  assertEquals(
+    result.draft.steps[1].description_template,
+    waterOriginal,
+    "Expected a 'time' record to be refused against <final_water_amount>, leaving the correct rendering untouched.",
+  );
+  assert(
+    !result.warnings.some((warning) => warning.includes("F32 repair")),
+    `Expected no F32 repair from a 'time'-kind record against either placeholder, got: ${
+      JSON.stringify(result.warnings)
+    }`,
+  );
+});
+
+Deno.test("D2/F32: a 'percent' unit_kind record never repairs a coffee OR water expression (a stated ratio is not an amount)", async () => {
+  // Same shape again with unit_kind 'percent' (e.g. a stated ratio like
+  // "6%" TDS or a brew-ratio percentage mentioned in passing) — neither a
+  // coffee nor a water amount, so it must never source-of-truth either
+  // placeholder.
+  const calls: Array<{ provider: string; stage: string }> = [];
+  const normalizedBase = createF32Normalized({
+    coffeeAmount: 20,
+    waterAmount: 300,
+  });
+  const coffeeOriginal = "Grind (1 x <final_coffee_amount>)g coffee.";
+  const waterOriginal = "Pour (0.2 x <final_water_amount>)g water and bloom.";
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction: {
+          ...createF32Extraction({ coffeeAmount: 20, waterAmount: 300 }),
+          extracted_amounts: [
+            {
+              value: 20,
+              unit: "%",
+              step_index: 0,
+              provenance: "literal",
+              source_quote: "20%",
+              rule: null,
+              rule_source_quote: null,
+              rule_inputs: null,
+              unit_kind: "percent",
+            },
+            {
+              value: 60,
+              unit: "%",
+              step_index: 1,
+              provenance: "literal",
+              source_quote: "60%",
+              rule: null,
+              rule_source_quote: null,
+              rule_inputs: null,
+              unit_kind: "percent",
+            },
+          ],
+        },
+        normalized: {
+          ...normalizedBase,
+          steps: [
+            {
+              ...normalizedBase.steps[0],
+              description_template: coffeeOriginal,
+            },
+            {
+              ...normalizedBase.steps[1],
+              description_template: waterOriginal,
+            },
+            normalizedBase.steps[2],
+          ],
+        },
+        calls,
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text:
+      "Grind coffee, 20% of total. Pour water and bloom, 60% strength. Pour to 300g total and wait 90 seconds.",
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Hario V60" },
+    ],
+    requestId: "req-d2-percent-kind-refused",
+  });
+
+  assertEquals(
+    result.draft.steps[0].description_template,
+    coffeeOriginal,
+    "Expected a 'percent' record to be refused against <final_coffee_amount>, leaving the correct rendering untouched.",
+  );
+  assertEquals(
+    result.draft.steps[1].description_template,
+    waterOriginal,
+    "Expected a 'percent' record to be refused against <final_water_amount>, leaving the correct rendering untouched.",
+  );
+  assert(
+    !result.warnings.some((warning) => warning.includes("F32 repair")),
+    `Expected no F32 repair from a 'percent'-kind record against either placeholder, got: ${
+      JSON.stringify(result.warnings)
+    }`,
+  );
+});
+
+// ---------------------------------------------------------------------
 // F33 — repairExpressionMultipliersAgainstLiteralProvenance must verify a
 // 'literal' record's source_quote against the request text before trusting
 // it, exactly like G22 (verifyAmountProvenance/quoteAppearsInSource) does
@@ -13104,5 +13547,209 @@ Deno.test("Task C: stated_range is backward compatible — a record with neither
     result.validation.is_publishable,
     true,
     "Expected an old-shape draft (no unit_kind/stated_range fields at all) to publish exactly as before Task C.",
+  );
+});
+
+// ---------------------------------------------------------------------
+// D3 (plan 020 §3 D3, §1 root cause): the recipe-level exemption in
+// findRangeEndpointCollapseIssues must not rest on step_index -1 alone.
+// CONFIRMED on production data (plan 020 task brief): four French-press
+// captures carrying an IDENTICAL raw extraction record (value 60,
+// stated_range {60,70}, step_index -1) split 2 published / 2 falsely
+// blocked, because normalization nondeterministically re-emitted
+// step_index as 0 on two of the four runs. The fix derives recipe-level
+// status from the record's VALUE against this draft's own final
+// recipe.coffee_amount/water_amount — data the model does not get to
+// rewrite after extraction — and keeps step_index < 0 only as
+// corroboration, not the sole oracle.
+// ---------------------------------------------------------------------
+
+Deno.test("D3: a recipe-level range collapse is exempted by VALUE match even when step_index was corrupted to a step index (French-press false-block shape)", async () => {
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction: {
+          ...createExtraction(),
+          extracted_amounts: [
+            ...G22_BASE_AMOUNTS,
+            B1_BLOOM_LITERAL_AMOUNT,
+            {
+              // Same shape as the CONFIRMED production defect: the record's
+              // value (15) equals createNormalized()'s recipe.coffee_amount
+              // (15) exactly, but step_index has been corrupted to 0 (a
+              // real step index) instead of the -1 sentinel — exactly what
+              // normalization did on two of the four French-press captures.
+              // Before D3, this false-blocks; after D3, the value match
+              // exempts it regardless of step_index.
+              value: 15,
+              unit: "g",
+              step_index: 0,
+              provenance: "derived",
+              source_quote: null,
+              rule: "range_endpoint",
+              rule_source_quote: "15-18g",
+              rule_inputs: { low: 15, high: 18, endpoint: 0 },
+              unit_kind: "mass",
+            },
+          ],
+        },
+        normalized: createNormalized(),
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text:
+      "Rinse the filter and add 15g of coffee (a dose stated as 15-18g). Pour 50g of water and bloom for 30 seconds. Pour to 250g total and wait 90 seconds.",
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Hario V60" },
+    ],
+    requestId: "req-d3-value-match-corrupted-sentinel",
+  });
+
+  assert(
+    !result.validation.issues.some((issue) =>
+      issue.code === "range_endpoint_collapsed"
+    ),
+    `Expected no range_endpoint_collapsed issue when the record's value matches recipe.coffee_amount, even with step_index corrupted to 0. Got issues: ${
+      JSON.stringify(result.validation.issues)
+    }`,
+  );
+  assertEquals(
+    result.validation.is_publishable,
+    true,
+    "Expected a recipe-level range collapse (value matches coffee_amount) to stay publishable regardless of step_index.",
+  );
+});
+
+Deno.test("D3 non-regression: a genuine step-level pour range whose value does NOT match coffee_amount or water_amount still blocks, even with unit_kind set (German round-3 shape)", async () => {
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction: {
+          ...createExtraction(),
+          extracted_amounts: [
+            ...G22_BASE_AMOUNTS,
+            B1_BLOOM_LITERAL_AMOUNT,
+            {
+              // Mirrors the German round-3 capture that must stay blocked:
+              // value 42 matches neither createNormalized()'s coffee_amount
+              // (15) nor water_amount (250) — a genuine step-level pour
+              // range collapse, not a restatement of the recipe's own
+              // final target. D3 must not exempt this.
+              value: 42,
+              unit: "ml",
+              step_index: 1,
+              provenance: "derived",
+              source_quote: null,
+              rule: "range_endpoint",
+              rule_source_quote: "42-48ml",
+              rule_inputs: { low: 42, high: 48, endpoint: 0 },
+              unit_kind: "volume",
+            },
+          ],
+        },
+        normalized: createNormalized(),
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: `${B1_REQUEST_TEXT} (elsewhere stated as 42-48ml)`,
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Hario V60" },
+    ],
+    requestId: "req-d3-non-regression-step-level",
+  });
+
+  assert(
+    result.validation.issues.some((issue) =>
+      issue.code === "range_endpoint_collapsed"
+    ),
+    `Expected a range_endpoint_collapsed issue for a step-level range whose value matches neither coffee_amount nor water_amount. Got issues: ${
+      JSON.stringify(result.validation.issues)
+    }`,
+  );
+  assertEquals(
+    result.validation.is_publishable,
+    false,
+    "Expected a genuine step-level range collapse to still block, even after D3's value-match exemption.",
+  );
+});
+
+Deno.test("D3 decision: a step-level record whose collapsed value equals recipe.water_amount is exempted (restated-final-total case)", async () => {
+  // Deliberate decision (plan 020 §3 D3's second trap, documented in
+  // isRecipeLevelScalarValue's header comment in parser.ts): a step-level
+  // record that restates the recipe's own final water total (e.g. a final
+  // cumulative pour phrased as "top up to 250g", where water_amount is
+  // already 250) is exempted by the SAME value-match rule as the
+  // recipe-level case. Rationale: the physical quantity a value-matching
+  // record names has exactly one legitimate number in this schema
+  // regardless of which step restates it, so collapsing a stated range for
+  // it is not a defect. This is a deliberate broadening, not an accident —
+  // see the header comment for the trade-off being made.
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction: {
+          ...createExtraction(),
+          extracted_amounts: [
+            ...G22_BASE_AMOUNTS,
+            B1_BLOOM_LITERAL_AMOUNT,
+            {
+              // value 250 equals createNormalized()'s water_amount (250)
+              // exactly, recorded at a real step index (the final pour),
+              // with a stated range whose high endpoint (300) never
+              // appears anywhere in the rendered draft.
+              value: 250,
+              unit: "g",
+              step_index: 2,
+              provenance: "derived",
+              source_quote: null,
+              rule: "range_endpoint",
+              rule_source_quote: "250-300g",
+              rule_inputs: { low: 250, high: 300, endpoint: 0 },
+              unit_kind: "mass",
+            },
+          ],
+        },
+        normalized: createNormalized(),
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text:
+      "Rinse the filter and add 15g of coffee. Pour 50g of water and bloom for 30 seconds. Pour to 250g total (stated elsewhere as 250-300g) and wait 90 seconds.",
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Hario V60" },
+    ],
+    requestId: "req-d3-cumulative-pour-equals-water-amount",
+  });
+
+  assert(
+    !result.validation.issues.some((issue) =>
+      issue.code === "range_endpoint_collapsed"
+    ),
+    `Expected no range_endpoint_collapsed issue for a step-level record whose value equals recipe.water_amount (restated final total). Got issues: ${
+      JSON.stringify(result.validation.issues)
+    }`,
+  );
+  assertEquals(
+    result.validation.is_publishable,
+    true,
+    "Expected a step-level range collapse that restates the recipe's own final water_amount to stay publishable, per D3's documented decision.",
   );
 });

@@ -55,10 +55,21 @@
 // any of the three mechanisms above is a HARNESS COVERAGE GAP, not
 // necessarily evidence the underlying fix is missing — see
 // expectations.ts's `harnessCanReplayFix` field, which is false for every
-// such capture, and README.md "Coverage limitation" for what porting the
-// rest would cost. Only captures whose fix lives ENTIRELY inside
+// such capture. Only captures whose fix lives ENTIRELY inside
 // provenance.ts (the Phase 1a unit lexicon — Arabic/Persian/German) are
-// fully provable by this harness alone.
+// fully provable by THIS FILE alone.
+//
+// CLOSED BY PHASE G (plans/020-provenance-oracle-hardening.md §4): all
+// three limitations above are now avoidable — see gate-replay.ts, which
+// calls the REAL finalizeDraftResponse (via parser.ts's exported
+// `replayFinalizeDraftResponseFromStageOutputs`) instead of re-running
+// only provenance.ts. Prefer gate-replay.ts for any capture whose cache
+// entry is gate-replayable (expectations.ts's `gateReplayable` field, or
+// just try it — it reports plainly when a capture's cache entry predates
+// the fidelity fix). This file (replay.ts) is kept for the narrower
+// provenance.ts-only view, which is still useful when iterating on
+// provenance.ts in isolation without needing the full stage_outputs
+// reconstruction gate-replay.ts requires.
 // ===========================================================================
 
 import {

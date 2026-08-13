@@ -66,20 +66,46 @@ export type ExpectationEntry = {
   reason: string;
   /** Which plan phase this expectation depends on landing. "phase0" means
    * it should already hold with only the sourcing fix + Phase 1a (unit
-   * lexicon) in place — no parser.ts change needed. */
+   * lexicon) in place — no parser.ts change needed.
+   *
+   * Phase G (plans/020 §4) addition: entries for that plan's own defects
+   * (D1-D6) use its phase letters (A-F), prefixed `plan020-` to keep them
+   * unambiguous next to plan 016's numbered phases above, which this same
+   * union still carries for the original 31 captures' entries. */
   dependsOn:
     | "phase0-harness-only"
     | "phase1a-unit-lexicon"
     | "phase3a-range-collapse"
     | "phase3b-stated-total-ratio"
     | "phase4-step-renumbering"
-    | "already-correct";
+    | "already-correct"
+    // plan 020 §4 phase letters:
+    | "plan020-phaseA-unit-kind-binding" // D2
+    | "plan020-phaseB-nearest-step-pairing" // D4
+    | "plan020-phaseC-recipe-level-derivation" // D3
+    | "plan020-phaseD-stated-range-backstop" // D1
+    | "plan020-phaseE-fahrenheit-conversion" // D5
+    | "plan020-phaseF-ratio-retune"; // D6
   /** True only when this harness's own verifyAmountProvenance/
-   * verifyTimingProvenance replay is sufficient to prove the expectation.
-   * False means the fix (confirmed landed in parser.ts by direct reading)
-   * lives entirely outside provenance.ts, so this harness's verdict for
-   * that capture is NOT evidence either way — see the module doc above. */
+   * verifyTimingProvenance replay (replay.ts) is sufficient to prove the
+   * expectation. False means the fix (confirmed landed in parser.ts by
+   * direct reading) lives entirely outside provenance.ts, so replay.ts's
+   * verdict for that capture is NOT evidence either way — see the module
+   * doc above. Phase G note: this field documents replay.ts's OLDER,
+   * narrower limitation specifically — see `gateReplayable` below for
+   * whether gate-replay.ts (which calls the real finalizeDraftResponse)
+   * can prove it instead. Every plan-020 entry below sets this to `false`
+   * (none of D1-D6 lives inside provenance.ts alone) and `gateReplayable`
+   * to whatever is actually true for that capture's cache entry. */
   harnessCanReplayFix: boolean;
+  /** Phase G (plans/020 §4) addition. True when this capture's cache entry
+   * carries the full per-attempt `parsed` object gate-replay.ts needs
+   * (i.e. `replayGateForCapture` returns `ok: true` for it) — independent
+   * of `harnessCanReplayFix` above. False/omitted for any of the original
+   * 31 captures still in the pre-Phase-G amount-only cache projection;
+   * true for all 21 captures Phase G added. Re-fetching an old capture
+   * with the current fetch.ts query flips this without any code change. */
+  gateReplayable?: boolean;
 };
 
 export const EXPECTATIONS: Record<string, ExpectationEntry> = {
@@ -303,6 +329,188 @@ export const EXPECTATIONS: Record<string, ExpectationEntry> = {
       "Under-specified control — correctly non-publishable in 015 (missing coffee/water amounts, brewing method — outside provenance.ts's scope). Must stay non-publishable throughout for those unrelated reasons. Also exercises the 'repair ran, succeeded per this harness's proxy, but re-emitted an EMPTY extracted_amounts' fallback path in selectAmountProvenanceSource (falls straight to raw extraction, which is also empty here — zero amounts stated in the source).",
     dependsOn: "already-correct",
     harnessCanReplayFix: true,
+  },
+
+  // =========================================================================
+  // Phase G additions (plans/020-provenance-oracle-hardening.md §4/§5) — the
+  // plan-019 exploratory captures, now gate-replayable via gate-replay.ts.
+  // Every reason below states the ACTUAL captured/replayed numbers, verified
+  // against the cache (2026-08-13), not the plan's own description restated
+  // — gate-replay.ts --verbose <id> reproduces every figure quoted here.
+  // =========================================================================
+
+  // --- French press 60-70g dose (D3) ---
+  "37daf1ec-8838-4e91-b6eb-d4cf79eaa3a1": {
+    expectation: "must_publish",
+    reason:
+      "French press 1 — CONFIRMED currently blocked: range_endpoint_collapsed@steps[0]=60 ('The source states a range of 60-70g, but the final draft only shows 60g — the other endpoint (70g) does not appear anywhere in the draft.'). Root cause (D3): normalization overwrote the recipe-level step_index:-1 sentinel to 0 for this run, so findRangeEndpointCollapseIssues no longer exempts it as a recipe-level dose. Same raw extraction as 372dc53f/708572ed, which publish. Must flip to publishable once Phase C derives recipe-level status from the draft (coffee_amount/water_amount match, or absence from any step's rendered text) instead of trusting step_index.",
+    dependsOn: "plan020-phaseC-recipe-level-derivation",
+    harnessCanReplayFix: false,
+    gateReplayable: true,
+  },
+  "0b85af13-2aaa-4828-85e1-efcf11163726": {
+    expectation: "must_publish",
+    reason: "French press 3 — same shape as French press 1 (37daf1ec): range_endpoint_collapsed@steps[0]=60, identical message.",
+    dependsOn: "plan020-phaseC-recipe-level-derivation",
+    harnessCanReplayFix: false,
+    gateReplayable: true,
+  },
+  "372dc53f-a6f3-43be-a753-2b19b801f034": {
+    expectation: "unchanged_control",
+    reason:
+      "French press 2 — CONFIRMED already publishable (0 issues) from the same source text as 37daf1ec/0b85af13; the step_index:-1 sentinel survived normalization intact for this run. Must stay publishable throughout Phase C — this is the control proving the D3 fix must not over-correct into blocking every French-press dose.",
+    dependsOn: "already-correct",
+    harnessCanReplayFix: false,
+    gateReplayable: true,
+  },
+  "708572ed-2f7f-4fe6-84c6-fcd9b0b7570f": {
+    expectation: "unchanged_control",
+    reason:
+      "French press 4 — CONFIRMED already publishable (0 issues), same shape as 372dc53f. ALSO the D6 ratio table's 'French press 4' row: stated 480s, emitted 510s, ratio 1.062. Plan 020 §3 D6 marks this ratio 'borderline' rather than a definite pass/block — genuinely undecided (mark that ONE dimension unknown; do not guess a threshold). The dose-collapse/is_publishable expectation above is unaffected either way and must hold regardless of where Phase F lands the ratio.",
+    dependsOn: "already-correct",
+    harnessCanReplayFix: false,
+    gateReplayable: true,
+  },
+
+  // --- Flash-chilled 150g ice/water collision (D4) ---
+  "73d06a79-5e48-497f-bf71-ebd48426caa4": {
+    expectation: "unknown",
+    reason:
+      "Flash-chilled 1 — CONFIRMED currently blocked with 3 issues: missing_brewing_method (UNRELATED to D4 — brewing method could not be resolved confidently, likely persists after the D4 fix), amount_step_binding_mismatch@steps[0]=150 ('150g was recorded for step 3 but appears on step 1'), and unverifiable_amount@steps[2]=150 ('Step 3 states 150g, which does not trace to any amount recorded from the source'). D4's acceptance test is narrower than overall is_publishable: those exact two identities must both disappear once Phase B pairs by nearest step_index instead of array order — is_publishable overall is marked 'unknown' here because the unrelated missing_brewing_method issue may keep this non-publishable regardless.",
+    dependsOn: "plan020-phaseB-nearest-step-pairing",
+    harnessCanReplayFix: false,
+    gateReplayable: true,
+  },
+  "3d163320-5d44-4251-9a53-becbf4a9da06": {
+    expectation: "unknown",
+    reason: "Flash-chilled 2 — same shape and same 3 issues as 73d06a79. The amount_step_binding_mismatch@steps[0]=150 and unverifiable_amount@steps[2]=150 identities must disappear once Phase B lands.",
+    dependsOn: "plan020-phaseB-nearest-step-pairing",
+    harnessCanReplayFix: false,
+    gateReplayable: true,
+  },
+  "01753dba-08b7-477b-980c-d71e45956c43": {
+    expectation: "unknown",
+    reason: "Flash-chilled 3 — the '150g collision' capture named explicitly in the Phase G task brief. Same shape and same 3 issues as 73d06a79/3d163320.",
+    dependsOn: "plan020-phaseB-nearest-step-pairing",
+    harnessCanReplayFix: false,
+    gateReplayable: true,
+  },
+  "2c6f58de-62ff-4936-8ccd-299fcbc76129": {
+    expectation: "unchanged_control",
+    reason:
+      "Flash-chilled 4 — 'escaped it' per the task brief: CONFIRMED only 1 issue (missing_brewing_method, unrelated to D4) and NEITHER amount_step_binding_mismatch NOR unverifiable_amount from the 150g collision, by ordering luck (array-order matching happened to pair correctly this run). Must stay free of those two identities through Phase B — the control proving the nearest-step-index fix does not regress the already-correct ordering-luck case.",
+    dependsOn: "already-correct",
+    harnessCanReplayFix: false,
+    gateReplayable: true,
+  },
+
+  // --- Moka pot stated-total ratio (D6) ---
+  "e17c14fe-df44-45f5-b11c-11b70a16d44f": {
+    expectation: "must_block",
+    reason:
+      "Moka pot 1 — CONFIRMED stated 240s, emitted 270s, ratio 1.125, currently publishable (0 issues; below the current factor-of-2 TOTAL_BREW_TIME_BLOCKING_RATIO). Plan 020 §3 D6's own table marks this 'should be: block' once Phase F tightens the ratio into the 1.05-1.10 range it identifies as having headroom over the cold-brew control (1.0003) while still catching this defect.",
+    dependsOn: "plan020-phaseF-ratio-retune",
+    harnessCanReplayFix: false,
+    gateReplayable: true,
+  },
+  "791a4275-d902-4de2-9972-5b85b5b23111": {
+    expectation: "unchanged_control",
+    reason:
+      "Moka pot 2 — CONFIRMED stated 240s, emitted 490s, ratio 2.04, currently blocked (total_brew_time_mismatch). Must remain blocked at any reasonable Phase F threshold (well above even the loosest 1.05-1.10 target).",
+    dependsOn: "already-correct",
+    harnessCanReplayFix: false,
+    gateReplayable: true,
+  },
+  "c4637750-429b-4f08-a36d-6af5f8fdcc20": {
+    expectation: "unchanged_control",
+    reason: "Moka pot 3 — same shape as 791a4275: 240s/490s, ratio 2.04, currently blocked, must remain blocked.",
+    dependsOn: "already-correct",
+    harnessCanReplayFix: false,
+    gateReplayable: true,
+  },
+  "ce4ad3b0-7d82-4062-b8f0-c1f2717b8880": {
+    expectation: "unchanged_control",
+    reason:
+      "Moka pot 4 — the '490s, blocked' capture named explicitly in the Phase G task brief. Same shape as 791a4275/c4637750: 240s/490s, ratio 2.04, currently blocked, must remain blocked.",
+    dependsOn: "already-correct",
+    harnessCanReplayFix: false,
+    gateReplayable: true,
+  },
+
+  // --- AeroPress 5s-stir minimum-duration rewrite (D7 — EXPLICITLY OUT OF
+  // SCOPE for plan 020, per its §7: needs a product decision first, do not
+  // implement). Recorded here only as unchanged controls so a future phase
+  // does not mistake a D7-related regression for an in-scope one. ---
+  "c3417c7a-e876-46e7-9958-f6a2273e1ae2": {
+    expectation: "unchanged_control",
+    reason:
+      "AeroPress 1 — CONFIRMED currently publishable (0 issues). Exercises D7 (5s stir expanded to the 10s minimum, shifting later landmarks) — plan 020 §7 explicitly excludes D7 from this plan pending a product decision, so nothing here should change across any of plan 020's phases. Recorded as a control so a future phase can tell a D7-caused regression apart from an in-scope one.",
+    dependsOn: "already-correct",
+    harnessCanReplayFix: false,
+    gateReplayable: true,
+  },
+  "16939b9a-b905-42ab-963a-dfd30683c367": {
+    expectation: "unchanged_control",
+    reason: "AeroPress 2 — same shape as c3417c7a: currently publishable, D7-only, out of scope, must stay unchanged.",
+    dependsOn: "already-correct",
+    harnessCanReplayFix: false,
+    gateReplayable: true,
+  },
+  "f1f84ece-e327-4d33-add5-5f09ee8150da": {
+    expectation: "unchanged_control",
+    reason: "AeroPress 3 — same shape as c3417c7a: currently publishable, D7-only, out of scope, must stay unchanged.",
+    dependsOn: "already-correct",
+    harnessCanReplayFix: false,
+    gateReplayable: true,
+  },
+  "c849207d-a238-4669-860d-594f1befbf40": {
+    expectation: "unchanged_control",
+    reason: "AeroPress 4 — same shape as c3417c7a: currently publishable, D7-only, out of scope, must stay unchanged.",
+    dependsOn: "already-correct",
+    harnessCanReplayFix: false,
+    gateReplayable: true,
+  },
+
+  // --- Round-3 German 50-70g range (D1) ---
+  "b2cf9abd-30de-4879-af6d-95380cc0c65f": {
+    expectation: "must_publish",
+    reason:
+      "German round-3, 1 — CONFIRMED currently blocked: range_endpoint_collapsed@steps[2]=50 ('The source states a range of 50-70g, but the final draft only shows 50g — the other endpoint (70g) does not appear anywhere in the draft.'). D1's own mechanism: normalization stopped emitting a record per endpoint once stated_range existed as a metadata slot, and the render collapsed to match. Acceptance test (plans/020 §5 item 4): both endpoints (50g AND 70g) must render once Phase D's deterministic both-endpoint backstop lands — check via gate-replay.ts --verbose's rendered-steps diff, not just is_publishable.",
+    dependsOn: "plan020-phaseD-stated-range-backstop",
+    harnessCanReplayFix: false,
+    gateReplayable: true,
+  },
+  "fb41e2fc-00bd-4924-81a1-65e5f3c21d18": {
+    expectation: "must_publish",
+    reason:
+      "German round-3, 2 — same shape as b2cf9abd: range_endpoint_collapsed@steps[2]=50. ALSO the only one of the four whose cumulative_rewrite stage actually ran and was accepted (confirmed via gate-replay.ts's diagnostics: cumulativeRewriteApplied=true) — proof the gate replay's cumulative_rewrite acceptance path (validateCumulativeRewriteSteps/validateRewrittenStepTemplates/revertUntraceableRangeCumulativeRewrites) is exercised and still reproduces the captured verdict exactly (0 captured-only/replayed-only identities).",
+    dependsOn: "plan020-phaseD-stated-range-backstop",
+    harnessCanReplayFix: false,
+    gateReplayable: true,
+  },
+  "51bc8f5d-d495-4812-a16c-bb196e68efc5": {
+    expectation: "must_publish",
+    reason: "German round-3, 3 — same shape as b2cf9abd: range_endpoint_collapsed@steps[2]=50.",
+    dependsOn: "plan020-phaseD-stated-range-backstop",
+    harnessCanReplayFix: false,
+    gateReplayable: true,
+  },
+  "39cface0-4ad0-4131-974d-02e8061db512": {
+    expectation: "must_publish",
+    reason: "German round-3, 4 — same shape as b2cf9abd: range_endpoint_collapsed@steps[2]=50.",
+    dependsOn: "plan020-phaseD-stated-range-backstop",
+    harnessCanReplayFix: false,
+    gateReplayable: true,
+  },
+
+  // --- Round-3 cold brew 4 cups / 82g coffee-mass mis-binding (D2) ---
+  "5b3b8661-a22c-4088-9e8e-9cf45793dc9c": {
+    expectation: "unknown",
+    reason:
+      "Cold brew round-3 — CONFIRMED reproduces D2 exactly: extracted_amounts carries {value:4, unit:'cups', unit_kind:'volume', step_index:0} (source '4 cups') alongside the real dose {value:82, unit:'grams', unit_kind:'mass', step_index:-1}; F32's multiplier repair binds the coffee expression to the volume record, rendering steps[0] as 'Grind 4g coffee very coarse...' against an 82g recipe. NOT a validation.issues code at all — G22 traces it as a legitimate literal, so it is invisible to identity-based issue comparison. Acceptance test (plans/020 §5 item 3) is a direct rendered-text check: use gate-replay.ts --verbose's rendered-steps diff, not the issues list. Currently non-publishable for two UNRELATED reasons (missing_water_temp, missing_brewing_method) that likely persist after Phase A lands, so overall is_publishable is marked unknown rather than guessed.",
+    dependsOn: "plan020-phaseA-unit-kind-binding",
+    harnessCanReplayFix: false,
+    gateReplayable: true,
   },
 };
 

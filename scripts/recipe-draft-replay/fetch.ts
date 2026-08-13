@@ -60,7 +60,7 @@ async function fetchCapture(
   const url = new URL("/rest/v1/parse_user_recipe_draft_captures", baseUrl);
   url.searchParams.set(
     "select",
-    "id,request_mode,request_text,stage_outputs,response",
+    "id,request_mode,request_text,request_brewing_method_id,request_source_language_hint,stage_outputs,response",
   );
   url.searchParams.set("id", `eq.${id}`);
 
@@ -84,6 +84,8 @@ async function fetchCapture(
     id: string;
     request_mode: string;
     request_text: string;
+    request_brewing_method_id: string | null;
+    request_source_language_hint: string | null;
     stage_outputs: unknown;
     response: CaptureRow["response"];
   }>;
@@ -98,14 +100,17 @@ async function fetchCapture(
     id: row.id,
     request_mode: row.request_mode,
     request_text: row.request_text,
+    request_brewing_method_id: row.request_brewing_method_id,
+    request_source_language_hint: row.request_source_language_hint,
     response: row.response,
-    // Full stage_outputs, untrimmed. The MCP-fetched cache entries store a
+    // Full stage_outputs, untrimmed (every attempt's full `.parsed` object,
+    // not just `extracted_amounts` — required since the Phase G fidelity
+    // fix for gate-reconstruct.ts to work at all; see reconstruct.ts's
+    // StageAttempt doc comment). The MCP-fetched cache entries store a
     // PROJECTION of this same field (per stage: {attempt, provider, model,
-    // error, extracted_amounts}) to keep the checked-in cache file small; a
-    // live fetch has no such size pressure, so it stores the field whole.
-    // Both shapes satisfy CaptureRow["stage_outputs"] — reconstruct.ts only
-    // ever reads `.parsed.extracted_amounts` / the projected
-    // `extracted_amounts` off each stage's attempts.
+    // error, parsed}) to keep the checked-in cache file smaller; a live
+    // fetch has no such size pressure, so it stores the field whole. Both
+    // shapes satisfy CaptureRow["stage_outputs"].
     // deno-lint-ignore no-explicit-any
     stage_outputs: row.stage_outputs as any,
   };

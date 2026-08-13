@@ -116,6 +116,11 @@ export type CaptureDraftStep = {
   description_source: string;
   description_template: string;
   duration_is_stated: boolean;
+  // Present on every captured response.draft.steps entry (DraftStep.
+  // preview_text, parser.ts) but unused by the amount/timing reconstruction
+  // above — typed here only so gate-replay.ts's rendered-text diff (Phase G,
+  // plans/020 §4) can read it without an `any` cast.
+  preview_text?: string;
 };
 
 export type CaptureExtractedAmount = AmountProvenance;
@@ -148,18 +153,40 @@ export type CaptureResponse = {
  * needs (see the fetch query documented in README.md): identity
  * (attempt/provider/model), the transport/schema-validation `error` a
  * provider call surfaced (mirrors createStageAttemptRecorder's `error`
- * field, parser.ts:6298-6327), and that attempt's OWN `extracted_amounts`
- * (from `parsed.extracted_amounts` in the real capture row — see
- * normalizedDraftSchema/extractionSchema, parser.ts:190-258).
- * cumulative_rewrite attempts never carry `extracted_amounts` at all
- * (cumulativeRewriteSchema has no such field — parser.ts:261-264), so it
- * is optional here and always absent for that stage.
+ * field, parser.ts:6298-6327), and that attempt's full, schema-validated
+ * `parsed` output (`result` from `input.schema.parse(parsedJson)` inside
+ * `invokeJson`, parser.ts ~2064-2069 — the SAME object
+ * `createStageAttemptRecorder` stores verbatim as `StageCaptureEntry.parsed`
+ * and the DB persists whole in `service.parse_user_recipe_draft_captures
+ * .stage_outputs`).
+ *
+ * FIDELITY FIX (Phase G, plans/020 §4): an earlier version of this type
+ * only carried a stage attempt's `extracted_amounts` — enough to replay
+ * verifyAmountProvenance/verifyTimingProvenance in isolation (replay.ts),
+ * but NOT enough to reconstruct finalizeDraftResponse's actual input,
+ * which needs the attempt's full `steps`/`recipe`/`localization`/
+ * `warnings`/`detected_input_language` (normalization/repair) or
+ * `steps`/`warnings` (cumulative_rewrite). `parsed` now carries the whole
+ * object; gate-reconstruct.ts derives `extracted_amounts` from
+ * `parsed.extracted_amounts` when it needs the amount-only view.
+ * cumulative_rewrite attempts' `parsed` never carries `extracted_amounts`
+ * at all (cumulativeRewriteSchema has no such field — parser.ts:261-264).
  */
 export type StageAttempt = {
   attempt: number;
   provider: unknown;
   model: unknown;
   error: string | null;
+  parsed?: Record<string, unknown> | null;
+  // DEPRECATED, read-only-for-backward-compat: the pre-Phase-G cache
+  // projection carried only this field (no `parsed`). Captures fetched
+  // before 2026-08-13 (the original 31; see README.md) are still cached in
+  // this shape and are NOT gate-replayable (gate-reconstruct.ts reports
+  // them as such, by name) — but their amount-only provenance.ts replay
+  // (replay.ts, selectAmountProvenanceSource below) must keep working
+  // unchanged, so this field is read as a fallback whenever `parsed` is
+  // absent. Never populated by a fresh fetch; new cache entries only ever
+  // set `parsed`.
   extracted_amounts?: CaptureExtractedAmount[] | null;
 };
 
@@ -174,12 +201,22 @@ export type CaptureRow = {
   id: string;
   request_mode: string;
   request_text: string;
+  // Phase G (plans/020 §4): needed by gate-reconstruct.ts to reproduce
+  // resolveBrewingMethodId's/getMissingSourceOnlyFields' inputs faithfully.
+  // Absent on captures cached before this fidelity fix; gate-reconstruct.ts
+  // treats a missing value the same as the live request did (undefined/
+  // null, i.e. "no hint supplied"), which is what production actually saw
+  // whenever the capture predates this column being selected.
+  request_brewing_method_id?: string | null;
+  request_source_language_hint?: string | null;
   response: CaptureResponse;
   // Per-stage attempts, projected to {attempt, provider, model, error,
-  // extracted_amounts} — see fetch.ts / README.md for the exact query.
-  // Absent for a capture cached before this fidelity fix (2026-08-12);
+  // parsed} — see fetch.ts / README.md for the exact query. Absent for a
+  // capture cached before the 2026-08-12 fidelity fix;
   // `selectAmountProvenanceSource` degrades to raw extraction, LABELLED,
-  // when this is missing.
+  // when this is missing. A capture whose stage_outputs predates the
+  // Phase G fidelity fix (parsed-per-attempt, not just extracted_amounts)
+  // cannot be gate-replayed at all — see gate-reconstruct.ts.
   stage_outputs?: CaptureStageOutputs;
 };
 
@@ -232,6 +269,21 @@ function countNonErroringAttempts(attempts: StageAttempt[] | undefined) {
   return attempts.filter((attempt) => !attempt.error).length;
 }
 
+/** Reads an attempt's extracted_amounts from whichever shape this cache
+ * entry actually carries — the current full-`parsed` format, or the
+ * legacy amount-only projection (see StageAttempt's `extracted_amounts`
+ * doc comment). Prefers `parsed` when both are somehow present. */
+function attemptExtractedAmounts(
+  attempt: StageAttempt,
+): CaptureExtractedAmount[] {
+  if (attempt.parsed) {
+    return (attempt.parsed.extracted_amounts as
+      | CaptureExtractedAmount[]
+      | undefined) ?? [];
+  }
+  return attempt.extracted_amounts ?? [];
+}
+
 export function selectAmountProvenanceSource(
   capture: CaptureRow,
 ): AmountProvenanceSource {
@@ -254,7 +306,7 @@ export function selectAmountProvenanceSource(
   const repairAttempt = lastAttemptWithoutError(stageOutputs.repair);
 
   if (repairAttempt) {
-    const repairRecords = repairAttempt.extracted_amounts ?? [];
+    const repairRecords = attemptExtractedAmounts(repairAttempt);
     if (repairRecords.length > 0) {
       return {
         records: repairRecords,
@@ -290,8 +342,9 @@ export function selectAmountProvenanceSource(
     stageOutputs.normalization,
   );
   if (normalizationAttempt) {
-    const normalizationRecords = normalizationAttempt.extracted_amounts ??
-      [];
+    const normalizationRecords = attemptExtractedAmounts(
+      normalizationAttempt,
+    );
     if (normalizationRecords.length > 0) {
       return {
         records: normalizationRecords,

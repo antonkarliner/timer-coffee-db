@@ -5458,24 +5458,112 @@ function resolveRangeEndpointTrigger(
   return null;
 }
 
+// D3 (plan 020 §3 D3, §1 root cause): step_index -1 is an LLM-authored
+// sentinel — normalization is free to re-emit it as 0 on any given run
+// (see the class header comment on findRangeEndpointCollapseIssues below),
+// and CONFIRMED production data shows it does, about half the time, on
+// byte-identical extraction. Four French-press captures with an identical
+// raw record (`value 60, stated_range {60,70}, step_index: -1`) split
+// 2 published / 2 falsely blocked purely on what normalization happened to
+// re-emit for step_index. Trusting the sentinel alone is therefore not a
+// safe oracle for "is this a recipe-level scalar."
+//
+// This function derives the same judgement from data the model does not
+// get to rewrite after the fact: does the record's own value equal this
+// draft's own final recipe.coffee_amount or recipe.water_amount? Those two
+// fields are single numbers by schema (see the class header comment below)
+// — verified against the French-press captures, whose collapsed dose
+// record (value 60) equals recipe.coffee_amount (60) in all four runs,
+// including the two whose step_index had already been corrupted to 0. The
+// German round-3 capture that must stay blocked (D1's territory — a
+// genuine step-level pour collapse) has a collapsed record of value 50
+// against coffee_amount 20 / water_amount 300: neither matches, so this
+// function does not exempt it.
+//
+// Deliberate decision (plan 020 §3 D3's second trap): a STEP-level record
+// (step_index >= 0) whose value equals recipe.water_amount is exempted by
+// this same rule, not just a record at the recipe level. Rationale: the
+// physical quantity a value-matching record names — the recipe's OWN final
+// coffee dose or final water total — has exactly one legitimate number in
+// this schema regardless of which step happens to restate it (e.g. a final
+// cumulative pour phrased as "top up to 300g" when water_amount is already
+// 300). Collapsing a stated range for that quantity to the single final
+// value is the same "not representable, so collapsing is correct" case
+// plan 016 already settled for the recipe-level sentinel, extended to
+// wherever the recipe's own final target is restated. This does trade away
+// a narrow slice of coverage — a genuinely different step-level amount that
+// happens to numerically equal the final coffee/water target by
+// coincidence would also be exempted — but the coincidence is unlikely
+// (confirmed absent from every capture inspected: German's real step-level
+// collapse is 50 against 20/300, not a coincidental match) and the
+// alternative (never exempting a step-level match) would re-introduce a
+// false block for the legitimate "restated final total" case with no way
+// to tell the two apart from this record's shape alone.
+//
+// unit_kind gates which comparison applies, permissively: a "volume"-kind
+// record can equal water_amount (grams/millilitres are treated as
+// interchangeable for water elsewhere in this file and in provenance.ts's
+// own unit lexicon) but never coffee_amount (coffee is never expressed in
+// volume in this schema). A "mass"-kind or absent unit_kind record may
+// match either. This is a permissive gate, not a strict requirement, so an
+// old-shape record predating unit_kind (unit_kind absent) is unaffected.
+function isRecipeLevelScalarValue(
+  record: AmountProvenanceRecord,
+  recipeCoffeeAmount: number | null,
+  recipeWaterAmount: number | null,
+): boolean {
+  const allowsCoffeeComparison = record.unit_kind !== "volume";
+  const allowsWaterComparison = record.unit_kind !== "time" &&
+    record.unit_kind !== "percent";
+
+  if (
+    allowsCoffeeComparison &&
+    recipeCoffeeAmount !== null &&
+    Math.abs(record.value - recipeCoffeeAmount) <=
+      RANGE_ENDPOINT_MATCH_TOLERANCE
+  ) {
+    return true;
+  }
+  if (
+    allowsWaterComparison &&
+    recipeWaterAmount !== null &&
+    Math.abs(record.value - recipeWaterAmount) <=
+      RANGE_ENDPOINT_MATCH_TOLERANCE
+  ) {
+    return true;
+  }
+  return false;
+}
+
 function findRangeEndpointCollapseIssues(
   provenance: AmountProvenanceRecord[],
   renderedAmounts: RenderedAmount[],
+  recipeCoffeeAmount: number | null,
+  recipeWaterAmount: number | null,
 ): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
 
   for (const record of provenance) {
-    // B1 (plan 016 §3 D4′, §4 Task B): step_index -1 is the recipe-level
-    // sentinel (e.g. coffee_amount, water_amount) rather than a specific
-    // step's amount. A recipe-level scalar is a single number by schema —
-    // "brew 20-24g" is not representable, so collapsing it to one endpoint
-    // is the CORRECT outcome, not a defect. Without this guard, a German
-    // capture's dose stated as "20-24g" (rule_inputs {low: 20, high: 24,
-    // endpoint: 0}, step_index: -1) trips this check and is falsely
-    // blocked — the very draft this plan exists to unblock. Step-level
-    // records (step_index >= 0, e.g. Spanish's collapsed bloom) are
-    // unaffected by this guard and are still checked below.
-    if (record.step_index < 0) {
+    // B1 (plan 016 §3 D4′, §4 Task B), hardened by D3 (plan 020 §3 D3): a
+    // recipe-level scalar (e.g. coffee_amount, water_amount) is a single
+    // number by schema — "brew 20-24g" is not representable, so collapsing
+    // it to one endpoint is the CORRECT outcome, not a defect. Two
+    // independent signals feed this judgement, and either is sufficient:
+    //
+    // 1. record.step_index < 0 — the LLM-authored recipe-level sentinel.
+    //    Kept as CORROBORATION only (plan 020 §1's framing), not the sole
+    //    oracle: normalization is free to re-emit this as 0 on any given
+    //    run (CONFIRMED — see isRecipeLevelScalarValue's header comment),
+    //    so trusting it alone reproduces D3's ~50% false-block rate.
+    // 2. isRecipeLevelScalarValue — a deterministic check against data the
+    //    model does not get to rewrite after extraction: does this
+    //    record's value equal the FINAL draft's own recipe.coffee_amount
+    //    or recipe.water_amount. This is what actually fixes D3, and it
+    //    does not depend on step_index surviving normalization intact.
+    if (
+      record.step_index < 0 ||
+      isRecipeLevelScalarValue(record, recipeCoffeeAmount, recipeWaterAmount)
+    ) {
       continue;
     }
 
@@ -5610,6 +5698,72 @@ function findExpressionOccurrences(template: string): ExpressionOccurrence[] {
   return occurrences;
 }
 
+// D2 (plan 020 §3, §4 Phase A): F32 below matches a literal provenance
+// record to an expression occurrence by value/step_index/placeholder-base
+// alone — it has no opinion on whether the record's own DIMENSION could
+// ever be the thing the placeholder represents. Confirmed defect: a cold
+// brew capture recorded { value: 4, unit: "cups", unit_kind: "volume",
+// step_index: 0 } for "4 cups" of water alongside the real dose
+// { value: 82, unit: "grams", unit_kind: "mass", step_index: -1 }. F32 saw
+// step 0's <final_coffee_amount> expression render ~82 g, found the sole
+// step-0 literal record was the 4-cups volume record, and "repaired" the
+// COFFEE multiplier to 4/82 — rendering "Grind 4g coffee" against an 82 g
+// recipe. Latent since F32 predates unit_kind (016); 016's richer
+// extraction prompt simply started producing step-level volume records
+// where the old prompt produced none for this shape.
+//
+// The rule is a per-placeholder allowlist, not a single-value denylist —
+// deliberately asymmetric between the two placeholders, but never open by
+// default for a *kind* this function has an opinion on:
+//  - <final_coffee_amount> only accepts "mass". Coffee is only ever
+//    weighed, never measured by volume, in any of this project's recipes
+//    — there is no legitimate reading under which a volume literal is the
+//    correct source-of-truth for a coffee-mass expression, however its
+//    value happens to divide out. "time" and "percent" are rejected for
+//    the same reason as "volume": neither is ever a coffee amount, so
+//    binding one to <final_coffee_amount> is the identical defect shape as
+//    the confirmed "4 cups" case — a number that was never an amount
+//    quietly overwriting a real dose (e.g. a stray "30" second record
+//    against a step that also renders "30g").
+//  - <final_water_amount> accepts "mass" and "volume". Water is routinely
+//    stated in both g and ml at density ≈ 1 in real captures — this is not
+//    a guess, it is the same equivalence unit_kind's own schema comment
+//    already documents ("mass and volume are mutually compatible
+//    (density≈1 precedent for water)", see amountProvenanceSchema above)
+//    and the same assumption normalizeUnitForRangeCheck makes a few
+//    hundred lines up. Two confirmed-good repairs depend on exactly this
+//    direction firing unchanged: German round-3 (a "50g" mass literal
+//    repairing a <final_water_amount> expression) and a Kalita capture (a
+//    "200grams" mass literal repairing <final_water_amount>). "time" and
+//    "percent" are rejected here too — a stated brew duration or a stated
+//    ratio percentage is no more a water amount than it is a coffee one,
+//    and no confirmed-good repair depends on either kind reaching this
+//    placeholder. If a real case ever needs a percent/time-labelled record
+//    to repair a water expression, that is a new, deliberate exception to
+//    add with its own evidence — not a default this function should fall
+//    into.
+//  - A record with no unit_kind at all (old captures, all six golden
+//    fixtures — the field is optional+nullable for exactly this reason)
+//    is always compatible with either placeholder, so this rule can never
+//    change the outcome for a draft that predates unit_kind.
+function isRecordCompatibleWithPlaceholder(
+  record: AmountProvenanceRecord,
+  placeholder: ExpressionOccurrence["placeholder"],
+): boolean {
+  const kind = record.unit_kind;
+  if (!kind) {
+    // Backward compatibility (plan 020 §Backward compatibility, CLAUDE.md):
+    // absent/null unit_kind must behave exactly as before this fix — never
+    // reject a binding on the strength of a field the record doesn't have.
+    return true;
+  }
+  if (placeholder === "<final_coffee_amount>") {
+    return kind === "mass";
+  }
+  // <final_water_amount>
+  return kind === "mass" || kind === "volume";
+}
+
 // F32: decides which literal provenance record (if any) repairs which
 // expression occurrence in a single step. Returns a map from occurrence
 // index to the record that should replace its multiplier; an occurrence
@@ -5646,13 +5800,22 @@ function planStepMultiplierRepairs(args: {
   );
 
   if (distinctPlaceholders.size === 1) {
-    if (args.literalRecords.length !== args.occurrences.length) {
+    const [onlyPlaceholder] = distinctPlaceholders;
+    // D2: drop any record whose unit_kind cannot legitimately describe
+    // this placeholder (e.g. a "volume" record against
+    // <final_coffee_amount>) BEFORE the count check below — a record that
+    // gets filtered out here must make the counts fail to line up rather
+    // than being silently paired positionally with the wrong expression.
+    const compatibleRecords = args.literalRecords.filter((record) =>
+      isRecordCompatibleWithPlaceholder(record, onlyPlaceholder)
+    );
+    if (compatibleRecords.length !== args.occurrences.length) {
       // Ambiguous — more/fewer records than expressions to pair them
       // with. Never guess: let G22 report it as it already does.
       return plan;
     }
     args.occurrences.forEach((occurrence, position) => {
-      plan.set(occurrence.index, args.literalRecords[position]);
+      plan.set(occurrence.index, compatibleRecords[position]);
     });
     return plan;
   }
@@ -5666,7 +5829,8 @@ function planStepMultiplierRepairs(args: {
         value: record.value,
         coffeeAmount: args.coffeeAmount,
         waterAmount: args.waterAmount,
-      }) === placeholder
+      }) === placeholder &&
+      isRecordCompatibleWithPlaceholder(record, placeholder)
     );
     if (recordsForBase.length !== occurrencesForBase.length) {
       continue;
@@ -6122,6 +6286,8 @@ function finalizeDraftResponse(input: {
   const rangeEndpointIssues = findRangeEndpointCollapseIssues(
     foldRemappedExtractedAmounts,
     renderedAmounts,
+    normalizedWithBalancedCopy.recipe.coffee_amount,
+    normalizedWithBalancedCopy.recipe.water_amount,
   );
 
   // Enforcement is asymmetric by field and mode (plans/009-recipe-draft-
@@ -6300,6 +6466,339 @@ function finalizeDraftResponse(input: {
   }
 
   return response;
+}
+
+// ===========================================================================
+// PHASE G (plans/020-provenance-oracle-hardening.md §4) — offline gate
+// replay entrypoint.
+// ===========================================================================
+// A THIN wrapper, added solely to widen this file's export surface for
+// scripts/recipe-draft-replay/ — the live request path (index.ts/handler.ts,
+// createRecipeDraftParser().parseDraft) never calls this and its behaviour
+// is completely unchanged by this addition. Nothing above this comment was
+// modified.
+//
+// createRecipeDraftParser's own parseDraft (below) builds `extraction` and
+// `normalized` by invoking LIVE providers, threading each stage's accepted
+// result into the next (extraction -> normalization -> optional repair ->
+// optional cumulative_rewrite) before calling finalizeDraftResponse. This
+// entrypoint reruns EXACTLY that same merge, calling the identical internal
+// functions parseDraft calls (applyExtractionFallbacks,
+// normalizeDraftTemperatures/normalizeExtractionTemperatures,
+// getMissingRequiredRepairFields/getMalformedStepTemplateRepairFields,
+// buildDraftSteps, validateCumulativeRewriteSteps/
+// validateRewrittenStepTemplates, revertUntraceableRangeCumulativeRewrites,
+// getPrimaryLanguageSignal) in the same order and with the same acceptance
+// criteria — never a reimplementation of that judgement — but SOURCES each
+// stage's candidate "attempt" from a pre-recorded array (as captured via
+// capture_stages: true into service.parse_user_recipe_draft_captures and
+// read back offline) instead of invoking a live provider, then calls
+// finalizeDraftResponse itself, unmodified, exactly as parseDraft does.
+//
+// FIDELITY: the one simplification against live behaviour is trusting that
+// the RECORDED attempts array already reflects where production's own
+// provider-fallback loop stopped, and re-deriving ACCEPTANCE (not ordering)
+// from that array in order:
+//   - extraction/normalization: first attempt with no transport/schema
+//     error re-validates cleanly against the real schema. Production stops
+//     at the first schema-validated success for these two stages (no
+//     further semantic check gates acceptance), so this is exact, not an
+//     approximation.
+//   - repair: iterates every attempt in order and, for each one that
+//     transport-succeeded, reruns the SAME
+//     getMissingRequiredRepairFields/getMalformedStepTemplateRepairFields
+//     check production uses to decide acceptance — the first attempt that
+//     clears it is the one production would have accepted. If none does,
+//     repair is treated as not having run, exactly like production leaving
+//     `normalized` untouched when every provider exhausts its attempts.
+//   - cumulative_rewrite: same pattern, using
+//     validateCumulativeRewriteSteps/validateRewrittenStepTemplates as the
+//     acceptance test, then applying revertUntraceableRangeCumulativeRewrites
+//     to the accepted attempt exactly as parseDraft does.
+// See scripts/recipe-draft-replay/gate-reconstruct.ts for the caller that
+// builds this function's input from a capture row.
+
+/** One recorded provider attempt for a single stage, projected down to what
+ * this replay needs. Mirrors StageCaptureEntry's identity/outcome fields;
+ * `parsed` is re-validated against the real stage schema below rather than
+ * trusted as-is, so a capture whose JSON predates a newly-added optional
+ * field still degrades exactly like a live run would. */
+export type ReplayStageAttempt = {
+  provider: string;
+  model: string;
+  error: string | null;
+  parsed: unknown | null;
+};
+
+export type ReplayStageOutputsInput = {
+  extraction: ReplayStageAttempt[];
+  normalization: ReplayStageAttempt[];
+  repair: ReplayStageAttempt[];
+  cumulative_rewrite: ReplayStageAttempt[];
+};
+
+/** Which recorded attempt (if any) this replay actually used for each
+ * stage, and whether repair/cumulative_rewrite were applied — so a caller
+ * can report its sourcing exactly as visibly as
+ * reconstruct.ts's existing `AmountProvenanceSource` does for the
+ * provenance-only replay path (plans/020 §4 Phase G, "label any fallback
+ * visibly, never silently"). */
+export type ReplayDiagnostics = {
+  extractionSource:
+    | { attemptIndex: number; provider: string; model: string }
+    | null;
+  normalizationSource:
+    | { attemptIndex: number; provider: string; model: string }
+    | null;
+  repairApplied: boolean;
+  repairSource:
+    | { attemptIndex: number; provider: string; model: string }
+    | null;
+  repairAttemptsConsidered: number;
+  cumulativeRewriteApplied: boolean;
+  cumulativeRewriteSource:
+    | { attemptIndex: number; provider: string; model: string }
+    | null;
+  cumulativeRewriteAttemptsConsidered: number;
+};
+
+/** Thrown when a capture's recorded stage_outputs genuinely cannot be
+ * reconstructed into valid finalizeDraftResponse input (e.g. every
+ * extraction/normalization attempt errored or fails schema re-validation).
+ * A caller must surface this honestly rather than substituting a plausible
+ * default — see plans/020 §4 Phase G's brief. */
+export class ReplayReconstructionError extends Error {}
+
+export function replayFinalizeDraftResponseFromStageOutputs(input: {
+  stageOutputs: ReplayStageOutputsInput;
+  requestText: string;
+  mode: RecipeDraftParserMode;
+  brewingMethods: BrewingMethodOption[];
+  brewingMethodHint?: string;
+  sourceLanguageHint?: string;
+  userId: string;
+  nowMs: number;
+}): { response: ParseUserRecipeDraftResponse; diagnostics: ReplayDiagnostics } {
+  // --- extraction: first attempt that transport-succeeded AND re-validates
+  // against extractionSchema (mirrors parseDraft's provider loop, which
+  // breaks at the first invokeProviderStageWithRetry success). ---
+  let extraction: ExtractionResult | null = null;
+  let extractionSource: ReplayDiagnostics["extractionSource"] = null;
+  for (let index = 0; index < input.stageOutputs.extraction.length; index++) {
+    const attempt = input.stageOutputs.extraction[index];
+    if (attempt.error || attempt.parsed == null) continue;
+    try {
+      extraction = extractionSchema.parse(attempt.parsed);
+      extractionSource = {
+        attemptIndex: index,
+        provider: attempt.provider,
+        model: attempt.model,
+      };
+      break;
+    } catch {
+      continue;
+    }
+  }
+  if (!extraction) {
+    throw new ReplayReconstructionError(
+      "no captured extraction attempt could be reconstructed (every attempt errored, was null, or failed extractionSchema re-validation) — cannot replay the gate for this capture.",
+    );
+  }
+  extraction = normalizeExtractionTemperatures(extraction);
+
+  // --- normalization: same pattern as extraction. ---
+  let normalized: NormalizedDraft | null = null;
+  let normalizationSource: ReplayDiagnostics["normalizationSource"] = null;
+  for (
+    let index = 0;
+    index < input.stageOutputs.normalization.length;
+    index++
+  ) {
+    const attempt = input.stageOutputs.normalization[index];
+    if (attempt.error || attempt.parsed == null) continue;
+    try {
+      normalized = normalizedDraftSchema.parse(attempt.parsed);
+      normalizationSource = {
+        attemptIndex: index,
+        provider: attempt.provider,
+        model: attempt.model,
+      };
+      break;
+    } catch {
+      continue;
+    }
+  }
+  if (!normalized) {
+    throw new ReplayReconstructionError(
+      "no captured normalization attempt could be reconstructed (every attempt errored, was null, or failed normalizedDraftSchema re-validation) — cannot replay the gate for this capture.",
+    );
+  }
+  normalized = normalizeDraftTemperatures(normalized);
+  normalized = applyExtractionFallbacks({ normalized, extraction });
+
+  // --- repair: only "counts" once the SAME missing/malformed-field check
+  // production uses reports nothing left missing (parser.ts's own repair
+  // loop, mirrored here rather than approximated by a transport-error
+  // proxy). ---
+  let repairApplied = false;
+  let repairSource: ReplayDiagnostics["repairSource"] = null;
+  let repairAttemptsConsidered = 0;
+  for (let index = 0; index < input.stageOutputs.repair.length; index++) {
+    const attempt = input.stageOutputs.repair[index];
+    if (attempt.error || attempt.parsed == null) continue;
+    repairAttemptsConsidered += 1;
+    let repaired: NormalizedDraft;
+    try {
+      repaired = normalizedDraftSchema.parse(attempt.parsed);
+    } catch {
+      continue;
+    }
+    const repairedWithNormalizedTemperatures = normalizeDraftTemperatures(
+      repaired,
+    );
+    const repairedWithFallbacks = applyExtractionFallbacks({
+      normalized: repairedWithNormalizedTemperatures,
+      extraction,
+    });
+    const remainingRepairFields = uniqueStrings([
+      ...getMissingRequiredRepairFields({
+        normalized: repairedWithFallbacks,
+        extraction,
+        brewingMethods: input.brewingMethods,
+        brewingMethodHint: input.brewingMethodHint,
+      }),
+      ...getMalformedStepTemplateRepairFields(repairedWithFallbacks),
+    ]);
+    if (remainingRepairFields.length > 0) {
+      continue;
+    }
+
+    normalized = {
+      ...repairedWithFallbacks,
+      warnings: uniqueStrings([
+        ...repairedWithFallbacks.warnings,
+        "Missing or malformed fields were repaired after re-reading the original text.",
+      ]),
+    };
+    repairApplied = true;
+    repairSource = {
+      attemptIndex: index,
+      provider: attempt.provider,
+      model: attempt.model,
+    };
+    break;
+  }
+
+  // --- cumulative_rewrite: same "same acceptance test as production"
+  // pattern, then the exact same range-safety overlay. Only steps/warnings
+  // change; extracted_amounts/recipe/localization are left untouched,
+  // matching parseDraft. An EMPTY recorded array means the pass was never
+  // attempted (shouldAttemptCumulativeRewritePass was false) — production's
+  // onAttempt fires for every real provider call, so a truly-attempted
+  // stage always leaves at least one recorded entry regardless of outcome;
+  // this lets the replay skip re-deriving that gate itself. ---
+  let skipDeterministicWaterTotals = false;
+  let cumulativeRewriteApplied = false;
+  let cumulativeRewriteSource: ReplayDiagnostics["cumulativeRewriteSource"] =
+    null;
+  let cumulativeRewriteAttemptsConsidered = 0;
+  if (input.stageOutputs.cumulative_rewrite.length > 0) {
+    const provisionalDraftSteps = buildDraftSteps({
+      steps: normalized.steps,
+      coffeeAmount: normalized.recipe.coffee_amount,
+      waterAmount: normalized.recipe.water_amount,
+      mode: input.mode,
+    });
+    for (
+      let index = 0;
+      index < input.stageOutputs.cumulative_rewrite.length;
+      index++
+    ) {
+      const attempt = input.stageOutputs.cumulative_rewrite[index];
+      if (attempt.error || attempt.parsed == null) continue;
+      cumulativeRewriteAttemptsConsidered += 1;
+      let rewritten: CumulativeRewriteResult;
+      try {
+        rewritten = cumulativeRewriteSchema.parse(attempt.parsed);
+      } catch {
+        continue;
+      }
+      const rewriteValidationError = validateCumulativeRewriteSteps({
+        original: normalized.steps,
+        rewritten: rewritten.steps,
+      });
+      if (rewriteValidationError) continue;
+      const rewrittenTemplateValidationError = validateRewrittenStepTemplates(
+        rewritten.steps,
+      );
+      if (rewrittenTemplateValidationError) continue;
+
+      const { steps: rangeSafeSteps, warnings: rangeSafeWarnings } =
+        revertUntraceableRangeCumulativeRewrites({
+          original: provisionalDraftSteps,
+          rewritten: rewritten.steps,
+          coffeeAmount: normalized.recipe.coffee_amount,
+          waterAmount: normalized.recipe.water_amount,
+        });
+
+      normalized = {
+        ...normalized,
+        warnings: uniqueStrings([
+          ...normalized.warnings,
+          ...rewritten.warnings,
+          ...rangeSafeWarnings,
+        ]),
+        steps: rangeSafeSteps,
+      };
+      skipDeterministicWaterTotals = true;
+      cumulativeRewriteApplied = true;
+      cumulativeRewriteSource = {
+        attemptIndex: index,
+        provider: attempt.provider,
+        model: attempt.model,
+      };
+      break;
+    }
+  }
+
+  const detectedInputLanguage = getPrimaryLanguageSignal([
+    input.sourceLanguageHint,
+    normalized.detected_input_language,
+    extraction.detected_input_language,
+  ]);
+
+  const response = finalizeDraftResponse({
+    extraction,
+    normalized,
+    userId: input.userId,
+    brewingMethods: input.brewingMethods,
+    brewingMethodHint: input.brewingMethodHint,
+    providerUsed: (extractionSource?.provider ?? "openai") as LlmProviderName,
+    providerModelUsed: extractionSource?.model ?? "unknown",
+    tokensUsed: 0,
+    openaiTokensUsed: 0,
+    skipDeterministicWaterTotals,
+    nowMs: input.nowMs,
+    detectedInputLanguage,
+    providerTrail: [],
+    mode: input.mode,
+    requestText: input.requestText,
+    stageOutputs: null,
+  });
+
+  return {
+    response,
+    diagnostics: {
+      extractionSource,
+      normalizationSource,
+      repairApplied,
+      repairSource,
+      repairAttemptsConsidered,
+      cumulativeRewriteApplied,
+      cumulativeRewriteSource,
+      cumulativeRewriteAttemptsConsidered,
+    },
+  };
 }
 
 // F10: most observed provider failures are transient or truncation-shaped

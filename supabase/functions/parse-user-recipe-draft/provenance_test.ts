@@ -470,6 +470,313 @@ Deno.test("REGRESSION (live capture a48f947e, German V60): a step split leaves a
 });
 
 // ---------------------------------------------------------------------
+// Plan 020 D4 — nearest-step_index pairing (flash-chilled 150 g ice / 150 g
+// water collision, confirmed on production capture
+// 73d06a79-5e48-497f-bf71-ebd48426caa4 via
+// scripts/recipe-draft-replay/gate-replay.ts). See the block comment above
+// `stepDistance`/`matchRenderedAmountsToProvenance` in provenance.ts for the
+// full mechanism and the Hario regression (127f391d) that decided the
+// sentinel-distance-zero design over the initially-tried sentinel-distance-
+// Infinity one.
+// ---------------------------------------------------------------------
+
+Deno.test("D4: a value rendered twice pairs each rendering to its OWN nearest record, not whichever is unconsumed first (flash-chilled shape)", () => {
+  // Reproduces capture 73d06a79 exactly: ice is deliberately never
+  // extracted (it is not brew water), so the ONLY 150 g record on file
+  // belongs to a later cumulative pour target. The ice's rendered 150 g
+  // comes first in array order; the old `unconsumed.find()` matcher let it
+  // steal the pour's record, leaving the pour unmatched two steps later.
+  const requestText =
+    "Add 150 g ice to the server. Start the timer and bloom with 75 g " +
+    "water. At 0:45 pour to a total of 150 g. At 1:15 pour to a total of " +
+    "225 g.";
+  const provenance: AmountProvenance[] = [
+    {
+      value: 150,
+      unit: "g",
+      // The pour target's own extraction step_index — matches step 2
+      // exactly.
+      step_index: 2,
+      provenance: "literal",
+      source_quote: "150 g",
+      rule: null,
+      rule_source_quote: null,
+      rule_inputs: null,
+    },
+  ];
+  const renderedAmounts: RenderedAmount[] = [
+    // The ice, rendered FIRST in array order but with no record of its own.
+    { step_index: 0, value: 150, unit: "g", is_cumulative_water: false },
+    // The pour target, rendered later, at the record's own step.
+    { step_index: 2, value: 150, unit: "g", is_cumulative_water: true },
+  ];
+
+  const result = verifyAmountProvenance({
+    requestText,
+    renderedAmounts,
+    provenance,
+  });
+
+  assertEquals(
+    findingCodes(result),
+    ["unverifiable_amount"],
+    "the pour target (distance 0 from the record) must claim the sole " +
+      "150 g record; the ice is honestly left unmatched (it truly has no " +
+      "provenance) rather than stealing the pour's record and reporting a " +
+      "fabricated two-step binding mismatch",
+  );
+  assertEquals(
+    result.findings[0].step_index,
+    0,
+    "the surviving finding must be on the ICE's step (0), not the pour's " +
+      "step (2) — the pour matched cleanly and produced no finding at all",
+  );
+});
+
+Deno.test("D4: nearest-step_index pairing prefers the closer of two candidate records over array order", () => {
+  // A stronger version of the case above: now there are TWO 40 g records,
+  // one near each rendering, deliberately listed in an order that would
+  // trip up first-match-wins (the record for the LATER rendering is listed
+  // FIRST in the provenance array).
+  const requestText =
+    "Add 40 g of coffee to the filter. Later, add another 40 g of coffee.";
+  const provenance: AmountProvenance[] = [
+    {
+      value: 40,
+      unit: "g",
+      // Belongs to the SECOND rendering (step 3) but appears FIRST in the
+      // array — array-order matching would wrongly grab this for step 0.
+      step_index: 3,
+      provenance: "literal",
+      source_quote: "40 g",
+      rule: null,
+      rule_source_quote: null,
+      rule_inputs: null,
+    },
+    {
+      value: 40,
+      unit: "g",
+      // Belongs to the FIRST rendering (step 0).
+      step_index: 0,
+      provenance: "literal",
+      source_quote: "40 g",
+      rule: null,
+      rule_source_quote: null,
+      rule_inputs: null,
+    },
+  ];
+  const renderedAmounts: RenderedAmount[] = [
+    { step_index: 0, value: 40, unit: "g", is_cumulative_water: false },
+    { step_index: 3, value: 40, unit: "g", is_cumulative_water: false },
+  ];
+
+  const result = verifyAmountProvenance({
+    requestText,
+    renderedAmounts,
+    provenance,
+  });
+
+  assertEquals(
+    result.findings,
+    [],
+    "each rendering must pair with the record at its OWN step (distance " +
+      "0 both ways) regardless of which record appears first in the " +
+      "provenance array — neither pairing should report a binding drift",
+  );
+});
+
+Deno.test("D4 tie rule: two equidistant candidates resolve to the EARLIER record, deterministically", () => {
+  // The rendered amount sits exactly between two compatible records, one
+  // step before and one step after — both distance 1. The documented tie
+  // rule (provenance.ts, above matchRenderedAmountsToProvenance) prefers
+  // the earlier-appearing rendered amount, then the earlier-appearing
+  // provenance record; with only one rendered amount here, that reduces to
+  // "prefer the earlier record".
+  const requestText = "Pour 30 g, then pour more, then pour 30 g again.";
+  const provenance: AmountProvenance[] = [
+    {
+      value: 30,
+      unit: "g",
+      step_index: 0, // distance 1 from the rendering at step 1
+      provenance: "literal",
+      source_quote: "30 g",
+      rule: null,
+      rule_source_quote: null,
+      rule_inputs: null,
+    },
+    {
+      value: 30,
+      unit: "g",
+      step_index: 2, // also distance 1 from the rendering at step 1
+      provenance: "derived",
+      source_quote: null,
+      // A rule outside DERIVED_RULES: if THIS record were picked instead,
+      // the test would see unsupported_derivation_rule, not a clean pass —
+      // making the tie-break's outcome observable, not just inferred.
+      rule: "not_a_real_rule",
+      rule_source_quote: "30 g again",
+      rule_inputs: null,
+    },
+  ];
+  const renderedAmounts: RenderedAmount[] = [
+    { step_index: 1, value: 30, unit: "g", is_cumulative_water: false },
+  ];
+
+  const result = verifyAmountProvenance({
+    requestText,
+    renderedAmounts,
+    provenance,
+  });
+
+  assertEquals(
+    result.findings,
+    [],
+    "the tie must resolve to the EARLIER record (step_index 0, a clean " +
+      "literal quote) rather than the later one (step_index 2, an " +
+      "unsupported derivation rule) — if the later record had won, this " +
+      "would report unsupported_derivation_rule instead of passing clean",
+  );
+});
+
+Deno.test("D4 sentinel: a step_index -1 recipe-level record is not treated as a fabricated large positional distance", () => {
+  // Guards the literal failure mode named in the task brief: naively
+  // computing Math.abs(-1 - rendered.step_index) would score a rendering on
+  // step 3 as "distance 4" from a -1 record — as if the sentinel were one
+  // step before step 0. A step_index of -1 is a marker, not a position, and
+  // must never be fed into that arithmetic. This is checked here via a
+  // record that would ONLY match if the sentinel is treated as compatible
+  // (not excluded, not penalised into unreachability) with a rendering far
+  // from step 0.
+  const requestText = "Use a 60 g dose of coffee. ... (many steps later) ...";
+  const provenance: AmountProvenance[] = [
+    {
+      value: 60,
+      unit: "g",
+      step_index: -1, // recipe-level sentinel: the recipe's overall dose.
+      provenance: "literal",
+      source_quote: "60 g dose",
+      rule: null,
+      rule_source_quote: null,
+      rule_inputs: null,
+    },
+  ];
+  const renderedAmounts: RenderedAmount[] = [
+    // Rendered far from step 0 — a naive |-1 - 3| = 4 formula would still
+    // "match" this (the sentinel is the only candidate either way), but
+    // must not ALSO trip the >1 binding-drift check the way a real
+    // positional record with step_index 4 steps away would.
+    { step_index: 3, value: 60, unit: "g", is_cumulative_water: false },
+  ];
+
+  const result = verifyAmountProvenance({
+    requestText,
+    renderedAmounts,
+    provenance,
+  });
+
+  assertEquals(
+    result.findings,
+    [],
+    "a recipe-level (-1) record must never be treated as a positionally " +
+      "distant record — it is compatible with a rendering anywhere in the " +
+      "recipe, so this must pass with no binding-mismatch finding",
+  );
+});
+
+Deno.test("D4 sentinel vs positional: a rendering exactly at a record's own step is not displaced by an unrelated sentinel duplicate of the same value", () => {
+  // REGRESSION GUARD — this is the shape that broke when the sentinel was
+  // first tried at distance Infinity: live capture 127f391d ("Hario full
+  // 4") carries the SAME value recorded BOTH as a step_index -1 sentinel
+  // AND, redundantly, at an unrelated positional step_index that the value
+  // is never actually re-stated at. The draft renders the value exactly
+  // ONCE, in the preparation step. Distance-zero sentinel treatment means
+  // the sentinel ties with an exact positional match rather than losing to
+  // a same-value duplicate parked at some other, irrelevant step.
+  const requestText = "Add 20 grams of beans and 260 grams of water.";
+  const provenance: AmountProvenance[] = [
+    {
+      value: 20,
+      unit: "g",
+      step_index: -1, // the recipe-level dose.
+      provenance: "literal",
+      source_quote: "20 grams of beans",
+      rule: null,
+      rule_source_quote: null,
+      rule_inputs: null,
+    },
+    {
+      value: 20,
+      unit: "g",
+      // A redundant duplicate at an unrelated step, far from where the
+      // value is actually rendered (step 0).
+      step_index: 2,
+      provenance: "literal",
+      source_quote: "20 grams of beans",
+      rule: null,
+      rule_source_quote: null,
+      rule_inputs: null,
+    },
+  ];
+  const renderedAmounts: RenderedAmount[] = [
+    { step_index: 0, value: 20, unit: "g", is_cumulative_water: false },
+  ];
+
+  const result = verifyAmountProvenance({
+    requestText,
+    renderedAmounts,
+    provenance,
+  });
+
+  assertEquals(
+    result.findings,
+    [],
+    "the rendering at step 0 must pair with the sentinel record (distance " +
+      "0, tied with nothing closer) rather than the unrelated positional " +
+      "duplicate at step 2 (distance 2), which would fabricate a " +
+      "two-step amount_step_binding_mismatch — exactly what regressed " +
+      "before the sentinel distance was corrected from Infinity to 0",
+  );
+});
+
+Deno.test("D4 non-regression: a single matching record with no competing candidates behaves exactly as before this fix", () => {
+  // The ordinary, overwhelmingly common case: one rendered amount, one
+  // compatible record, nothing else in play. Nearest-step_index pairing
+  // must not change this at all.
+  const requestText = "Add 42 g of coffee to the filter.";
+  const provenance: AmountProvenance[] = [
+    {
+      value: 42,
+      unit: "g",
+      step_index: 5, // far from where it renders — irrelevant here, since
+      // it is the only candidate: this exercises that "only candidate"
+      // still wins regardless of distance, then falls through to the
+      // ordinary one-vs-two-step drift check exactly as before.
+      provenance: "literal",
+      source_quote: "42 g",
+      rule: null,
+      rule_source_quote: null,
+      rule_inputs: null,
+    },
+  ];
+  const renderedAmounts: RenderedAmount[] = [
+    { step_index: 5, value: 42, unit: "g", is_cumulative_water: false },
+  ];
+
+  const result = verifyAmountProvenance({
+    requestText,
+    renderedAmounts,
+    provenance,
+  });
+
+  assertEquals(
+    result.findings,
+    [],
+    "a lone compatible record at the exact same step as its rendering " +
+      "must still pass cleanly",
+  );
+});
+
+// ---------------------------------------------------------------------
 // Japanese cumulative-pour incident: five ascending pours (60/120/180/
 // 240/300 ml) all emitted as 60 ml. See provenance.ts's own file-header
 // comment (lines 3-7) and the design doc's "non_monotonic_cumulative"
