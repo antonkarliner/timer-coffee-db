@@ -15742,3 +15742,368 @@ Deno.test("D10: a genuinely starved allocation (legitimate duration_is_stated an
     "Expected the genuine 170s-vs-155s mismatch to still be flagged — this fix must not suppress a real mismatch.",
   );
 });
+
+// ---------------------------------------------------------------------
+// D12 (plan 020 §3, D10 follow-up): D10 stopped a drawdown whose
+// elapsed_seconds equals the recipe's resolved completion target from
+// being trusted as a DIFFERENCING PARTNER (i.e. as marking when the
+// PRECEDING step ends). That fix flipped a moka-pot capture
+// (c4637750-429b-4f08-a36d-6af5f8fdcc20) from blocked to publishable at
+// the correct 240s total — but splitDerivedBrewStepDurationsFromTarget
+// still handed that SAME drawdown 100% of the leftover `available` time,
+// because "the drawdown absorbs the remainder" was never conditioned on
+// the drawdown being trustworthy as a DURATION either. For a moka pot,
+// whose source never states how much water any individual brew step
+// adds, every derived step's estimate is already the same flat
+// DERIVED_STIR_SECONDS nominal — so dumping the remainder on the one step
+// literally labelled "remove from heat" (an instantaneous action, not a
+// wait) put 81% of the total (195 of 240s) on the step that takes no time
+// at all, while the real long wait immediately before it sat at the 15s
+// floor.
+//
+// This reproduces that exact capture's shape (verified directly against
+// the cached extraction/normalization for c4637750 via
+// scripts/recipe-draft-replay before this fix landed).
+// ---------------------------------------------------------------------
+
+Deno.test("D12: a drawdown that is BOTH an untrustworthy end-marker (D10) AND has no water-metered sibling step does not absorb the remainder (moka-pot live-incident shape, c4637750)", async () => {
+  const extraction: ExtractionResult = {
+    extracted_amounts: [],
+    detected_input_language: "en",
+    likely_brewing_method: "Moka pot",
+    name: "D12 moka pot shape",
+    short_description: "Tests D12's ungrounded-drawdown-remainder fix.",
+    grind_size: "fine, but not espresso-fine",
+    water_temp_celsius: 96.1,
+    coffee_amount_grams: 28,
+    water_amount: 250,
+    preparation:
+      "Fill the lower chamber with 250 g hot water. Add 28 g coffee to the basket and level it without tamping. Assemble the moka pot and place it over medium heat with the lid open.",
+    steps: [
+      {
+        title: null,
+        raw_text: "Start the timer.",
+        duration_seconds: 240,
+        elapsed_seconds: 0,
+        starts_timer: true,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: null,
+      },
+      {
+        title: null,
+        raw_text: "When coffee begins flowing, lower the heat.",
+        duration_seconds: 230,
+        elapsed_seconds: null,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: null,
+      },
+      {
+        title: null,
+        raw_text: "Remove from heat when steam appears, at approximately 4 minutes.",
+        duration_seconds: 10,
+        elapsed_seconds: 240,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: "drawdown",
+      },
+      {
+        title: null,
+        raw_text: "Cool the base under running water to stop extraction, then serve.",
+        duration_seconds: 10,
+        elapsed_seconds: null,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: "serve",
+      },
+    ],
+    notes: [],
+    total_brew_time_seconds: 240,
+  };
+  const normalized: NormalizedDraft = {
+    extracted_amounts: [],
+    detected_input_language: "en",
+    warnings: [],
+    recipe: {
+      brewing_method_id: "mokapot",
+      brewing_method_confidence: "high",
+      coffee_amount: 28,
+      water_amount: 250,
+      water_temp: 96.1,
+    },
+    localization: {
+      name: "D12 moka pot shape",
+      grind_size: "fine, but not espresso-fine",
+      short_description: "Tests D12's ungrounded-drawdown-remainder fix.",
+    },
+    steps: [
+      {
+        kind: "preparation",
+        description_source:
+          "Fill the lower chamber with 250 g hot water. Add 28 g coffee to the basket and level it without tamping. Assemble the moka pot and place it over medium heat with the lid open.",
+        description_template:
+          "Fill the lower chamber with 250g water. Add 28g coffee, level without tamping, then assemble and heat with the lid open.",
+        duration_seconds: 0,
+        elapsed_seconds: null,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [{ value: 250, unit: "g" }, {
+          value: 28,
+          unit: "g",
+        }],
+        step_role: "preparation",
+      },
+      {
+        kind: "brew",
+        description_source: "Start the timer.",
+        description_template: "Start the timer.",
+        duration_seconds: 240,
+        elapsed_seconds: 0,
+        starts_timer: true,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: null,
+      },
+      {
+        kind: "brew",
+        description_source: "When coffee begins flowing, lower the heat.",
+        description_template: "When coffee begins flowing, lower the heat.",
+        duration_seconds: 230,
+        elapsed_seconds: null,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: null,
+      },
+      {
+        kind: "brew",
+        description_source:
+          "Remove from heat when steam appears, at approximately 4 minutes.",
+        description_template: "Remove from heat when steam appears.",
+        duration_seconds: 10,
+        elapsed_seconds: 240,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: "drawdown",
+      },
+      {
+        kind: "brew",
+        description_source:
+          "Cool the base under running water to stop extraction, then serve.",
+        description_template: "Cool the base under running water, then serve.",
+        duration_seconds: 10,
+        elapsed_seconds: null,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: "serve",
+      },
+    ],
+  };
+
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction,
+        normalized,
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: "Coava Coffee Moka Pot mock",
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "mokapot", brewing_method: "Moka Pot" },
+    ],
+    requestId: "req-d12-moka-pot",
+  });
+
+  assertEquals(
+    result.draft.steps.map((step) => step.duration_seconds),
+    [0, 75, 75, 15, 75],
+    "Expected the remainder to be spread across the three non-drawdown derived steps (75s each) instead of dumped onto the drawdown, which now gets only the same fixed 15s nominal any other quick action gets.",
+  );
+  assertEquals(
+    result.draft.recipe.brew_time_seconds,
+    240,
+    "Expected the stated 240s total to still be hit exactly.",
+  );
+  assertEquals(
+    result.validation.is_publishable,
+    true,
+    "Expected this capture to remain publishable, exactly as after D10 — D12 only changes the SPLIT, never the total or the gate decision.",
+  );
+});
+
+Deno.test("D12 control: a drawdown that is an untrustworthy end-marker BUT has a water-metered sibling pour still absorbs the remainder (German V60 shape must not regress)", async () => {
+  // Same drawdown-equals-target shape D10 fixed for German V60 — this must
+  // keep behaving exactly as D10 left it: the drawdown still absorbs the
+  // remainder, because (unlike the moka pot above) this recipe's other
+  // derived step states a real per-pour gram amount, so the "drawdown is
+  // the longest derived step because it's the physical drain tail" model
+  // is still grounded in something the source actually said.
+  const extraction: ExtractionResult = {
+    extracted_amounts: [],
+    detected_input_language: "de",
+    likely_brewing_method: "V60",
+    name: "D12 control: German V60 shape",
+    short_description: "Tests D12 does not touch a water-grounded drawdown.",
+    grind_size: "Mittel",
+    water_temp_celsius: 93,
+    coffee_amount_grams: 20,
+    water_amount: 300,
+    preparation: "Filter spuelen und Kaffee hinzufuegen.",
+    steps: [
+      {
+        title: null,
+        raw_text: "Gieße 25g Wasser auf (Bloom).",
+        duration_seconds: 30,
+        elapsed_seconds: 0,
+        starts_timer: true,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: "bloom",
+      },
+      {
+        title: null,
+        raw_text: "Bei 0:30 auf insgesamt 300g Wasser aufgießen.",
+        duration_seconds: 60,
+        elapsed_seconds: 30,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [{ value: 300, unit: "g" }],
+        step_role: "pour",
+      },
+      {
+        title: null,
+        raw_text: "Vollständig durchlaufen lassen.",
+        duration_seconds: 10,
+        elapsed_seconds: 180,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: "drawdown",
+      },
+    ],
+    notes: [],
+    total_brew_time_seconds: 180,
+  };
+  const normalized: NormalizedDraft = {
+    extracted_amounts: [],
+    detected_input_language: "de",
+    warnings: [],
+    recipe: {
+      brewing_method_id: "v60",
+      brewing_method_confidence: "high",
+      coffee_amount: 20,
+      water_amount: 300,
+      water_temp: 93,
+    },
+    localization: {
+      name: "D12 control: German V60 shape",
+      grind_size: "Mittel",
+      short_description: "Tests D12 does not touch a water-grounded drawdown.",
+    },
+    steps: [
+      {
+        kind: "preparation",
+        description_source: "Filter spuelen und Kaffee hinzufuegen.",
+        description_template: "Filter spuelen und Kaffee hinzufuegen.",
+        duration_seconds: 0,
+        elapsed_seconds: null,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: "preparation",
+      },
+      {
+        kind: "brew",
+        description_source: "Gieße 25g Wasser auf (Bloom).",
+        description_template: "Gieße 25g Wasser auf (Bloom).",
+        duration_seconds: 30,
+        elapsed_seconds: 0,
+        starts_timer: true,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: "bloom",
+      },
+      {
+        kind: "brew",
+        description_source: "Bei 0:30 auf insgesamt 300g Wasser aufgießen.",
+        description_template: "Bei 0:30 auf insgesamt 300g Wasser aufgießen.",
+        duration_seconds: 60,
+        elapsed_seconds: 30,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [{ value: 300, unit: "g" }],
+        step_role: "pour",
+      },
+      {
+        kind: "brew",
+        description_source: "Vollständig durchlaufen lassen.",
+        description_template: "Vollständig durchlaufen lassen.",
+        duration_seconds: 10,
+        elapsed_seconds: 180,
+        starts_timer: false,
+        duration_is_stated: false,
+        scalable_amounts: [],
+        step_role: "drawdown",
+      },
+    ],
+  };
+
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction,
+        normalized,
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: "Mock German V60 recipe, single water-metered pour",
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Hario V60" },
+    ],
+    requestId: "req-d12-control-water-grounded",
+  });
+
+  const bloomStep = result.draft.steps[1];
+  const pourStep = result.draft.steps[2];
+  const drawdownStep = result.draft.steps[3];
+
+  assertEquals(
+    bloomStep.duration_seconds,
+    30,
+    "Bloom is a fixed nominal (DERIVED_BLOOM_SECONDS), untouched by D12.",
+  );
+  assert(
+    pourStep.duration_seconds > 0 &&
+      pourStep.duration_seconds < drawdownStep.duration_seconds,
+    `Expected the pour (${pourStep.duration_seconds}s, water-scaled) to stay far shorter than the drawdown (${drawdownStep.duration_seconds}s, absorbing the remainder) — D12 must not fire here because this recipe DOES have a water-metered sibling step.`,
+  );
+  assertEquals(
+    result.draft.recipe.brew_time_seconds,
+    180,
+    "Expected the stated 180s total to still be hit exactly.",
+  );
+  assertEquals(
+    result.validation.is_publishable,
+    true,
+    "Expected this control to remain publishable.",
+  );
+});

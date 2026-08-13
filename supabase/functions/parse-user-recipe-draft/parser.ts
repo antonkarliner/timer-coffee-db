@@ -4372,7 +4372,81 @@ function splitDerivedBrewStepDurationsFromTarget(input: {
 
   const finalDurations = new Map<number, number>();
 
-  if (drawdownRemainder >= MIN_BREW_STEP_DURATION_SECONDS) {
+  // D12 (plan 020 §3, following D10's precedent of not trusting an
+  // end-marker as more than it actually states): "the drawdown absorbs the
+  // remainder" above is a claim about PHYSICS — on a Chemex/V60 the
+  // drawdown genuinely is the longest derived step because it is water
+  // draining slowly through grounds, and that is still true even when a
+  // drawdown's own elapsed_seconds happens to equal the resolved target
+  // (see the four German V60 captures this must not regress — their
+  // drawdowns keep absorbing the remainder correctly precisely because
+  // their OTHER derived steps are grounded in real per-pour gram amounts).
+  // It is also still true for an immersion brewer like the Hario Switch,
+  // whose drawdown ("let it fully steep and drain until 1:25") legitimately
+  // is the long step even though nothing in that recipe carries a per-step
+  // water amount at all — see this function's own golden fixture, which
+  // this must not regress either.
+  //
+  // What is NOT physically grounded is a drawdown that is BOTH (a) an
+  // untrustworthy end-marker in exactly D10's sense — its own
+  // elapsed_seconds equals the recipe's resolved completion target, i.e.
+  // the source is stating WHEN the step happens, not how long it lasts —
+  // AND (b) has no other derived step anywhere in the recipe carrying a
+  // water-added signal to ground the "physical process" story in. A moka
+  // pot's "remove from heat when steam appears, at approximately 4
+  // minutes" satisfies both: "4 minutes" states the moment of removal
+  // (not a duration), the step is an instantaneous action, and the recipe
+  // never states how much water any individual brew step adds (only the
+  // recipe-level total, consumed on the preparation step). Handing that
+  // step the remainder is then not a physically-informed choice at all —
+  // it is an artifact of which label the model attached.
+  //
+  // Confirmed against the actual failing capture (moka pot, plan 020's
+  // c4637750): before this fix, [start timer]=15s, [lower heat]=15s,
+  // [remove from heat/drawdown]=195s, [cool+serve]=15s against a 240s
+  // target — 81% of the total on the one instantaneous step, while the
+  // step immediately before it (the real long wait for coffee to start
+  // flowing) sat at the 15s floor.
+  //
+  // Fix, gated on BOTH (a) and (b): invert which side gets the leftover.
+  // The drawdown gets the same fixed, ungrounded nominal any other quick
+  // action gets (DERIVED_STIR_SECONDS) — exactly what "remove from heat"
+  // physically is — instead of the remainder, and `available` minus that
+  // nominal is what actually gets distributed, across the OTHER derived
+  // steps by their own weights (reusing allocateAvailableSecondsByWeight,
+  // already this function's own established mechanism for "no better
+  // basis than equal weight is available" — see the scale-down failure
+  // branch below, which pools drawdown in at the same nominal weight for
+  // the same reason). This does not claim to know the pre-drawdown wait is
+  // longer than the extraction step that follows it — nothing in the draft
+  // distinguishes them either — it only stops manufacturing false
+  // precision by dumping the entire remainder onto a single step whose own
+  // timestamp already tells us it is not a duration, putting the bulk of
+  // the target back onto the steps that actually span the unmetered time
+  // instead.
+  const drawdownStep = input.steps[drawdownIndex];
+  const drawdownIsUntrustworthyEndMarker = drawdownStep.step_role ===
+      "drawdown" &&
+    drawdownStep.elapsed_seconds === targetSeconds;
+  const otherDerivedStepsHaveNoWaterSignal = otherDerivedIndexes.length >
+      0 &&
+    otherDerivedIndexes.every((index) => (waterAddedByIndex[index] ?? 0) <= 0);
+  const drawdownRemainderIsUngrounded = drawdownIsUntrustworthyEndMarker &&
+    otherDerivedStepsHaveNoWaterSignal;
+
+  if (drawdownRemainderIsUngrounded) {
+    const drawdownNominal = clampBrewStepDuration(DERIVED_STIR_SECONDS);
+    finalDurations.set(drawdownIndex, drawdownNominal);
+    const remainderForOthers = available - drawdownNominal;
+    const allocation = allocateAvailableSecondsByWeight(
+      remainderForOthers,
+      otherDerivedIndexes,
+      otherEstimates,
+    );
+    for (const [index, duration] of allocation) {
+      finalDurations.set(index, duration);
+    }
+  } else if (drawdownRemainder >= MIN_BREW_STEP_DURATION_SECONDS) {
     // Common case: the estimates for everything else fit comfortably, so
     // the drawdown gets exactly what's left — the total lands on the
     // target exactly whenever that remainder is also within the cap.
