@@ -236,6 +236,13 @@ export const extractionSchema = z.object({
   total_brew_time_seconds: z.number().int().positive().nullable().default(
     null,
   ),
+  // Phase A/E1 (plan 023): whether the source presents the stated total as
+  // approximate rather than exact. This is a semantic judgement made by the
+  // multilingual extraction model; do not replace it with an English keyword
+  // regex. Optional for backward compatibility with stored captures and the
+  // many pre-existing ExtractionResult literals in the test suite. Consumers
+  // must read it through `?? null`.
+  total_brew_time_is_approximate: z.boolean().nullable().optional(),
   // Phase A/E1 (plan 023): the source's stated total may be a range even
   // when total_brew_time_seconds contains one landmark or a model-selected
   // point. The range is authoritative for the final timing gate whenever it
@@ -2628,6 +2635,7 @@ function buildExtractionSystemPrompt(): string {
     "total_brew_time_seconds must come only from a statement about this recipe's own stated brew time. Ignore timing mentioned in commentary, comparisons to other brewers, equipment asides, anecdotes, or general advice unrelated to this recipe's own brew.",
     "This applies in EVERY language the source may be written in, not just English. A labelled total-time field is the same field regardless of what language it's labelled in — for example German 'Brühzeit: 2:30 - 3:30', Spanish 'tiempo de extracción', French 'temps d'infusion', or Japanese '抽出時間' are all total_brew_time_seconds, exactly like an English 'Brew time: 2:30-3:30'. Example: German 'Brühzeit: 2:30 - 3:30' becomes total_brew_time_seconds 180 (the midpoint, per the rounding rule below).",
     "A sentence stating this recipe should finish within roughly some amount of time — such as 'should be finished within about 3 minutes' or its equivalent in another language — is a STATED total brew time, not commentary, and must populate total_brew_time_seconds. Only commentary about OTHER setups, other people's brews, or general advice unrelated to this recipe's own brew should be excluded, exactly as above.",
+    "Set total_brew_time_is_approximate to true when the source presents the recipe's stated total as approximate, hedged, or an estimate; set it to false when the source presents a single total as exact; leave it null when no total brew time is stated. Judge this from the meaning in the source language, not from an English keyword list. A range belongs in total_brew_time_stated_range and does not by itself make this flag true.",
     "The midpoint-of-range rule below applies only to total_brew_time_seconds. Never average or take the midpoint of a range for any other field, including coffee_amount_grams, water_amount, or any individual step's duration_seconds.",
     "If the source gives a range for total_brew_time_seconds, use the midpoint rounded to the nearest 5 seconds. Example: 'three fifteen to three forty-five' becomes 210.",
     "If no total brew time is stated for this recipe, total_brew_time_seconds must be null.",
@@ -2676,6 +2684,7 @@ function buildExtractionUserPrompt(input: {
         ],
         notes: ["string"],
         total_brew_time_seconds: "number|null",
+        total_brew_time_is_approximate: "boolean|null",
         total_brew_time_stated_range: "{ low: number, high: number }|null",
         extracted_amounts: [
           {
@@ -2705,6 +2714,7 @@ function buildExtractionUserPrompt(input: {
     "Return water_temp_celsius as a bare JSON number in Celsius only. Example: 96 or 96.1, not '96C'.",
     "water_temp_stated_range is for a STATED RANGE only (e.g. '195-205°F'): transcribe low/high literally in the source's own unit, do not convert or compute anything for it. Leave it null for a single stated temperature.",
     "total_brew_time_stated_range is for a STATED TOTAL-TIME RANGE only: return both endpoints in seconds, even when total_brew_time_seconds contains one selected point or a different landmark. Leave it null for a single stated total.",
+    "total_brew_time_is_approximate describes a SINGLE stated total: true for an approximate or hedged estimate, false for an exact stated total, and null when no total is stated. Determine this semantically in the source language.",
     "Recipe text:",
     input.text,
   ].join("\n\n");
@@ -5887,9 +5897,19 @@ function buildRenderedTimingStepsFromDraftSteps(
 // vs 1.06 first defect) and does not carve out an exception for short brews.
 const TOTAL_BREW_TIME_BLOCKING_RATIO = 1.05;
 
+// E1 (plan 023): a source that explicitly hedges its total is not making the
+// same precision claim as a flatly stated target. The live Hario Switch source
+// says "until about 1:25"; deterministic minimum-duration normalization adds a
+// final 10-second serve step and emits 95s (ratio 1.118). A 15% window admits
+// that physically consistent result with modest headroom. It is intentionally
+// unavailable to exact totals, so the moka-pot control (240s stated, 270s
+// emitted, ratio 1.125) continues to block under the 1.05 exact-total gate.
+const APPROXIMATE_TOTAL_BREW_TIME_BLOCKING_RATIO = 1.15;
+
 function isTotalBrewTimeMismatchSevere(
   statedSeconds: number,
   emittedSeconds: number,
+  statedTotalIsApproximate = false,
 ): boolean {
   if (statedSeconds <= 0 || emittedSeconds <= 0) {
     // Defensive only, not expected on live traffic: extraction's schema
@@ -5905,7 +5925,10 @@ function isTotalBrewTimeMismatchSevere(
   const ratio = emittedSeconds >= statedSeconds
     ? emittedSeconds / statedSeconds
     : statedSeconds / emittedSeconds;
-  return ratio >= TOTAL_BREW_TIME_BLOCKING_RATIO;
+  return ratio >=
+    (statedTotalIsApproximate
+      ? APPROXIMATE_TOTAL_BREW_TIME_BLOCKING_RATIO
+      : TOTAL_BREW_TIME_BLOCKING_RATIO);
 }
 
 type TotalBrewTimeStatedRange = NonNullable<
@@ -7565,6 +7588,8 @@ function finalizeDraftResponse(input: {
     .filter((step) => step.kind === "brew")
     .reduce((sum, step) => sum + step.duration_seconds, 0);
   const statedTotalBrewTimeSeconds = input.extraction.total_brew_time_seconds;
+  const statedTotalBrewTimeIsApproximate =
+    input.extraction.total_brew_time_is_approximate ?? false;
   const statedTotalBrewTimeRange = resolveTotalBrewTimeStatedRange(
     input.extraction.total_brew_time_stated_range ?? null,
   );
@@ -7598,6 +7623,7 @@ function finalizeDraftResponse(input: {
       isTotalBrewTimeMismatchSevere(
         statedTotalBrewTimeSeconds,
         emittedTotalBrewTimeSeconds,
+        statedTotalBrewTimeIsApproximate,
       );
   // verify mode blocks on every timing finding unconditionally, exactly as
   // before (preserveStepCount, untouched). Extract mode still only WARNS on

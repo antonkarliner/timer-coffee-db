@@ -14303,6 +14303,7 @@ async function assertTotalBrewTimeVerdict(
   statedSeconds: number,
   emittedSeconds: number,
   expectBlocked: boolean,
+  statedTotalIsApproximate?: boolean,
 ): Promise<void> {
   const half = Math.floor(emittedSeconds / 2);
   const parser = createRecipeDraftParser({
@@ -14312,6 +14313,7 @@ async function assertTotalBrewTimeVerdict(
         extraction: {
           ...createExtraction(),
           total_brew_time_seconds: statedSeconds,
+          total_brew_time_is_approximate: statedTotalIsApproximate ?? false,
         },
         normalized: {
           ...createNormalized(),
@@ -14382,6 +14384,36 @@ Deno.test("D6: moka pot 240s stated vs 490s emitted (ratio 2.04, high-variance d
 
 Deno.test("D6: Russian 180s stated vs 40s emitted (ratio 4.5) must block", async () => {
   await assertTotalBrewTimeVerdict("russian", 180, 40, true);
+});
+
+Deno.test("Phase A/E1: an approximate 85s total may emit 95s without blocking (Hario fe584516 shape)", async () => {
+  await assertTotalBrewTimeVerdict(
+    "hario-approximate-total",
+    85,
+    95,
+    false,
+    true,
+  );
+});
+
+Deno.test("Phase A/E1 control: the same 85s to 95s divergence blocks when the source states an exact total", async () => {
+  await assertTotalBrewTimeVerdict(
+    "exact-total-same-ratio",
+    85,
+    95,
+    true,
+    false,
+  );
+});
+
+Deno.test("Phase A/E1 boundary: an approximate total still blocks at a 15% divergence", async () => {
+  await assertTotalBrewTimeVerdict(
+    "approximate-total-boundary",
+    100,
+    115,
+    true,
+    true,
+  );
 });
 
 async function parsePhaseAE1RangeCase(args: {
