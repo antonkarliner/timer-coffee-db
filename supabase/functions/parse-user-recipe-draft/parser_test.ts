@@ -5,6 +5,7 @@ import {
   type ExtractionResult,
   formatMultiplier,
   type NormalizedDraft,
+  type ParseUserRecipeDraftResponse,
   type RecipeDraftAiProvider,
   type StageCaptureEntry,
 } from "./parser.ts";
@@ -12196,6 +12197,192 @@ Deno.test("F32: a rendering that already matches its literal record is left unto
 });
 
 // ---------------------------------------------------------------------
+// Phase A/E2 (plan 023): an F32 repair is only valid when the expression's
+// current rendered value is unexplained. Same-dimension records can name
+// different physical roles (ice versus coffee), so mass compatibility alone
+// cannot authorize a rewrite.
+// ---------------------------------------------------------------------
+
+Deno.test("Phase A/E2: F32 does not bind a same-step ice record to a coffee expression whose current 25g rendering already traces", async () => {
+  const normalizedBase = createF32Normalized({
+    coffeeAmount: 25,
+    waterAmount: 450,
+  });
+  const original =
+    "Add (0.333333 x <final_water_amount>)g ice to the server. Rinse the filter and add (1 x <final_coffee_amount>)g coffee.";
+  const parser = createRecipeDraftParser({
+    providers: [createMockProvider({
+      name: "groq",
+      extraction: {
+        ...createF32Extraction({ coffeeAmount: 25, waterAmount: 450 }),
+        extracted_amounts: [
+          {
+            value: 25,
+            unit: "g",
+            step_index: -1,
+            provenance: "literal",
+            source_quote: "25 g",
+            rule: null,
+            rule_source_quote: null,
+            rule_inputs: null,
+            unit_kind: "mass",
+          },
+          {
+            value: 150,
+            unit: "g",
+            step_index: 0,
+            provenance: "literal",
+            source_quote: "150 g",
+            rule: null,
+            rule_source_quote: null,
+            rule_inputs: null,
+            unit_kind: "mass",
+          },
+        ],
+      },
+      normalized: {
+        ...normalizedBase,
+        steps: [
+          {
+            ...normalizedBase.steps[0],
+            description_source:
+              "Add 150 g ice to the server. Rinse the filter and add 25 g coffee.",
+            description_template: original,
+          },
+          normalizedBase.steps[1],
+          normalizedBase.steps[2],
+        ],
+      },
+      calls: [],
+    })],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text:
+      "Flash-chilled coffee: use 25 g coffee, 300 g hot water, and 150 g ice. Add 150 g ice to the server. Rinse the filter and add 25 g coffee.",
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Hario V60" },
+    ],
+    requestId: "req-e2-flash-role-collision",
+  });
+
+  assertEquals(
+    result.draft.steps[0].description_template,
+    original,
+    "Expected both already-tracing flash-chilled expressions to remain byte-identical.",
+  );
+  assert(
+    !result.draft.steps[0].description_template.includes(
+      "6 x <final_coffee_amount>",
+    ),
+    "Expected F32 to decline the fabricated 150g coffee repair.",
+  );
+  assert(
+    !result.warnings.some((warning) => warning.includes("F32 repair")),
+    `Expected no F32 repair warning when both current expressions already trace, got: ${
+      JSON.stringify(result.warnings)
+    }`,
+  );
+});
+
+async function assertPhaseAE2KnownGoodWaterRepair(args: {
+  label: string;
+  coffeeAmount: number;
+  waterAmount: number;
+  currentMultiplier: number;
+  statedValue: number;
+  sourceQuote: string;
+  expectedMultiplier: string;
+}): Promise<void> {
+  const normalizedBase = createF32Normalized({
+    coffeeAmount: args.coffeeAmount,
+    waterAmount: args.waterAmount,
+  });
+  const parser = createRecipeDraftParser({
+    providers: [createMockProvider({
+      name: "groq",
+      extraction: {
+        ...createF32Extraction({
+          coffeeAmount: args.coffeeAmount,
+          waterAmount: args.waterAmount,
+        }),
+        extracted_amounts: [{
+          value: args.statedValue,
+          unit: "g",
+          step_index: 1,
+          provenance: "literal",
+          source_quote: args.sourceQuote,
+          rule: null,
+          rule_source_quote: null,
+          rule_inputs: null,
+          unit_kind: "mass",
+        }],
+      },
+      normalized: {
+        ...normalizedBase,
+        steps: [
+          normalizedBase.steps[0],
+          {
+            ...normalizedBase.steps[1],
+            description_template:
+              `Pour (${args.currentMultiplier} x <final_water_amount>)g water.`,
+          },
+          normalizedBase.steps[2],
+        ],
+      },
+      calls: [],
+    })],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text:
+      `Use ${args.coffeeAmount}g coffee and ${args.waterAmount}g water. Pour ${args.sourceQuote} water.`,
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Hario V60" },
+    ],
+    requestId: `req-e2-${args.label}`,
+  });
+
+  assertEquals(
+    result.draft.steps[1].description_template,
+    `Pour (${args.expectedMultiplier} x <final_water_amount>)g water.`,
+    `${args.label}: expected the unexplained water expression to retain its known-good F32 repair.`,
+  );
+  assert(
+    result.warnings.some((warning) => warning.includes("F32 repair")),
+    `${args.label}: expected the known-good F32 repair to keep firing.`,
+  );
+}
+
+Deno.test("Phase A/E2 control: German mass provenance still repairs an unexplained water expression", async () => {
+  await assertPhaseAE2KnownGoodWaterRepair({
+    label: "german-mass-water-control",
+    coffeeAmount: 20,
+    waterAmount: 400,
+    currentMultiplier: 0.1875,
+    statedValue: 50,
+    sourceQuote: "50g",
+    expectedMultiplier: "0.125",
+  });
+});
+
+Deno.test("Phase A/E2 control: Kalita 200g cumulative amount still repairs an unexplained water expression", async () => {
+  await assertPhaseAE2KnownGoodWaterRepair({
+    label: "kalita-200g-control",
+    coffeeAmount: 25,
+    waterAmount: 400,
+    currentMultiplier: 0.1875,
+    statedValue: 200,
+    sourceQuote: "200g",
+    expectedMultiplier: "0.5",
+  });
+});
+
+// ---------------------------------------------------------------------
 // D2 (plan 020 §3, §5 item 3) — F32 must consult unit_kind before binding a
 // literal provenance record to an expression: a "volume" record must never
 // repair a <final_coffee_amount> expression, however its value/step_index
@@ -14195,6 +14382,122 @@ Deno.test("D6: moka pot 240s stated vs 490s emitted (ratio 2.04, high-variance d
 
 Deno.test("D6: Russian 180s stated vs 40s emitted (ratio 4.5) must block", async () => {
   await assertTotalBrewTimeVerdict("russian", 180, 40, true);
+});
+
+async function parsePhaseAE1RangeCase(args: {
+  scalarSeconds: number;
+  emittedSeconds: number;
+  low: number;
+  high: number;
+  requestId: string;
+}): Promise<ParseUserRecipeDraftResponse> {
+  const firstDuration = Math.floor(args.emittedSeconds / 2);
+  const parser = createRecipeDraftParser({
+    providers: [createMockProvider({
+      name: "groq",
+      extraction: {
+        ...createExtraction(),
+        total_brew_time_seconds: args.scalarSeconds,
+        total_brew_time_stated_range: { low: args.low, high: args.high },
+      },
+      normalized: {
+        ...createNormalized(),
+        steps: [
+          createNormalized().steps[0],
+          {
+            ...createNormalized().steps[1],
+            duration_seconds: firstDuration,
+            duration_is_stated: true,
+          },
+          {
+            ...createNormalized().steps[2],
+            duration_seconds: args.emittedSeconds - firstDuration,
+            duration_is_stated: true,
+          },
+        ],
+      },
+      calls: [],
+    })],
+    now: () => 1776000000000,
+  });
+
+  return await parser.parseDraft({
+    text:
+      `Mock recipe with a stated total of ${args.low}-${args.high} seconds.`,
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Hario V60" },
+    ],
+    requestId: args.requestId,
+  });
+}
+
+Deno.test("Phase A/E1: an emitted total inside the source's stated range is not a mismatch even when the extracted scalar exceeds the ratio", async () => {
+  const result = await parsePhaseAE1RangeCase({
+    scalarSeconds: 85,
+    emittedSeconds: 95,
+    low: 90,
+    high: 100,
+    requestId: "req-e1-inside-range",
+  });
+
+  assert(
+    !result.validation.issues.some((issue) =>
+      issue.code === "total_brew_time_mismatch"
+    ),
+    `Expected 95s inside 90-100s to produce no total mismatch, got: ${
+      JSON.stringify(result.validation.issues)
+    }`,
+  );
+  assert(
+    !result.warnings.some((warning) =>
+      warning.includes("total brew time") && warning.includes("85s")
+    ),
+    `Expected the superseded 85s scalar mismatch not to survive as a warning, got: ${
+      JSON.stringify(result.warnings)
+    }`,
+  );
+  assertEquals(
+    result.validation.is_publishable,
+    true,
+    "Expected the in-range Hario-shaped draft to remain publishable.",
+  );
+});
+
+Deno.test("Phase A/E1: an emitted total outside the source's stated range blocks", async () => {
+  const result = await parsePhaseAE1RangeCase({
+    // Deliberately equal to the emitted value: this proves the range gate
+    // does not depend on provenance.ts first finding a scalar mismatch.
+    scalarSeconds: 105,
+    emittedSeconds: 105,
+    low: 90,
+    high: 100,
+    requestId: "req-e1-outside-range",
+  });
+
+  assert(
+    result.validation.issues.some((issue) =>
+      issue.code === "total_brew_time_mismatch" &&
+      issue.message.includes("90-100s") && issue.message.includes("105s")
+    ),
+    `Expected 105s outside 90-100s to block on a range-based total mismatch, got: ${
+      JSON.stringify(result.validation.issues)
+    }`,
+  );
+  assertEquals(
+    result.validation.is_publishable,
+    false,
+    "Expected an emitted total outside the stated range to block publication.",
+  );
+});
+
+Deno.test("Phase A/E1 control: without a stated range, the existing single-total ratio path is unchanged", async () => {
+  await assertTotalBrewTimeVerdict(
+    "phase-a-single-total-ratio-control",
+    240,
+    270,
+    true,
+  );
 });
 
 // ---------------------------------------------------------------------

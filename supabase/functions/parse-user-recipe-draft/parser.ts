@@ -236,6 +236,23 @@ export const extractionSchema = z.object({
   total_brew_time_seconds: z.number().int().positive().nullable().default(
     null,
   ),
+  // Phase A/E1 (plan 023): the source's stated total may be a range even
+  // when total_brew_time_seconds contains one landmark or a model-selected
+  // point. The range is authoritative for the final timing gate whenever it
+  // is present; see resolveTotalBrewTimeStatedRange below.
+  //
+  // Nullable + `.optional()`, never `.default()`, for the exact same
+  // backward-compatibility reason as water_temp_stated_range: existing
+  // fixtures/captures and ExtractionResult literals predate this field and
+  // must continue to parse with the key entirely absent.
+  //
+  // Like every prompt-populated field, reliable live adoption cannot be
+  // established offline. The deterministic gate is reliable when the field
+  // is supplied; whether providers consistently supply it needs a live run.
+  total_brew_time_stated_range: z.object({
+    low: z.number(),
+    high: z.number(),
+  }).nullable().optional(),
   // G22: provenance records for every numeric amount this stage emitted
   // (recipe-level coffee_amount_grams/water_amount and every step's own
   // amounts). Top-level rather than nested per-step, because each record
@@ -2600,6 +2617,7 @@ function buildExtractionSystemPrompt(): string {
     "Notes are optional and should only contain parser-relevant caveats such as ambiguity, inference, conversion, or repair concerns.",
     "Do not put generic brewing advice or recipe commentary in notes.",
     "All timed brew steps must use integer seconds when explicit or strongly inferable from local context; otherwise use null.",
+    "If the source states the recipe's TOTAL brew time as a RANGE (e.g. '90-100 seconds' or '2 to 2.5 minutes'), also fill total_brew_time_stated_range with both endpoints converted to seconds: { low, high }. Preserve both endpoints even if total_brew_time_seconds selects one value or a different timing landmark. Leave total_brew_time_stated_range null when the source states only a single total, not a range.",
     "If a step starts with a timestamp like 0:45 or 1:30, that timestamp is elapsed brew time from recipe start; preserve it in raw_text and do not treat it as the step duration unless the interval to the next action is explicit.",
     "Final coffee_amount_grams and water_amount should represent the overall recipe target, not a single pour.",
     "If the source gives a range for coffee_amount_grams or water_amount (e.g. 'Dosis: 20-24g'), do not average or take the midpoint of the range. Instead use whichever value the recipe's own steps actually build up to — for example if the steps pour to a final total of 300g, use 300 for water_amount even if the intro text says '300g-350g'. If the steps never resolve the range to a single value, use the low end of the range.",
@@ -2658,6 +2676,7 @@ function buildExtractionUserPrompt(input: {
         ],
         notes: ["string"],
         total_brew_time_seconds: "number|null",
+        total_brew_time_stated_range: "{ low: number, high: number }|null",
         extracted_amounts: [
           {
             value: "number",
@@ -2685,6 +2704,7 @@ function buildExtractionUserPrompt(input: {
       : "Source language hint: none",
     "Return water_temp_celsius as a bare JSON number in Celsius only. Example: 96 or 96.1, not '96C'.",
     "water_temp_stated_range is for a STATED RANGE only (e.g. '195-205°F'): transcribe low/high literally in the source's own unit, do not convert or compute anything for it. Leave it null for a single stated temperature.",
+    "total_brew_time_stated_range is for a STATED TOTAL-TIME RANGE only: return both endpoints in seconds, even when total_brew_time_seconds contains one selected point or a different landmark. Leave it null for a single stated total.",
     "Recipe text:",
     input.text,
   ].join("\n\n");
@@ -5888,6 +5908,32 @@ function isTotalBrewTimeMismatchSevere(
   return ratio >= TOTAL_BREW_TIME_BLOCKING_RATIO;
 }
 
+type TotalBrewTimeStatedRange = NonNullable<
+  ExtractionResult["total_brew_time_stated_range"]
+>;
+
+function resolveTotalBrewTimeStatedRange(
+  range: TotalBrewTimeStatedRange | null,
+): { low: number; high: number } | null {
+  if (
+    !range || !Number.isFinite(range.low) || !Number.isFinite(range.high) ||
+    range.low <= 0 || range.high <= 0
+  ) {
+    return null;
+  }
+  return {
+    low: Math.min(range.low, range.high),
+    high: Math.max(range.low, range.high),
+  };
+}
+
+function isTotalBrewTimeInsideStatedRange(
+  emittedSeconds: number,
+  range: { low: number; high: number },
+): boolean {
+  return emittedSeconds >= range.low && emittedSeconds <= range.high;
+}
+
 // F32: mirrors provenance.ts's AmountProvenance shape, taken from the
 // normalized draft's own carried-through field rather than re-imported,
 // since that's the exact array this repair pass reads.
@@ -7022,7 +7068,39 @@ function repairExpressionMultipliersAgainstLiteralProvenance(input: {
   const warnings: string[] = [];
 
   const steps = input.steps.map((step, stepIndex) => {
-    const occurrences = findExpressionOccurrences(step.description_template);
+    const allOccurrences = findExpressionOccurrences(
+      step.description_template,
+    );
+    if (allOccurrences.length === 0) {
+      return step;
+    }
+
+    // Phase A/E2 (plan 023): F32 is a repair for an unexplained current
+    // rendering, not a licence to replace one source-traceable amount with
+    // another same-dimension record from the same step. Probe each current
+    // expression through the real provenance verifier before pairing it.
+    // The flash-chilled defect's coffee expression already renders the
+    // recipe's source-traceable 25 g dose, so its unrelated 150 g ice record
+    // must never rewrite it to 6 x <final_coffee_amount>.
+    const occurrences = allOccurrences.filter((occurrence) => {
+      const base = occurrence.placeholder === "<final_coffee_amount>"
+        ? input.coffeeAmount
+        : input.waterAmount;
+      if (base === null || !Number.isFinite(base) || base === 0) {
+        return true;
+      }
+      const probe = verifyAmountProvenance({
+        requestText: input.requestText,
+        renderedAmounts: [{
+          step_index: stepIndex,
+          value: occurrence.multiplier * base,
+          unit: normalizeExpressionUnit(occurrence.unit),
+          is_cumulative_water: false,
+        }],
+        provenance: input.provenance,
+      });
+      return probe.unverified || probe.findings.length > 0;
+    });
     if (occurrences.length === 0) {
       return step;
     }
@@ -7049,7 +7127,7 @@ function repairExpressionMultipliersAgainstLiteralProvenance(input: {
     let cursor = 0;
     let changed = false;
 
-    for (const occurrence of occurrences) {
+    for (const occurrence of allOccurrences) {
       repairedTemplate += step.description_template.slice(
         cursor,
         occurrence.matchStart,
@@ -7487,11 +7565,40 @@ function finalizeDraftResponse(input: {
     .filter((step) => step.kind === "brew")
     .reduce((sum, step) => sum + step.duration_seconds, 0);
   const statedTotalBrewTimeSeconds = input.extraction.total_brew_time_seconds;
-  const severeTotalBrewTimeMismatch = statedTotalBrewTimeSeconds !== null &&
-    isTotalBrewTimeMismatchSevere(
-      statedTotalBrewTimeSeconds,
+  const statedTotalBrewTimeRange = resolveTotalBrewTimeStatedRange(
+    input.extraction.total_brew_time_stated_range ?? null,
+  );
+  const emittedTotalIsInsideStatedRange = statedTotalBrewTimeRange !== null &&
+    isTotalBrewTimeInsideStatedRange(
       emittedTotalBrewTimeSeconds,
+      statedTotalBrewTimeRange,
     );
+  // A stated range supersedes a scalar point/landmark for total-time
+  // validation. Remove provenance.ts's scalar-based total finding, then
+  // add a range-based finding only when the final total is outside the
+  // inclusive window. Other timing findings remain untouched.
+  const timingFindings = statedTotalBrewTimeRange === null
+    ? timingResult.findings
+    : [
+      ...timingResult.findings.filter((finding) =>
+        finding.code !== "total_brew_time_mismatch"
+      ),
+      ...(emittedTotalIsInsideStatedRange
+        ? []
+        : [{
+          code: "total_brew_time_mismatch" as const,
+          step_index: -1,
+          message:
+            `The source states a total brew time range of ${statedTotalBrewTimeRange.low}-${statedTotalBrewTimeRange.high}s, but the final brew steps sum to ${emittedTotalBrewTimeSeconds}s.`,
+        }]),
+    ];
+  const severeTotalBrewTimeMismatch = statedTotalBrewTimeRange !== null
+    ? !emittedTotalIsInsideStatedRange
+    : statedTotalBrewTimeSeconds !== null &&
+      isTotalBrewTimeMismatchSevere(
+        statedTotalBrewTimeSeconds,
+        emittedTotalBrewTimeSeconds,
+      );
   // verify mode blocks on every timing finding unconditionally, exactly as
   // before (preserveStepCount, untouched). Extract mode still only WARNS on
   // an ordinary derived-duration/elapsed-landmark finding, exactly as
@@ -7511,7 +7618,7 @@ function finalizeDraftResponse(input: {
     return finding.code === "total_brew_time_mismatch" &&
       severeTotalBrewTimeMismatch;
   };
-  const timingValidationIssues: ValidationIssue[] = timingResult.findings
+  const timingValidationIssues: ValidationIssue[] = timingFindings
     .filter(isBlockingTimingFinding)
     .map((finding: TimingProvenanceFinding) => ({
       code: finding.code,
@@ -7520,7 +7627,7 @@ function finalizeDraftResponse(input: {
         : "extraction.total_brew_time_seconds",
       message: finding.message,
     }));
-  const timingWarnings = timingResult.findings
+  const timingWarnings = timingFindings
     .filter((finding) => !isBlockingTimingFinding(finding))
     .map((finding) => finding.message);
 
