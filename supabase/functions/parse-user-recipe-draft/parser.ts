@@ -147,6 +147,18 @@ const extractedStepSchema = z.object({
       unit: z.string().trim().min(1),
     }),
   ).default([]),
+  // E4 (plan 023): numeric rates mentioned by this step, represented by
+  // their numerator value/unit (for example 5 g in "5 grams per second").
+  // These are not recipe quantities and must neither scale nor enter amount
+  // provenance. The multilingual extraction model makes the semantic call;
+  // an English rate regex remains only as a compatibility fallback. Optional
+  // so stored captures and pre-existing typed fixtures continue to parse.
+  rate_amounts: z.array(
+    z.object({
+      value: z.number(),
+      unit: z.string().trim().min(1),
+    }),
+  ).nullable().optional(),
   // Phase C3 (F29): labels what this step DOES — independent of the
   // language it's written in — so role-detection (isDrawdownLikeStep, and
   // bloom/drawdown selection in splitDerivedBrewStepDurationsFromTarget)
@@ -289,6 +301,13 @@ const normalizedStepSchema = z.object({
       unit: z.string().trim().min(1),
     }),
   ).default([]),
+  // See extractedStepSchema.rate_amounts — carried through with the step.
+  rate_amounts: z.array(
+    z.object({
+      value: z.number(),
+      unit: z.string().trim().min(1),
+    }),
+  ).nullable().optional(),
   // See extractedStepSchema.step_role — carried through unchanged (or
   // reassigned if a step is split/merged and its role no longer applies
   // cleanly to the resulting step).
@@ -364,6 +383,9 @@ export type DraftStep = {
   duration_is_stated: boolean;
   // See extractedStepSchema.scalable_amounts.
   scalable_amounts: Array<{ value: number; unit: string }>;
+  // See extractedStepSchema.rate_amounts. Internal provenance metadata; it
+  // is additive alongside the already-exposed scalable_amounts field.
+  rate_amounts?: Array<{ value: number; unit: string }>;
   // See extractedStepSchema.step_role.
   step_role:
     | "preparation"
@@ -1143,6 +1165,7 @@ const TEMPERATURE_MENTION_REGEX =
 
 function normalizeTemperatureMentionsInText(
   value: string,
+  resolvedTemperatureCelsius?: number,
 ): { text: string; wasNormalized: boolean } {
   let wasNormalized = false;
 
@@ -1155,10 +1178,13 @@ function normalizeTemperatureMentionsInText(
       }
 
       const unit = String(unitValue).toLowerCase();
-      const normalizedNumeric = unit.startsWith("f")
-        ? convertFahrenheitToCelsius(numeric)
-        : Number(numeric.toFixed(1));
-      const replacement = `${formatTemperatureNumber(normalizedNumeric)}C`;
+      const normalizedNumeric = resolvedTemperatureCelsius ??
+        (unit.startsWith("f")
+          ? convertFahrenheitToCelsius(numeric)
+          : Number(numeric.toFixed(1)));
+      const replacement = `${formatTemperatureNumber(normalizedNumeric)}${
+        resolvedTemperatureCelsius !== undefined ? "°C" : "C"
+      }`;
 
       if (replacement !== fullMatch) {
         wasNormalized = true;
@@ -1318,6 +1344,17 @@ function normalizeDraftTemperatures(
         ...normalized.recipe,
         water_temp: resolvedRange.celsius,
       },
+      // E5 (plan 023): the deterministic range result is authoritative in
+      // every user-visible representation. Phase E already made the scalar
+      // and warning agree; also replace any inline temperature mention so a
+      // model's incorrect arithmetic cannot survive in step prose.
+      steps: normalized.steps.map((step) => ({
+        ...step,
+        description_template: normalizeTemperatureMentionsInText(
+          step.description_template,
+          resolvedRange.celsius,
+        ).text,
+      })),
     };
   }
 
@@ -1878,6 +1915,59 @@ function resolveAmountPlaceholder(args: {
 // "0". Shared by both the range and single-amount passes below.
 const MIN_SCALABLE_AMOUNT_RATIO = 0.02;
 
+function matchesStructuredRateAmount(
+  rateAmounts: Array<{ value: number; unit: string }>,
+  value: number,
+  unit: string,
+): boolean {
+  const normalizedUnit = normalizeExpressionUnit(unit).trim().toLowerCase();
+  return rateAmounts.some((rate) =>
+    normalizeExpressionUnit(rate.unit).trim().toLowerCase() ===
+      normalizedUnit && Math.abs(rate.value - value) < 0.01
+  );
+}
+
+// E4: if a provider has already turned a stated rate into a scalable
+// expression, restore its literal numerator. This is driven exclusively by
+// the structured multilingual rate signal, never by interpreting prose here.
+function restoreRateExpressionsToLiterals(args: {
+  description: string;
+  coffeeAmount: number | null;
+  waterAmount: number | null;
+  rateAmounts: Array<{ value: number; unit: string }>;
+}): string {
+  if (args.rateAmounts.length === 0) {
+    return args.description;
+  }
+
+  return args.description.replace(
+    cloneRegex(EXPRESSION_REGEX),
+    (fullMatch, multiplierValue, placeholderValue, unitValue) => {
+      const multiplier = Number(multiplierValue);
+      const baseAmount = String(placeholderValue).toLowerCase() ===
+          "final_coffee_amount"
+        ? args.coffeeAmount
+        : args.waterAmount;
+      if (!Number.isFinite(multiplier) || baseAmount === null) {
+        return fullMatch;
+      }
+
+      const renderedValue = Number((multiplier * baseAmount).toFixed(2));
+      const unit = normalizeExpressionUnit(String(unitValue ?? ""));
+      const rate = args.rateAmounts.find((candidate) =>
+        matchesStructuredRateAmount([candidate], renderedValue, unit)
+      );
+      if (!rate) {
+        return fullMatch;
+      }
+
+      return `${formatCompactNumber(rate.value)}${
+        unit || normalizeExpressionUnit(rate.unit)
+      }`;
+    },
+  );
+}
+
 function convertNumericValuesToExpressions(args: {
   description: string;
   stepKind: "preparation" | "brew";
@@ -1890,6 +1980,10 @@ function convertNumericValuesToExpressions(args: {
   // make the list and stay literal even if they'd otherwise parse as a
   // scalable amount near a coffee/water keyword.
   scalableAmounts: Array<{ value: number; unit: string }>;
+  // E4: numerator values that are rates, not recipe quantities. A matching
+  // number must remain literal even when scalable_amounts is empty and the
+  // legacy regex-only conversion fallback is active.
+  rateAmounts: Array<{ value: number; unit: string }>;
   // See extractedStepSchema.step_role. Passed through to
   // resolveAmountPlaceholder as a secondary, language-agnostic tiebreaker
   // (defect 1 follow-up) — optional so callers that predate step_role
@@ -2028,6 +2122,10 @@ function convertNumericValuesToExpressions(args: {
     (fullMatch, numericValue, unit, offset, fullDescription) => {
       const value = Number(numericValue);
       if (!Number.isFinite(value) || value < 0.1) {
+        return fullMatch;
+      }
+
+      if (matchesStructuredRateAmount(args.rateAmounts, value, String(unit))) {
         return fullMatch;
       }
 
@@ -2641,6 +2739,7 @@ function buildExtractionSystemPrompt(): string {
     "If no total brew time is stated for this recipe, total_brew_time_seconds must be null.",
     "Each step's scalable_amounts must list ONLY the amounts in that step's raw_text that are genuine recipe quantities: coffee or water that this recipe's own brew actually uses. Never include equipment capacities (e.g. a reservoir or tank size), product specifications, paper or filter weights, ratios quoted as an aside, comparisons to other recipes, or any number mentioned only in commentary. Example: a Gabi Dripmaster's '120ml reservoir' is equipment capacity, not a scalable amount, even in a step that also pours water. When in doubt, leave an amount out of scalable_amounts.",
     "scalable_amounts may be an empty array when a step has no genuine scalable coffee/water amount.",
+    "Each step's rate_amounts must list numeric RATES stated in that step, using the numerator value and unit exactly as stated: for example '5 grams a second' becomes [{ value: 5, unit: 'grams' }]. A rate is not a recipe quantity and must never also appear in scalable_amounts. Use an empty array when the step states no rate. Judge this from the meaning in the source language, not from an English keyword list.",
     "Each step's step_role labels what that step DOES, independent of the language it is written in. Use 'preparation' for setup before brewing starts, 'bloom' for the initial wetting pour, 'pour' for any subsequent water addition, 'stir' for a stir/swirl/agitate action with no water added, 'drawdown' for waiting for the bed to drain after the last pour, and 'serve' for decanting, straining, or serving. Use null only when no role clearly applies.",
     "step_role describes the step's function, not its wording or language — for example a German step whose raw_text is 'Vollständig durchlaufen lassen.' (let it drain completely) is step_role 'drawdown', exactly like an English 'Let it fully draw down.' would be.",
     "grind_size must be a SHORT grind descriptor only — a noun phrase like 'Medium-fine' or 'Coarse, like sea salt' — never a full sentence, an instruction, or a total-brew-time statement. It is easy to mis-grab a nearby sentence that merely mentions grinding: 'Grind fine for a total brew time of 2 to 2.5 minutes.' is an INSTRUCTION about brew time, not a grind size, even though it contains the word 'grind'. If the source does not clearly state what grind setting to use, leave grind_size null — do not guess, and do not copy in the surrounding sentence just to have something non-null.",
@@ -2679,6 +2778,7 @@ function buildExtractionUserPrompt(input: {
             starts_timer: "boolean",
             duration_is_stated: "boolean",
             scalable_amounts: [{ value: "number", unit: "string" }],
+            rate_amounts: [{ value: "number", unit: "string" }],
             step_role: "preparation|bloom|pour|stir|drawdown|serve|null",
           },
         ],
@@ -2780,6 +2880,7 @@ function buildNormalizationSystemPrompt(mode: RecipeDraftParserMode): string {
     "starts_timer must stay true on only the single normalized step that starts the timer or begins the first pour, and false on every other step.",
     "duration_is_stated must stay true only when the source text explicitly gave a duration for that step; never set it true because you inferred or estimated a duration_seconds value yourself.",
     "Each extracted step also carries scalable_amounts. Carry it through onto whichever normalized step corresponds to that original action, splitting or merging the list along with the step. scalable_amounts must list ONLY amounts that are genuine coffee or water quantities this recipe's own brew uses — never equipment capacities, product specifications, paper or filter weights, ratios quoted as an aside, comparisons to other recipes, or numbers in commentary. Only convert a fixed numeric amount into a scalable expression in description_template when it is listed in that step's scalable_amounts.",
+    "Each extracted step also carries rate_amounts. Carry every stated numeric rate through onto the corresponding normalized step, splitting or merging the list with the step. A rate must stay literal prose in description_template and must never become a scalable expression or appear in scalable_amounts.",
     "Each extracted step also carries step_role, labelling what that step DOES independent of the language it is written in: 'preparation' (setup before brewing starts), 'bloom' (the initial wetting pour), 'pour' (any subsequent water addition), 'stir' (stir/swirl/agitate with no water added), 'drawdown' (waiting for the bed to drain after the last pour), or 'serve' (decanting, straining, or serving). Carry it through onto whichever normalized step corresponds to that original action, splitting or merging steps as needed; if you split or merge a step, assign step_role yourself so it still correctly describes the resulting step's function. Example: a German 'Vollständig durchlaufen lassen.' (let it drain completely) is step_role 'drawdown', exactly like an English 'Let it fully draw down.'",
   ];
 
@@ -2838,6 +2939,7 @@ function buildNormalizationUserPrompt(input: {
             starts_timer: "boolean",
             duration_is_stated: "boolean",
             scalable_amounts: [{ value: "number", unit: "string" }],
+            rate_amounts: [{ value: "number", unit: "string" }],
             step_role: "preparation|bloom|pour|stir|drawdown|serve|null",
           },
         ],
@@ -2937,6 +3039,7 @@ function buildRepairSystemPrompt(mode: RecipeDraftParserMode): string {
     "starts_timer must stay true on only the single step that starts the timer or begins the first pour, and false on every other step.",
     "duration_is_stated must stay true only when the source text explicitly gave a duration for that step; never set it true because you inferred or estimated a duration_seconds value yourself.",
     "Each normalized step also carries scalable_amounts from the extraction stage. Keep already-correct values stable and carry them onto whichever step corresponds to the original action. scalable_amounts must list ONLY amounts that are genuine coffee or water quantities this recipe's own brew uses — never equipment capacities, product specifications, paper or filter weights, ratios quoted as an aside, comparisons to other recipes, or numbers in commentary.",
+    "Each normalized step also carries rate_amounts from extraction. Keep those rates attached to the corresponding step and literal in description_template; never turn one into a scalable expression or move it into scalable_amounts.",
     "Each normalized step also carries step_role from the extraction stage — one of preparation, bloom, pour, stir, drawdown, or serve, labelling what that step DOES independent of the language it is written in (e.g. a German 'Vollständig durchlaufen lassen.' is step_role 'drawdown', exactly like an English 'Let it fully draw down.'). Keep already-correct values stable and carry them onto whichever step corresponds to the original action.",
   ];
 
@@ -2990,7 +3093,7 @@ function buildCumulativeRewriteSystemPrompt(
     "You rewrite coffee recipe brew-step wording for Timer.Coffee.",
     "Return only valid JSON.",
     "Preserve the original language of the step descriptions. Do not translate.",
-    "Keep step count, step order, kind, duration_seconds, description_source, elapsed_seconds, starts_timer, duration_is_stated, scalable_amounts, and step_role unchanged.",
+    "Keep step count, step order, kind, duration_seconds, description_source, elapsed_seconds, starts_timer, duration_is_stated, scalable_amounts, rate_amounts, and step_role unchanged.",
     "Only rewrite brew-step description_template fields when needed.",
   ];
 
@@ -3042,6 +3145,7 @@ function buildCumulativeRewriteUserPrompt(input: {
             starts_timer: "boolean",
             duration_is_stated: "boolean",
             scalable_amounts: [{ value: "number", unit: "string" }],
+            rate_amounts: [{ value: "number", unit: "string" }],
             step_role: "preparation|bloom|pour|stir|drawdown|serve|null",
           },
         ],
@@ -3354,16 +3458,33 @@ function normalizeStepDescriptionTemplate(args: {
   step: NormalizedDraft["steps"][number];
   coffeeAmount: number | null;
   waterAmount: number | null;
+  resolvedTemperatureCelsius?: number;
   mode: RecipeDraftParserMode;
 }): string {
+  // Verify mode receives an already-formed recipe. Its submitted step text is
+  // the authority: even a syntactically valid model-authored expression can
+  // invent an amount absent from that step (E3's three live captures). Do not
+  // attempt to distinguish acceptable from unacceptable rewrites downstream;
+  // preserve description_source byte-for-byte as the mode promises.
+  if (args.mode === "verify") {
+    return args.step.description_source;
+  }
+
   const normalizeCandidate = (candidate: string) => {
-    const normalizedExpressionMathTemplate = normalizeExpressionLikeMath({
+    const rateSafeCandidate = restoreRateExpressionsToLiterals({
       description: candidate,
+      coffeeAmount: args.coffeeAmount,
+      waterAmount: args.waterAmount,
+      rateAmounts: args.step.rate_amounts ?? [],
+    });
+    const normalizedExpressionMathTemplate = normalizeExpressionLikeMath({
+      description: rateSafeCandidate,
       coffeeAmount: args.coffeeAmount,
       waterAmount: args.waterAmount,
     });
     const normalizedTemperatureTemplate = normalizeTemperatureMentionsInText(
       normalizedExpressionMathTemplate,
+      args.resolvedTemperatureCelsius,
     ).text;
     const normalizedTemplate = convertNumericValuesToExpressions({
       description: normalizedTemperatureTemplate,
@@ -3371,12 +3492,9 @@ function normalizeStepDescriptionTemplate(args: {
       coffeeAmount: args.coffeeAmount,
       waterAmount: args.waterAmount,
       scalableAmounts: args.step.scalable_amounts,
+      rateAmounts: args.step.rate_amounts ?? [],
       stepRole: args.step.step_role,
     });
-
-    if (args.mode === "verify") {
-      return normalizedTemplate;
-    }
 
     return normalizeTemplateTextPolish(
       normalizeCumulativeWaterWording(
@@ -3400,6 +3518,7 @@ function buildDraftSteps(input: {
   steps: NormalizedDraft["steps"];
   coffeeAmount: number | null;
   waterAmount: number | null;
+  resolvedTemperatureCelsius?: number;
   mode: RecipeDraftParserMode;
 }): DraftStep[] {
   return input.steps.map((step, index) => {
@@ -3407,6 +3526,7 @@ function buildDraftSteps(input: {
       step,
       coffeeAmount: input.coffeeAmount,
       waterAmount: input.waterAmount,
+      resolvedTemperatureCelsius: input.resolvedTemperatureCelsius,
       mode: input.mode,
     });
 
@@ -3425,6 +3545,9 @@ function buildDraftSteps(input: {
       starts_timer: step.starts_timer,
       duration_is_stated: step.duration_is_stated,
       scalable_amounts: step.scalable_amounts,
+      ...(step.rate_amounts?.length
+        ? { rate_amounts: step.rate_amounts }
+        : {}),
       step_role: step.step_role,
       expressions: extractExpressions(
         normalizedTemplate,
@@ -3514,6 +3637,10 @@ function foldPreTimerStepsIntoPreparation(
 
   const preparationStep = input.steps[0];
   const foldedSteps = input.steps.slice(1, startsTimerIndex);
+  const mergedRateAmounts = [
+    ...(preparationStep.rate_amounts ?? []),
+    ...foldedSteps.flatMap((step) => step.rate_amounts ?? []),
+  ];
 
   const mergedPreparationStep: DraftStep = {
     ...preparationStep,
@@ -3525,6 +3652,9 @@ function foldPreTimerStepsIntoPreparation(
       preparationStep.description_template,
       ...foldedSteps.map((step) => step.description_template),
     ]),
+    ...(mergedRateAmounts.length > 0
+      ? { rate_amounts: mergedRateAmounts }
+      : {}),
   };
 
   const remainingSteps = [
@@ -5755,6 +5885,15 @@ function buildRenderedAmountsFromDraftSteps(
       if (expression.preview_value === null) {
         continue;
       }
+      if (
+        matchesStructuredRateAmount(
+          step.rate_amounts ?? [],
+          expression.preview_value,
+          expression.unit,
+        )
+      ) {
+        continue;
+      }
       rendered.push({
         step_index: stepIndex,
         value: expression.preview_value,
@@ -5777,10 +5916,24 @@ function buildRenderedAmountsFromDraftSteps(
       if (!Number.isFinite(value)) {
         continue;
       }
+      const unit = normalizeExpressionUnit(match[2] ?? "");
+      const tail = withoutExpressions.slice(
+        (match.index ?? 0) + match[0].length,
+        (match.index ?? 0) + match[0].length + 24,
+      );
+      if (
+        matchesStructuredRateAmount(step.rate_amounts ?? [], value, unit) ||
+        RATE_CONTEXT_REGEX.test(tail)
+      ) {
+        // Structured rate metadata is the multilingual mechanism. The regex
+        // is retained only so captures/providers predating rate_amounts do not
+        // regress (including the stored English Kalita E4 capture).
+        continue;
+      }
       rendered.push({
         step_index: stepIndex,
         value,
-        unit: normalizeExpressionUnit(match[2] ?? ""),
+        unit,
         is_cumulative_water: false,
       });
     }
@@ -7316,6 +7469,9 @@ function finalizeDraftResponse(input: {
     steps: normalizedWithBalancedCopy.steps,
     coffeeAmount: normalizedWithBalancedCopy.recipe.coffee_amount,
     waterAmount: normalizedWithBalancedCopy.recipe.water_amount,
+    resolvedTemperatureCelsius: resolveWaterTempStatedRange(
+      input.extraction.water_temp_stated_range ?? null,
+    )?.celsius,
     mode: input.mode,
   });
   const foldedDraftSteps = foldPreTimerStepsIntoPreparation({
@@ -7981,6 +8137,9 @@ export function replayFinalizeDraftResponseFromStageOutputs(input: {
       steps: normalized.steps,
       coffeeAmount: normalized.recipe.coffee_amount,
       waterAmount: normalized.recipe.water_amount,
+      resolvedTemperatureCelsius: resolveWaterTempStatedRange(
+        extraction.water_temp_stated_range ?? null,
+      )?.celsius,
       mode: input.mode,
     });
     for (
@@ -8496,6 +8655,9 @@ export function createRecipeDraftParser(
         steps: normalized.steps,
         coffeeAmount: normalized.recipe.coffee_amount,
         waterAmount: normalized.recipe.water_amount,
+        resolvedTemperatureCelsius: resolveWaterTempStatedRange(
+          extraction.water_temp_stated_range ?? null,
+        )?.celsius,
         mode: input.mode ?? "extract",
       });
       const detectedInputLanguage = getPrimaryLanguageSignal([

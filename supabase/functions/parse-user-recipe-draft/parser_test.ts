@@ -2707,6 +2707,15 @@ Deno.test("D5: 205-210°F range (moka pot shape) resolves deterministically to i
             ...createNormalized().recipe,
             water_temp: 96.1,
           },
+          steps: createNormalized().steps.map((step, index) =>
+            index === 0
+              ? {
+                ...step,
+                description_source: "Fill the base with water at 96.1C.",
+                description_template: "Fill the base with water at 96.1C.",
+              }
+              : step
+          ),
         },
         calls: [],
       }),
@@ -2733,6 +2742,11 @@ Deno.test("D5: 205-210°F range (moka pot shape) resolves deterministically to i
       "Water temperature was normalized from the stated 205-210°F range to its midpoint, 97.5°C.",
     ),
     "Expected a warning built from the value actually emitted.",
+  );
+  assertEquals(
+    result.draft.steps[0].description_template,
+    "Fill the base with water at 97.5°C.",
+    "Expected the deterministic midpoint to replace the model's wrong inline arithmetic too.",
   );
   assert(
     !result.warnings.includes(
@@ -11552,6 +11566,155 @@ Deno.test("D9: scalable_amounts on the ice's step is populated to match the amou
   );
 });
 
+Deno.test("Phase B/E4: structured rate metadata restores a model-authored scalable expression and excludes the rate from amount provenance", async () => {
+  const rateText =
+    "Gieße mit ungefähr 5 g pro Sekunde weiter, bis 250 g erreicht sind.";
+  const extraction: ExtractionResult = {
+    ...createExtraction(),
+    detected_input_language: "de",
+    steps: createExtraction().steps.map((step, index) =>
+      index === 1
+        ? {
+          ...step,
+          raw_text: rateText,
+          scalable_amounts: [{ value: 250, unit: "g" }],
+          rate_amounts: [{ value: 5, unit: "g" }],
+        }
+        : step
+    ),
+  };
+  const normalized: NormalizedDraft = {
+    ...createNormalized(),
+    detected_input_language: "de",
+    steps: createNormalized().steps.map((step, index) =>
+      index === 1
+        ? {
+          ...step,
+          description_source: rateText,
+          description_template:
+            "Gieße mit ungefähr (0.02 x <final_water_amount>)g pro Sekunde weiter, bis (1 x <final_water_amount>)g erreicht sind.",
+          scalable_amounts: [{ value: 250, unit: "g" }],
+          rate_amounts: [{ value: 5, unit: "g" }],
+        }
+        : step
+    ),
+  };
+  const parser = createRecipeDraftParser({
+    providers: [createMockProvider({
+      name: "groq",
+      extraction,
+      normalized,
+      calls: [],
+    })],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: rateText,
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Hario V60" },
+    ],
+    requestId: "req-phase-b-e4-structured-rate",
+  });
+
+  assert(
+    result.draft.steps[1].description_template.includes(
+      "5g pro Sekunde",
+    ),
+    `Expected the structured multilingual rate to be restored as literal prose, got: ${result.draft.steps[1].description_template}`,
+  );
+  assert(
+    !result.draft.steps[1].expressions.some((expression) =>
+      expression.preview_value === 5
+    ),
+    `Expected no scalable 5g rate expression, got: ${
+      JSON.stringify(result.draft.steps[1].expressions)
+    }`,
+  );
+  assert(
+    !result.validation.issues.some((issue) =>
+      issue.code === "unverifiable_amount" && issue.message.includes("5g")
+    ),
+    `Expected the rate to stay outside amount provenance, got: ${
+      JSON.stringify(result.validation.issues)
+    }`,
+  );
+});
+
+Deno.test("Phase B/E4 compatibility: a pre-rate_amounts English capture does not provenance-check a literal rate as a dose", async () => {
+  const rateText = "Continue at about 5g per second until reaching 250g.";
+  const extraction: ExtractionResult = {
+    ...createExtraction(),
+    extracted_amounts: G22_BASE_AMOUNTS,
+    steps: [
+      createExtraction().steps[0],
+      {
+        ...createExtraction().steps[1],
+        raw_text: "Start the timer.",
+        scalable_amounts: [],
+      },
+      {
+        ...createExtraction().steps[2],
+        raw_text: rateText,
+        scalable_amounts: [{ value: 250, unit: "g" }],
+      },
+    ],
+  };
+  const normalized: NormalizedDraft = {
+    ...createNormalized(),
+    extracted_amounts: G22_BASE_AMOUNTS,
+    steps: [
+      createNormalized().steps[0],
+      {
+        ...createNormalized().steps[1],
+        description_source: "Start the timer.",
+        description_template: "Start the timer.",
+        scalable_amounts: [],
+      },
+      {
+        ...createNormalized().steps[2],
+        description_source: rateText,
+        description_template:
+          "Continue at about 5g per second until reaching (1 x <final_water_amount>)g.",
+        scalable_amounts: [{ value: 250, unit: "g" }],
+      },
+    ],
+  };
+  const parser = createRecipeDraftParser({
+    providers: [createMockProvider({
+      name: "groq",
+      extraction,
+      normalized,
+      calls: [],
+    })],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: `Rinse the filter and add 15g coffee. ${rateText}`,
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Hario V60" },
+    ],
+    requestId: "req-phase-b-e4-legacy-rate",
+  });
+
+  assert(
+    !result.validation.issues.some((issue) =>
+      issue.code === "unverifiable_amount" && issue.message.includes("5g")
+    ),
+    `Expected the stored-capture compatibility fallback to ignore the 5g rate, got: ${
+      JSON.stringify(result.validation.issues)
+    }`,
+  );
+  assertEquals(
+    result.validation.is_publishable,
+    true,
+    "Expected the legacy English rate shape to remain publishable.",
+  );
+});
+
 Deno.test("D9: a recipe with no non-brew amount is completely unaffected by the backstop (no-op control)", async () => {
   const calls: Array<{ provider: string; stage: string }> = [];
   const parser = createRecipeDraftParser({
@@ -14600,6 +14763,60 @@ Deno.test("Phase 2: verify mode preserves a leading-timestamp step and a 'pour t
     result.draft.steps[2].description_template,
     "Pour to the fill line and wait.",
     "Expected verify mode to keep 'pour to' wording byte-identical to description_source instead of rewriting it to 'pour up to'.",
+  );
+});
+
+Deno.test("Phase B/E3: verify mode does not insert a scalar-derived coffee amount absent from the submitted step", async () => {
+  const normalized: NormalizedDraft = {
+    ...createNormalized(),
+    steps: [
+      {
+        ...createNormalized().steps[0],
+        description_source: "Add coffee",
+        // Exact live-capture mechanism: a valid scalar placeholder is present
+        // even though the submitted step contained no amount.
+        description_template: "Add (1 x <final_coffee_amount>)g coffee",
+        scalable_amounts: [],
+      },
+      ...createNormalized().steps.slice(1),
+    ],
+  };
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction: createExtraction(),
+        normalized,
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: "Add coffee",
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Hario V60" },
+    ],
+    requestId: "req-phase-b-e3",
+    mode: "verify",
+  });
+
+  assertEquals(
+    result.draft.steps[0].description_template,
+    "Add coffee",
+    "Expected verify mode to fall back to the submitted amount-free step.",
+  );
+  assertEquals(
+    result.draft.steps[0].preview_text,
+    "Add coffee",
+    "Expected the rendered verify text to stay byte-identical.",
+  );
+  assertEquals(
+    result.draft.steps[0].expressions,
+    [],
+    "Expected no scalar-derived expression to survive.",
   );
 });
 
