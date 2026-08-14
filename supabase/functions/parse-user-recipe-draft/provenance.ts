@@ -87,6 +87,8 @@ export type RenderedAmount = {
   step_index: number;
   value: number;
   unit: string;
+  /** Present only for a recipe-level scalar rendered outside any step. */
+  recipe_field?: "coffee_amount" | "water_amount";
   /** True when the amount is a cumulative water target rather than an addition. */
   is_cumulative_water: boolean;
 };
@@ -102,6 +104,7 @@ export type ProvenanceFindingCode =
 export type ProvenanceFinding = {
   code: ProvenanceFindingCode;
   step_index: number;
+  recipe_field?: "coffee_amount" | "water_amount";
   message: string;
 };
 
@@ -486,15 +489,26 @@ function recomputeDerivedValue(
 // pairing closest to how a human reading the recipe would actually
 // resolve it, not the one that is superficially "more specific" on paper.
 const SENTINEL_STEP_DISTANCE = 0;
+const RECIPE_SCALAR_POSITIONAL_FALLBACK_DISTANCE = Number.MAX_SAFE_INTEGER;
 
 function stepDistance(
   recordStepIndex: number,
-  renderedStepIndex: number,
+  rendered: RenderedAmount,
 ): number {
-  if (recordStepIndex === -1 || renderedStepIndex === -1) {
+  // D13: recipe scalars have no position. Prefer their dedicated -1 record
+  // over every positional duplicate, while retaining a last-resort fallback
+  // when an older provider recorded the scalar only on a step. Step-rendered
+  // amounts keep the established D4 rule where a -1 record ties an exact
+  // positional match at distance zero.
+  if (rendered.recipe_field) {
+    return recordStepIndex === -1
+      ? SENTINEL_STEP_DISTANCE
+      : RECIPE_SCALAR_POSITIONAL_FALLBACK_DISTANCE;
+  }
+  if (recordStepIndex === -1 || rendered.step_index === -1) {
     return SENTINEL_STEP_DISTANCE;
   }
-  return Math.abs(recordStepIndex - renderedStepIndex);
+  return Math.abs(recordStepIndex - rendered.step_index);
 }
 
 // Tie rule (needed whenever two or more candidates land on the exact same
@@ -540,7 +554,7 @@ function matchRenderedAmountsToProvenance(
       candidates.push({
         renderedIndex,
         recordIndex,
-        distance: stepDistance(record.step_index, rendered.step_index),
+        distance: stepDistance(record.step_index, rendered),
       });
     });
   });
@@ -611,9 +625,12 @@ export function verifyAmountProvenance(
       findings.push({
         code: "unverifiable_amount",
         step_index: rendered.step_index,
+        recipe_field: rendered.recipe_field,
         message:
-          `Step ${
-            rendered.step_index + 1
+          `${
+            rendered.recipe_field
+              ? `Recipe ${rendered.recipe_field}`
+              : `Step ${rendered.step_index + 1}`
           } states ${rendered.value}${rendered.unit}, ` +
           `which does not trace to any amount recorded from the source.`,
       });
@@ -647,12 +664,14 @@ export function verifyAmountProvenance(
     // most likely belongs to different source content entirely, which is
     // exactly the shape of mis-binding this check exists to catch.
     if (
+      !rendered.recipe_field &&
       record.step_index >= 0 &&
       Math.abs(record.step_index - rendered.step_index) > 1
     ) {
       findings.push({
         code: "amount_step_binding_mismatch",
         step_index: rendered.step_index,
+        recipe_field: rendered.recipe_field,
         message: `${rendered.value}${rendered.unit} was recorded for step ` +
           `${record.step_index + 1} but appears on step ${
             rendered.step_index + 1
@@ -665,6 +684,7 @@ export function verifyAmountProvenance(
       findings.push({
         code: "inferred_amount_not_permitted",
         step_index: rendered.step_index,
+        recipe_field: rendered.recipe_field,
         message:
           `${rendered.value}${rendered.unit} is marked inferred. Amounts must ` +
           `come from the source; only water temperature and grind size may be inferred.`,
@@ -677,6 +697,7 @@ export function verifyAmountProvenance(
         findings.push({
           code: "unverifiable_amount",
           step_index: rendered.step_index,
+          recipe_field: rendered.recipe_field,
           message:
             `${rendered.value}${rendered.unit} is marked literal but carries no source quote.`,
         });
@@ -686,6 +707,7 @@ export function verifyAmountProvenance(
         findings.push({
           code: "amount_provenance_mismatch",
           step_index: rendered.step_index,
+          recipe_field: rendered.recipe_field,
           message:
             `${rendered.value}${rendered.unit} cites "${record.source_quote}", ` +
             `which does not appear in the submitted text.`,
@@ -699,6 +721,7 @@ export function verifyAmountProvenance(
       findings.push({
         code: "unsupported_derivation_rule",
         step_index: rendered.step_index,
+        recipe_field: rendered.recipe_field,
         message: `${rendered.value}${rendered.unit} claims derivation rule ` +
           `"${record.rule ?? "none"}", which is not a recognised rule.`,
       });
@@ -712,6 +735,7 @@ export function verifyAmountProvenance(
       findings.push({
         code: "amount_provenance_mismatch",
         step_index: rendered.step_index,
+        recipe_field: rendered.recipe_field,
         message:
           `${rendered.value}${rendered.unit} is derived by "${record.rule}", but ` +
           `the rule itself does not appear in the submitted text.`,
@@ -724,6 +748,7 @@ export function verifyAmountProvenance(
       findings.push({
         code: "unsupported_derivation_rule",
         step_index: rendered.step_index,
+        recipe_field: rendered.recipe_field,
         message:
           `${rendered.value}${rendered.unit} could not be recomputed from rule ` +
           `"${record.rule}" — its inputs are missing or incomplete.`,
@@ -735,6 +760,7 @@ export function verifyAmountProvenance(
       findings.push({
         code: "amount_provenance_mismatch",
         step_index: rendered.step_index,
+        recipe_field: rendered.recipe_field,
         message:
           `${rendered.value}${rendered.unit} does not match its stated derivation ` +
           `"${record.rule}", which yields ${recomputed}.`,

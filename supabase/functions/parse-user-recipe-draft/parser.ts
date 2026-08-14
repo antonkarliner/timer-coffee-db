@@ -5942,6 +5942,38 @@ function buildRenderedAmountsFromDraftSteps(
   return rendered;
 }
 
+// D13 (plan 020): recipe scalars are user-visible brew facts and the bases
+// every scalable step expression uses, so they must enter the same provenance
+// gate as step amounts. They deliberately come before step renderings: the
+// matcher gives a recipe scalar's -1 provenance record priority over any
+// same-valued positional duplicate, while still allowing an older positional
+// record as a last-resort fallback (see provenance.ts stepDistance).
+function buildRenderedRecipeScalarAmounts(args: {
+  coffeeAmount: number | null;
+  waterAmount: number | null;
+}): RenderedAmount[] {
+  const rendered: RenderedAmount[] = [];
+  if (args.coffeeAmount !== null && Number.isFinite(args.coffeeAmount)) {
+    rendered.push({
+      step_index: -1,
+      recipe_field: "coffee_amount",
+      value: args.coffeeAmount,
+      unit: "",
+      is_cumulative_water: false,
+    });
+  }
+  if (args.waterAmount !== null && Number.isFinite(args.waterAmount)) {
+    rendered.push({
+      step_index: -1,
+      recipe_field: "water_amount",
+      value: args.waterAmount,
+      unit: "",
+      is_cumulative_water: false,
+    });
+  }
+  return rendered;
+}
+
 // G22 — timing landmark enforcement.
 //
 // Landmarks are captured from the draft steps AS THEY STAND RIGHT AFTER
@@ -7658,7 +7690,11 @@ function finalizeDraftResponse(input: {
   // plain object instead of running it through schema.parse) — without the
   // guard, a fixture predating this field would crash here instead of
   // correctly falling into verifyAmountProvenance's `unverified` path.
-  const renderedAmounts = buildRenderedAmountsFromDraftSteps(draftSteps);
+  const renderedStepAmounts = buildRenderedAmountsFromDraftSteps(draftSteps);
+  const renderedRecipeScalarAmounts = buildRenderedRecipeScalarAmounts({
+    coffeeAmount: normalizedWithBalancedCopy.recipe.coffee_amount,
+    waterAmount: normalizedWithBalancedCopy.recipe.water_amount,
+  });
   // Phase D + D9: uses nonBrewAmountProvenance.provenance
   // (foldRemappedExtractedAmounts, PLUS any synthetic sibling records Phase
   // D's range-endpoint backstop added, PLUS any synthetic non-brew-amount
@@ -7668,11 +7704,29 @@ function finalizeDraftResponse(input: {
   // reconstructed/derived amount needs a provenance record of its own to
   // avoid trading range_endpoint_collapsed/unverifiable_amount for
   // unverifiable_amount.
-  const provenanceResult = verifyAmountProvenance({
+  // D13: verify scalars and step renderings as two matching domains. One
+  // recipe-level record legitimately substantiates both the recipe's own dose
+  // and that same dose repeated in preparation; a single combined one-use
+  // pool would consume it for the scalar and falsely leave the step
+  // unverifiable. Pairing remains one-record-per-rendering within each domain.
+  const scalarProvenanceResult = verifyAmountProvenance({
     requestText: input.requestText,
-    renderedAmounts,
+    renderedAmounts: renderedRecipeScalarAmounts,
     provenance: nonBrewAmountProvenance.provenance,
   });
+  const stepProvenanceResult = verifyAmountProvenance({
+    requestText: input.requestText,
+    renderedAmounts: renderedStepAmounts,
+    provenance: nonBrewAmountProvenance.provenance,
+  });
+  const provenanceResult = {
+    findings: [
+      ...scalarProvenanceResult.findings,
+      ...stepProvenanceResult.findings,
+    ],
+    unverified: scalarProvenanceResult.unverified ||
+      stepProvenanceResult.unverified,
+  };
 
   // D4 (plan 016 Phase 3a): see findRangeEndpointCollapseIssues above.
   // Reuses the exact same (Phase D/D9-augmented) provenance array and
@@ -7680,7 +7734,7 @@ function finalizeDraftResponse(input: {
   // extraction pass, no new field.
   const rangeEndpointIssues = findRangeEndpointCollapseIssues(
     nonBrewAmountProvenance.provenance,
-    renderedAmounts,
+    renderedStepAmounts,
     normalizedWithBalancedCopy.recipe.coffee_amount,
     normalizedWithBalancedCopy.recipe.water_amount,
   );
@@ -7699,7 +7753,9 @@ function finalizeDraftResponse(input: {
   const provenanceIssues: ValidationIssue[] = provenanceResult.findings.map(
     (finding: ProvenanceFinding) => ({
       code: finding.code,
-      field: `steps[${finding.step_index}].description_template`,
+      field: finding.recipe_field
+        ? `recipe.${finding.recipe_field}`
+        : `steps[${finding.step_index}].description_template`,
       message: finding.message,
     }),
   );

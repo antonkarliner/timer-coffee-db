@@ -17043,6 +17043,9 @@ Deno.test("D12 control: a drawdown that is an untrustworthy end-marker BUT has a
 // The risk these tests exist to cover is the SCHEMA: rule_inputs was
 // z.record(z.number()), which rejects `parts`' array outright, so a record
 // naming this rule never survived validation to reach provenance.ts at all.
+const SUM_OF_PARTS_REQUEST_TEXT = D9_ICE_REQUEST_TEXT +
+  " The recipe combines 150 g hot water and 150 g ice.";
+
 function createSumOfPartsExtraction(): ExtractionResult {
   const base = createD9IceExtraction();
   return {
@@ -17056,7 +17059,7 @@ function createSumOfPartsExtraction(): ExtractionResult {
           provenance: "derived" as const,
           source_quote: null,
           rule: "sum_of_parts",
-          rule_source_quote: "300 g of water and 150 g of ice",
+          rule_source_quote: "150 g hot water and 150 g ice",
           rule_inputs: { parts: [150, 150] },
         }
         : amount
@@ -17070,7 +17073,10 @@ Deno.test("sum_of_parts: an array-valued rule_inputs survives schema validation 
       createMockProvider({
         name: "groq",
         extraction: createSumOfPartsExtraction(),
-        normalized: createD9IceNormalized(),
+        normalized: {
+          ...createD9IceNormalized(),
+          extracted_amounts: createSumOfPartsExtraction().extracted_amounts,
+        },
         calls: [],
       }),
     ],
@@ -17078,7 +17084,7 @@ Deno.test("sum_of_parts: an array-valued rule_inputs survives schema validation 
   });
 
   const result = await parser.parseDraft({
-    text: D9_ICE_REQUEST_TEXT,
+    text: SUM_OF_PARTS_REQUEST_TEXT,
     userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
     brewingMethods: [{ brewing_method_id: "v60", brewing_method: "Hario V60" }],
     requestId: "req-sum-of-parts",
@@ -17125,7 +17131,10 @@ Deno.test("sum_of_parts: parts that do not add up to the recorded value still fa
       createMockProvider({
         name: "groq",
         extraction: broken,
-        normalized: createD9IceNormalized(),
+        normalized: {
+          ...createD9IceNormalized(),
+          extracted_amounts: broken.extracted_amounts,
+        },
         calls: [],
       }),
     ],
@@ -17133,30 +17142,28 @@ Deno.test("sum_of_parts: parts that do not add up to the recorded value still fa
   });
 
   const result = await parser.parseDraft({
-    text: D9_ICE_REQUEST_TEXT,
+    text: SUM_OF_PARTS_REQUEST_TEXT,
     userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
     brewingMethods: [{ brewing_method_id: "v60", brewing_method: "Hario V60" }],
     requestId: "req-sum-of-parts-bad",
   });
 
-  // KNOWN GAP, discovered by writing this test: nothing fires. A
-  // recipe-level scalar is never verified against its provenance record,
-  // because buildRenderedAmountsFromDraftSteps collects rendered amounts
-  // from step EXPRESSIONS only — recipe.coffee_amount and
-  // recipe.water_amount are not among them. So a deliberately wrong
-  // derivation on the water total goes unchecked.
-  //
-  // This is asserted as-is rather than as the behaviour we want, so the
-  // gap is visible instead of implied. See plan 020 §3 D13. It also means
-  // sum_of_parts does not currently make water_amount *verifiable* — it
-  // documents the derivation, and becomes load-bearing the moment
-  // recipe-scalar verification exists or a step renders the total itself.
+  const scalarMismatches = result.validation.issues.filter((issue) =>
+    issue.code === "amount_provenance_mismatch" &&
+    issue.field === "recipe.water_amount"
+  );
   assertEquals(
-    result.validation.issues.length,
-    0,
-    "Documenting the gap: a recipe-level scalar's derivation is unverified, " +
-      "so even parts that do not sum produce no finding. If this assertion " +
-      "starts failing, recipe-scalar verification has arrived — flip it to " +
-      "expect a mismatch rather than deleting the test.",
+    scalarMismatches.length,
+    1,
+    `D13 must verify the 300g recipe water scalar against its -1 record and ` +
+      `catch that 100 + 100 yields 200, while the same-valued 300g step ` +
+      `continues to pair with its own positional record. Issues: ${
+        JSON.stringify(result.validation.issues)
+      }`,
+  );
+  assertEquals(
+    result.validation.is_publishable,
+    false,
+    "Expected the false recipe-scalar derivation to block publication.",
   );
 });

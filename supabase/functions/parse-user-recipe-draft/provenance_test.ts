@@ -738,6 +738,91 @@ Deno.test("D4 sentinel vs positional: a rendering exactly at a record's own step
   );
 });
 
+Deno.test("D13: a recipe scalar prefers its -1 record over a same-valued positional duplicate", () => {
+  const requestText =
+    "Use 100 g hot water plus 100 g ice, and pour to 300 g in the final step.";
+  const provenance: AmountProvenance[] = [
+    {
+      value: 300,
+      unit: "g",
+      step_index: 4,
+      provenance: "literal",
+      source_quote: "300 g",
+      rule: null,
+      rule_source_quote: null,
+      rule_inputs: null,
+    },
+    {
+      value: 300,
+      unit: "g",
+      step_index: -1,
+      provenance: "derived",
+      source_quote: null,
+      rule: "sum_of_parts",
+      rule_source_quote: "100 g hot water plus 100 g ice",
+      rule_inputs: { parts: [100, 100] },
+    },
+  ];
+  const renderedAmounts: RenderedAmount[] = [{
+    step_index: -1,
+    recipe_field: "water_amount",
+    value: 300,
+    unit: "",
+    is_cumulative_water: false,
+  }];
+
+  const result = verifyAmountProvenance({
+    requestText,
+    renderedAmounts,
+    provenance,
+  });
+
+  assertEquals(result.findings.length, 1, "Expected one scalar finding.");
+  assertEquals(
+    result.findings[0].code,
+    "amount_provenance_mismatch",
+    "Expected the broken -1 derivation to win over the positional literal.",
+  );
+  assertEquals(
+    result.findings[0].recipe_field,
+    "water_amount",
+    "Expected the finding to identify the recipe water scalar.",
+  );
+});
+
+Deno.test("D13 compatibility: a recipe scalar may fall back to an older positional record without a binding mismatch", () => {
+  const requestText = "Use 300 g water.";
+  const provenance: AmountProvenance[] = [{
+    value: 300,
+    unit: "g",
+    step_index: 4,
+    provenance: "literal",
+    source_quote: "300 g water",
+    rule: null,
+    rule_source_quote: null,
+    rule_inputs: null,
+  }];
+  const renderedAmounts: RenderedAmount[] = [{
+    step_index: -1,
+    recipe_field: "water_amount",
+    value: 300,
+    unit: "",
+    is_cumulative_water: false,
+  }];
+
+  const result = verifyAmountProvenance({
+    requestText,
+    renderedAmounts,
+    provenance,
+  });
+
+  assertEquals(
+    result.findings,
+    [],
+    "Expected a positional-only legacy scalar record to remain usable.",
+  );
+});
+
 Deno.test("D4 non-regression: a single matching record with no competing candidates behaves exactly as before this fix", () => {
   // The ordinary, overwhelmingly common case: one rendered amount, one
   // compatible record, nothing else in play. Nearest-step_index pairing
