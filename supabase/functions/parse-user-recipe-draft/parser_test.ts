@@ -16481,3 +16481,130 @@ Deno.test("D12 control: a drawdown that is an untrustworthy end-marker BUT has a
     "Expected this control to remain publishable.",
   );
 });
+
+// sum_of_parts (plan 020 §3 D9-successor): an iced recipe's water total is its
+// hot water plus its ice, and a source states those parts separately without
+// ever stating the total — production recipe 104 "James Hoffmann iced V60"
+// carries water_amount 500 as (0.4 x water) ice plus (0.6 x water) hot. The
+// rule lets that total trace instead of being blocked as unquoted.
+//
+// The risk these tests exist to cover is the SCHEMA: rule_inputs was
+// z.record(z.number()), which rejects `parts`' array outright, so a record
+// naming this rule never survived validation to reach provenance.ts at all.
+function createSumOfPartsExtraction(): ExtractionResult {
+  const base = createD9IceExtraction();
+  return {
+    ...base,
+    extracted_amounts: base.extracted_amounts!.map((amount) =>
+      amount.step_index === -1 && amount.value === 300
+        ? {
+          value: 300,
+          unit: "g",
+          step_index: -1,
+          provenance: "derived" as const,
+          source_quote: null,
+          rule: "sum_of_parts",
+          rule_source_quote: "300 g of water and 150 g of ice",
+          rule_inputs: { parts: [150, 150] },
+        }
+        : amount
+    ),
+  };
+}
+
+Deno.test("sum_of_parts: an array-valued rule_inputs survives schema validation and recomputes, rather than being rejected as an unsupported rule", async () => {
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction: createSumOfPartsExtraction(),
+        normalized: createD9IceNormalized(),
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: D9_ICE_REQUEST_TEXT,
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [{ brewing_method_id: "v60", brewing_method: "Hario V60" }],
+    requestId: "req-sum-of-parts",
+  });
+
+  // The rule name reaching provenance.ts at all is the point: before the schema
+  // widening the record was dropped in validation, so no derivation ran.
+  assert(
+    !result.validation.issues.some((issue) =>
+      issue.code === "unsupported_derivation_rule"
+    ),
+    `sum_of_parts must be a recognized rule with a working recompute. Issues: ${
+      JSON.stringify(result.validation.issues)
+    }`,
+  );
+  // 150 + 150 = 300 matches the recorded value, so the derivation verifies and
+  // nothing about this amount blocks.
+  assert(
+    !result.validation.issues.some((issue) =>
+      issue.code === "amount_provenance_mismatch"
+    ),
+    `A correctly-summing sum_of_parts record must verify. Issues: ${
+      JSON.stringify(result.validation.issues)
+    }`,
+  );
+  assertEquals(
+    result.validation.is_publishable,
+    true,
+    "Expected the draft to stay publishable with a verifying sum_of_parts total.",
+  );
+});
+
+Deno.test("sum_of_parts: parts that do not add up to the recorded value still fail, so the widened schema did not weaken the check", async () => {
+  const broken = createSumOfPartsExtraction();
+  // 100 + 100 = 200, not the 300 this record claims.
+  broken.extracted_amounts = broken.extracted_amounts!.map((amount) =>
+    amount.rule === "sum_of_parts"
+      ? { ...amount, rule_inputs: { parts: [100, 100] } }
+      : amount
+  );
+
+  const parser = createRecipeDraftParser({
+    providers: [
+      createMockProvider({
+        name: "groq",
+        extraction: broken,
+        normalized: createD9IceNormalized(),
+        calls: [],
+      }),
+    ],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: D9_ICE_REQUEST_TEXT,
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [{ brewing_method_id: "v60", brewing_method: "Hario V60" }],
+    requestId: "req-sum-of-parts-bad",
+  });
+
+  // KNOWN GAP, discovered by writing this test: nothing fires. A
+  // recipe-level scalar is never verified against its provenance record,
+  // because buildRenderedAmountsFromDraftSteps collects rendered amounts
+  // from step EXPRESSIONS only — recipe.coffee_amount and
+  // recipe.water_amount are not among them. So a deliberately wrong
+  // derivation on the water total goes unchecked.
+  //
+  // This is asserted as-is rather than as the behaviour we want, so the
+  // gap is visible instead of implied. See plan 020 §3 D13. It also means
+  // sum_of_parts does not currently make water_amount *verifiable* — it
+  // documents the derivation, and becomes load-bearing the moment
+  // recipe-scalar verification exists or a step renders the total itself.
+  assertEquals(
+    result.validation.issues.length,
+    0,
+    "Documenting the gap: a recipe-level scalar's derivation is unverified, " +
+      "so even parts that do not sum produce no finding. If this assertion " +
+      "starts failing, recipe-scalar verification has arrived — flip it to " +
+      "expect a mismatch rather than deleting the test.",
+  );
+});

@@ -25,7 +25,8 @@ export type DerivedRule =
   | "concentration"
   | "concentration_water_from_coffee"
   | "range_endpoint"
-  | "cumulative_sum";
+  | "cumulative_sum"
+  | "sum_of_parts";
 
 export const DERIVED_RULES: ReadonlySet<string> = new Set<DerivedRule>([
   "multiple_of_coffee",
@@ -35,6 +36,7 @@ export const DERIVED_RULES: ReadonlySet<string> = new Set<DerivedRule>([
   "concentration_water_from_coffee",
   "range_endpoint",
   "cumulative_sum",
+  "sum_of_parts",
 ]);
 
 export type AmountProvenance = {
@@ -49,8 +51,15 @@ export type AmountProvenance = {
   rule: string | null;
   /** Required for `derived`: the rule itself must trace to the source. */
   rule_source_quote: string | null;
-  /** Operands the rule was applied to, e.g. { multiplier: 3, coffee_amount: 25 }. */
-  rule_inputs: Record<string, number> | null;
+  /**
+   * Operands the rule was applied to, e.g. { multiplier: 3, coffee_amount: 25 }.
+   * Every existing rule's operands are scalar numbers. `sum_of_parts` is the
+   * sole exception: its `parts` operand is `number[]`, the stated component
+   * amounts being summed — see `recomputeDerivedValue`'s "sum_of_parts" case
+   * for the array-specific reading this requires (the scalar `get` helper
+   * does not apply to it).
+   */
+  rule_inputs: Record<string, number | number[]> | null;
   /**
    * Plan 016 §4 Phase 1b: the extraction stage's own semantic judgement of
    * what KIND of unit `unit` names. This is the durable mechanism per
@@ -376,6 +385,38 @@ function recomputeDerivedValue(
     case "cumulative_sum": {
       const total = get("sum");
       return total;
+    }
+    case "sum_of_parts": {
+      // Plan 020 D9-successor: a source that states its components
+      // separately ("Water: 300 g", "Ice: 150 g") and never states their
+      // total. `parts` is the array of stated component amounts; the total
+      // is recomputed as their sum, never taken as a given.
+      //
+      // `parts` is an array, so it does not go through the scalar `get`
+      // helper above — that helper's `typeof value === "number"` check would
+      // simply reject it. Read and validated directly instead.
+      //
+      // Fail closed (return null, meaning "unrecomputable") rather than
+      // recomputing a possibly-wrong sum, whenever:
+      //  - `parts` is missing or not an array at all;
+      //  - `parts` has fewer than two entries — a "sum" of one part is not a
+      //    sum, and would let any single value masquerade as derived, one of
+      //    exactly the fabrication shapes this whole module exists to block;
+      //  - any entry is not a finite number (NaN/Infinity would otherwise
+      //    poison the sum silently, or a non-number would coerce unexpectedly
+      //    under `+`).
+      const parts = inputs["parts"];
+      if (!Array.isArray(parts) || parts.length < 2) {
+        return null;
+      }
+      let sum = 0;
+      for (const part of parts) {
+        if (typeof part !== "number" || !Number.isFinite(part)) {
+          return null;
+        }
+        sum += part;
+      }
+      return sum;
     }
     default:
       return null;

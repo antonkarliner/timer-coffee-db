@@ -995,6 +995,348 @@ Deno.test("range_endpoint taking the low end (endpoint: 0) is not a finding", ()
   assertEquals(result.findings, [], "");
 });
 
+// ---------------------------------------------------------------------
+// Plan 020 D9-successor: sum_of_parts. See provenance.ts's "sum_of_parts"
+// case in recomputeDerivedValue for the fail-closed rationale — an iced
+// recipe's total is the sum of its stated parts (e.g. hot water + ice),
+// which the source states separately and never sums itself.
+// ---------------------------------------------------------------------
+
+Deno.test("sum_of_parts: two stated parts (water + ice) summing to the stated total recomputes cleanly", () => {
+  const requestText = "Water: 300 g. Ice: 150 g.";
+  const provenance: AmountProvenance[] = [
+    {
+      value: 450,
+      unit: "g",
+      step_index: -1,
+      provenance: "derived",
+      source_quote: null,
+      rule: "sum_of_parts",
+      rule_source_quote: "Water: 300 g. Ice: 150 g.",
+      rule_inputs: { parts: [300, 150] },
+    },
+  ];
+  const renderedAmounts: RenderedAmount[] = [
+    { step_index: -1, value: 450, unit: "g", is_cumulative_water: false },
+  ];
+
+  const result = verifyAmountProvenance({
+    requestText,
+    renderedAmounts,
+    provenance,
+  });
+
+  assertEquals(result.findings, [], "");
+});
+
+Deno.test("sum_of_parts: three stated parts recompute cleanly", () => {
+  const requestText = "Coffee A: 10 g, Coffee B: 15 g, Coffee C: 5 g blended.";
+  const provenance: AmountProvenance[] = [
+    {
+      value: 30,
+      unit: "g",
+      step_index: -1,
+      provenance: "derived",
+      source_quote: null,
+      rule: "sum_of_parts",
+      rule_source_quote: "Coffee A: 10 g, Coffee B: 15 g, Coffee C: 5 g",
+      rule_inputs: { parts: [10, 15, 5] },
+    },
+  ];
+  const renderedAmounts: RenderedAmount[] = [
+    { step_index: -1, value: 30, unit: "g", is_cumulative_water: false },
+  ];
+
+  const result = verifyAmountProvenance({
+    requestText,
+    renderedAmounts,
+    provenance,
+  });
+
+  assertEquals(result.findings, [], "");
+});
+
+Deno.test("sum_of_parts: parts that do not add up to the stated value is amount_provenance_mismatch", () => {
+  const requestText = "Water: 300 g. Ice: 100 g.";
+  const provenance: AmountProvenance[] = [
+    {
+      value: 450, // 300 + 100 = 400, not 450 — a fabricated total.
+      unit: "g",
+      step_index: -1,
+      provenance: "derived",
+      source_quote: null,
+      rule: "sum_of_parts",
+      rule_source_quote: "Water: 300 g. Ice: 100 g.",
+      rule_inputs: { parts: [300, 100] },
+    },
+  ];
+  const renderedAmounts: RenderedAmount[] = [
+    { step_index: -1, value: 450, unit: "g", is_cumulative_water: false },
+  ];
+
+  const result = verifyAmountProvenance({
+    requestText,
+    renderedAmounts,
+    provenance,
+  });
+
+  assertEquals(
+    findingCodes(result),
+    ["amount_provenance_mismatch"],
+    "the parts genuinely do not sum to the claimed total",
+  );
+});
+
+Deno.test("sum_of_parts: a single-part array fails closed — a 'sum' of one part is not a sum", () => {
+  const requestText = "Water: 300 g.";
+  const provenance: AmountProvenance[] = [
+    {
+      value: 300,
+      unit: "g",
+      step_index: -1,
+      provenance: "derived",
+      source_quote: null,
+      rule: "sum_of_parts",
+      rule_source_quote: "Water: 300 g.",
+      rule_inputs: { parts: [300] },
+    },
+  ];
+  const renderedAmounts: RenderedAmount[] = [
+    { step_index: -1, value: 300, unit: "g", is_cumulative_water: false },
+  ];
+
+  const result = verifyAmountProvenance({
+    requestText,
+    renderedAmounts,
+    provenance,
+  });
+
+  assertEquals(
+    findingCodes(result),
+    ["unsupported_derivation_rule"],
+    "a single-entry parts array must not be recomputable — otherwise any single value could masquerade as derived",
+  );
+});
+
+Deno.test("sum_of_parts: missing parts fails closed", () => {
+  const requestText = "Water: 300 g. Ice: 150 g.";
+  const provenance: AmountProvenance[] = [
+    {
+      value: 450,
+      unit: "g",
+      step_index: -1,
+      provenance: "derived",
+      source_quote: null,
+      rule: "sum_of_parts",
+      rule_source_quote: "Water: 300 g. Ice: 150 g.",
+      rule_inputs: {}, // no `parts` key at all
+    },
+  ];
+  const renderedAmounts: RenderedAmount[] = [
+    { step_index: -1, value: 450, unit: "g", is_cumulative_water: false },
+  ];
+
+  const result = verifyAmountProvenance({
+    requestText,
+    renderedAmounts,
+    provenance,
+  });
+
+  assertEquals(
+    findingCodes(result),
+    ["unsupported_derivation_rule"],
+    "a missing parts operand must not be recomputable",
+  );
+});
+
+Deno.test("sum_of_parts: empty parts array fails closed", () => {
+  const requestText = "Water: 300 g. Ice: 150 g.";
+  const provenance: AmountProvenance[] = [
+    {
+      value: 450,
+      unit: "g",
+      step_index: -1,
+      provenance: "derived",
+      source_quote: null,
+      rule: "sum_of_parts",
+      rule_source_quote: "Water: 300 g. Ice: 150 g.",
+      rule_inputs: { parts: [] },
+    },
+  ];
+  const renderedAmounts: RenderedAmount[] = [
+    { step_index: -1, value: 450, unit: "g", is_cumulative_water: false },
+  ];
+
+  const result = verifyAmountProvenance({
+    requestText,
+    renderedAmounts,
+    provenance,
+  });
+
+  assertEquals(
+    findingCodes(result),
+    ["unsupported_derivation_rule"],
+    "an empty parts operand must not be recomputable",
+  );
+});
+
+Deno.test("sum_of_parts: a non-finite entry fails closed", () => {
+  const requestText = "Water: 300 g. Ice: 150 g.";
+  const provenance: AmountProvenance[] = [
+    {
+      value: 450,
+      unit: "g",
+      step_index: -1,
+      provenance: "derived",
+      source_quote: null,
+      rule: "sum_of_parts",
+      rule_source_quote: "Water: 300 g. Ice: 150 g.",
+      rule_inputs: { parts: [300, Number.POSITIVE_INFINITY] },
+    },
+  ];
+  const renderedAmounts: RenderedAmount[] = [
+    { step_index: -1, value: 450, unit: "g", is_cumulative_water: false },
+  ];
+
+  const result = verifyAmountProvenance({
+    requestText,
+    renderedAmounts,
+    provenance,
+  });
+
+  assertEquals(
+    findingCodes(result),
+    ["unsupported_derivation_rule"],
+    "a non-finite part must not silently poison the sum",
+  );
+});
+
+// ---------------------------------------------------------------------
+// Regression guard: adding sum_of_parts widened AmountProvenance.rule_inputs
+// from Record<string, number> to Record<string, number | number[]>, and
+// added the sum_of_parts case above the switch's default. Every other rule
+// must recompute EXACTLY as before — this exercises the three rules
+// (multiple_of_water, ratio_of_total, concentration_water_from_coffee,
+// cumulative_sum) that no other test in this file happens to cover, so the
+// scalar `get` helper's behaviour against the widened rule_inputs type is
+// actually checked, not merely assumed unaffected.
+// ---------------------------------------------------------------------
+
+Deno.test("REGRESSION: derived multiple_of_water recomputes cleanly (unaffected by sum_of_parts)", () => {
+  const requestText =
+    "Add double the initial pour of water, 300 ml total for 150 ml poured.";
+  const provenance: AmountProvenance[] = [
+    {
+      value: 300,
+      unit: "ml",
+      step_index: 0,
+      provenance: "derived",
+      source_quote: null,
+      rule: "multiple_of_water",
+      rule_source_quote: "double the initial pour",
+      rule_inputs: { multiplier: 2, water_amount: 150 },
+    },
+  ];
+  const renderedAmounts: RenderedAmount[] = [
+    { step_index: 0, value: 300, unit: "ml", is_cumulative_water: false },
+  ];
+
+  const result = verifyAmountProvenance({
+    requestText,
+    renderedAmounts,
+    provenance,
+  });
+
+  assertEquals(result.findings, [], "");
+});
+
+Deno.test("REGRESSION: derived ratio_of_total recomputes cleanly (unaffected by sum_of_parts)", () => {
+  const requestText = "Bloom with 20 percent of the total 300 g water.";
+  const provenance: AmountProvenance[] = [
+    {
+      value: 60,
+      unit: "g",
+      step_index: 0,
+      provenance: "derived",
+      source_quote: null,
+      rule: "ratio_of_total",
+      rule_source_quote: "20 percent of the total",
+      rule_inputs: { percent: 20, water_amount: 300 },
+    },
+  ];
+  const renderedAmounts: RenderedAmount[] = [
+    { step_index: 0, value: 60, unit: "g", is_cumulative_water: false },
+  ];
+
+  const result = verifyAmountProvenance({
+    requestText,
+    renderedAmounts,
+    provenance,
+  });
+
+  assertEquals(result.findings, [], "");
+});
+
+Deno.test("REGRESSION: derived concentration_water_from_coffee recomputes cleanly (unaffected by sum_of_parts)", () => {
+  const requestText =
+    "Use a ratio of 60 grams per liter for a 30 g dose, giving 500 ml water.";
+  const provenance: AmountProvenance[] = [
+    {
+      value: 500,
+      unit: "ml",
+      step_index: -1,
+      provenance: "derived",
+      source_quote: null,
+      rule: "concentration_water_from_coffee",
+      rule_source_quote: "60 grams per liter",
+      rule_inputs: { grams_per_litre: 60, coffee_grams: 30 },
+    },
+  ];
+  const renderedAmounts: RenderedAmount[] = [
+    { step_index: -1, value: 500, unit: "ml", is_cumulative_water: false },
+  ];
+
+  const result = verifyAmountProvenance({
+    requestText,
+    renderedAmounts,
+    provenance,
+  });
+
+  assertEquals(result.findings, [], "");
+});
+
+Deno.test("REGRESSION: derived cumulative_sum recomputes cleanly (unaffected by sum_of_parts)", () => {
+  const requestText = "Pour to a running total of 180 ml by the third pour.";
+  const provenance: AmountProvenance[] = [
+    {
+      value: 180,
+      unit: "ml",
+      step_index: 2,
+      provenance: "derived",
+      source_quote: null,
+      rule: "cumulative_sum",
+      rule_source_quote: "running total of 180 ml",
+      rule_inputs: { sum: 180 },
+    },
+  ];
+  const renderedAmounts: RenderedAmount[] = [
+    {
+      step_index: 2,
+      value: 180,
+      unit: "ml",
+      is_cumulative_water: true,
+    },
+  ];
+
+  const result = verifyAmountProvenance({
+    requestText,
+    renderedAmounts,
+    provenance,
+  });
+
+  assertEquals(result.findings, [], "");
+});
+
 Deno.test("a literal quote that appears verbatim is not a finding", () => {
   const requestText = "Add 42 g of coffee to the filter.";
   const provenance: AmountProvenance[] = [

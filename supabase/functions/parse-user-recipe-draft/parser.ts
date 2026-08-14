@@ -56,7 +56,14 @@ const amountProvenanceSchema = z.object({
   source_quote: z.string().trim().min(1).nullable().default(null),
   rule: z.string().trim().min(1).nullable().default(null),
   rule_source_quote: z.string().trim().min(1).nullable().default(null),
-  rule_inputs: z.record(z.number()).nullable().default(null),
+  // Widened from z.record(z.number()) for sum_of_parts, whose `parts`
+  // operand is an ARRAY of the stated components rather than a scalar —
+  // every other rule's operands are scalars and still validate unchanged.
+  // Deliberately not z.any(): only numbers and numeric arrays are accepted,
+  // and provenance.ts's recompute reads `parts` with its own
+  // length/finiteness checks and fails closed on anything else.
+  rule_inputs: z.record(z.union([z.number(), z.array(z.number())]))
+    .nullable().default(null),
   // C1 (plan 016 §3 D1-vocabulary, §4 Phase 1b — an agreed cross-agent
   // contract with provenance.ts's owner; this shape must match exactly).
   // The model's own semantic classification of `unit`'s DIMENSION,
@@ -2563,13 +2570,14 @@ const AMOUNT_PROVENANCE_PROMPT_RULES: string[] = [
   "step_index is the 0-based index into steps that the amount belongs to, or -1 for a recipe-level amount not tied to one specific step.",
   "provenance is exactly one of three values: 'literal', 'derived', or 'inferred'.",
   '\'literal\' means the value appears verbatim in the source text. source_quote must be the exact substring of the source text stating it — copy it character for character, do not paraphrase or reformat it. rule, rule_source_quote, and rule_inputs must be null. Worked example (English): the text \'Pour 50 g of water for the bloom.\' gives { value: 50, unit: "g", provenance: "literal", source_quote: "50 g", rule: null, rule_source_quote: null, rule_inputs: null }. Worked example (German, non-English): the text \'25g Kaffee aufgießen und quellen lassen.\' gives { value: 25, unit: "g", provenance: "literal", source_quote: "25g", rule: null, rule_source_quote: null, rule_inputs: null } — never translate source_quote into English.',
-  "'derived' means the value is computed from other source facts by a rule the text states, not quoted directly as a number. rule must be exactly one of: multiple_of_coffee (N x coffee_amount), multiple_of_water (N x water_amount), ratio_of_total (percent of water_amount), concentration (grams_per_litre x millilitres / 1000, giving a COFFEE mass — use this ONLY when the value you are recording is the coffee amount), concentration_water_from_coffee (coffee_grams / grams_per_litre x 1000, giving a WATER volume — use this instead of concentration whenever the value you are recording is the water amount), range_endpoint (low, high, or midpoint of a stated range), cumulative_sum (running total of prior pours). rule_source_quote must be the exact source substring stating the RULE itself (not the resulting number), and rule_inputs must hold the exact numeric operands needed to recompute the value. source_quote must be null.",
+  "'derived' means the value is computed from other source facts by a rule the text states, not quoted directly as a number. rule must be exactly one of: multiple_of_coffee (N x coffee_amount), multiple_of_water (N x water_amount), ratio_of_total (percent of water_amount), concentration (grams_per_litre x millilitres / 1000, giving a COFFEE mass — use this ONLY when the value you are recording is the coffee amount), concentration_water_from_coffee (coffee_grams / grams_per_litre x 1000, giving a WATER volume — use this instead of concentration whenever the value you are recording is the water amount), range_endpoint (low, high, or midpoint of a stated range), cumulative_sum (running total of prior pours), sum_of_parts (a total the source never states outright but which is the sum of two or more amounts it does state — the motivating case is an iced recipe, where the water total is the hot water plus the ice, because ice is water too). rule_source_quote must be the exact source substring stating the RULE itself (not the resulting number), and rule_inputs must hold the exact numeric operands needed to recompute the value. source_quote must be null.",
   'Worked example, multiple_of_coffee: \'Bloom with three times the dose of water\' for a 25 g dose gives { value: 75, unit: "g", provenance: "derived", source_quote: null, rule: "multiple_of_coffee", rule_source_quote: "three times the dose", rule_inputs: { multiplier: 3, coffee_amount: 25 } }.',
   'Worked example, concentration: \'Use a ratio of 60 grams per liter\' at a 500 ml water target gives the COFFEE mass, { value: 30, unit: "g", provenance: "derived", source_quote: null, rule: "concentration", rule_source_quote: "60 grams per liter", rule_inputs: { grams_per_litre: 60, millilitres: 500 } }. This rule only derives a coffee mass from a concentration and a water volume — it cannot derive a water amount, so never use it to justify a water figure.',
   'Worked example, concentration_water_from_coffee: the SAME \'Use a ratio of 60 grams per liter\' text, but now for a 30 g coffee dose, gives the WATER volume, { value: 500, unit: "ml", provenance: "derived", source_quote: null, rule: "concentration_water_from_coffee", rule_source_quote: "60 grams per liter", rule_inputs: { grams_per_litre: 60, coffee_grams: 30 } }. Never call this rule "concentration" and never pass the water figure you are trying to justify back in as one of its own rule_inputs — rule_inputs must hold only the OTHER facts (the concentration and the coffee dose), not the value being derived.',
   'Worked example, range_endpoint: \'60-90 g of coffee\', when the recipe\'s own steps settle on the low end, gives { value: 60, unit: "g", provenance: "derived", source_quote: null, rule: "range_endpoint", rule_source_quote: "60-90 g", rule_inputs: { low: 60, high: 90, endpoint: 0 }, unit_kind: "mass", stated_range: { low: 60, high: 90 } }. endpoint is 0 for the low end, 1 for the high end, 0.5 for the midpoint.',
   'Worked example, stated_range on a LITERAL record: a bloom stated as \'Pour 60-90g of water and bloom.\' where you record only the literal 60 (because that is the number the step\'s own later text settles on) still gives { value: 60, unit: "g", provenance: "literal", source_quote: "60g", rule: null, rule_source_quote: null, rule_inputs: null, unit_kind: "mass", stated_range: { low: 60, high: 90 } } — stated_range is set even though this record is literal, not range_endpoint, so the 90 is not lost from extracted_amounts entirely.',
   'Worked example, cumulative_sum: five pours to running totals 60/120/180/240/300 ml — the step pouring to 180 ml gives { value: 180, unit: "ml", provenance: "derived", source_quote: null, rule: "cumulative_sum", rule_source_quote: "<the source phrase stating the running/cumulative total for that pour>", rule_inputs: { sum: 180 } }.',
+  'Worked example, sum_of_parts: an iced recipe stating \'Water: 300 g\' and \'Ice: 150 g\' never states its 450 g total, but the total IS water — ice is frozen water — so water_amount_grams is 450 and gets { value: 450, unit: "g", provenance: "derived", source_quote: null, rule: "sum_of_parts", rule_source_quote: "<the source phrase stating the parts, e.g. \'Water: 300 g\' plus \'Ice: 150 g\'>", rule_inputs: { parts: [300, 150] }, unit_kind: "mass" }. parts must list every stated component and must hold at least two entries. Use this ONLY for a total you did not find stated; if the source states the total itself, record it as literal instead. Never pass the total you are deriving back in as one of its own parts.',
   "'inferred' means there is no source basis for the value at all. inferred is PERMITTED ONLY for water temperature and grind size (never represented in extracted_amounts, since those are not coffee/water amounts) — it must NEVER be used for a coffee or water amount. If you cannot justify an amount as literal or derived per the rules above, do not invent one: leave it out of extracted_amounts rather than mark it inferred.",
   "extracted_amounts may be an empty array only when the source genuinely states no coffee or water amounts at all. Never omit a record for an amount you did extract.",
 ];
@@ -2658,7 +2666,7 @@ function buildExtractionUserPrompt(input: {
             provenance: "literal|derived|inferred",
             source_quote: "string|null",
             rule:
-              "multiple_of_coffee|multiple_of_water|ratio_of_total|concentration|concentration_water_from_coffee|range_endpoint|cumulative_sum|null",
+              "multiple_of_coffee|multiple_of_water|ratio_of_total|concentration|concentration_water_from_coffee|range_endpoint|cumulative_sum|sum_of_parts|null",
             rule_source_quote: "string|null",
             rule_inputs: "object of numeric operands, or null",
             unit_kind: "mass|volume|time|percent|null",
@@ -2811,7 +2819,7 @@ function buildNormalizationUserPrompt(input: {
             provenance: "literal|derived|inferred",
             source_quote: "string|null",
             rule:
-              "multiple_of_coffee|multiple_of_water|ratio_of_total|concentration|concentration_water_from_coffee|range_endpoint|cumulative_sum|null",
+              "multiple_of_coffee|multiple_of_water|ratio_of_total|concentration|concentration_water_from_coffee|range_endpoint|cumulative_sum|sum_of_parts|null",
             rule_source_quote: "string|null",
             rule_inputs: "object of numeric operands, or null",
             unit_kind: "mass|volume|time|percent|null",
