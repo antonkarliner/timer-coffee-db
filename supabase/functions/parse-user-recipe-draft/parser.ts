@@ -4876,8 +4876,22 @@ function normalizeAbsoluteTimestampDurations(input: {
   const naturalDurationsByIndex = new Map<number, number>();
   timestamped.forEach((item, order) => {
     const nextTimestamp = reliableNextByOrder.get(order);
+    const step = input.steps[item.index];
+    const previousTimestamp = timestamped[order - 1];
+    // D11 double-count guard: a final timestamped step can carry the
+    // duration of the interval that ENDS at its own elapsed landmark (for
+    // example, "after 4 minutes, stir" becomes elapsed=240 and
+    // duration=240). The preceding step already owns that exact interval
+    // through timestamp differencing, so reusing it after the landmark
+    // would count the same source time twice.
+    const statedDurationOverlapsPrecedingInterval = !nextTimestamp &&
+      step.duration_is_stated && previousTimestamp !== undefined &&
+      step.duration_seconds ===
+        item.timestampSeconds - previousTimestamp.timestampSeconds;
     const duration = nextTimestamp
       ? nextTimestamp.timestampSeconds - item.timestampSeconds
+      : step.duration_is_stated && !statedDurationOverlapsPrecedingInterval
+      ? step.duration_seconds
       : FINAL_TIMESTAMPED_STEP_DURATION_SECONDS;
     naturalDurationsByIndex.set(item.index, duration);
   });
@@ -4888,7 +4902,7 @@ function normalizeAbsoluteTimestampDurations(input: {
   // expansion would otherwise push back, so paying there is what keeps
   // every later stated landmark on the timeline the source actually gave.
   //
-  // Gated to steps carrying duration_is_stated === true: a natural
+  // D7 is gated to steps carrying duration_is_stated === true: a natural
   // duration below the minimum can also come from two source landmarks
   // that legitimately resolve to the very same elapsed second (e.g. "at
   // 1:35 put the pitcher on; at 1:40 flip the brewer" collapsed into one
@@ -4896,10 +4910,9 @@ function normalizeAbsoluteTimestampDurations(input: {
   // exactly 0) — that is landmark-resolution noise, not a stated
   // sub-minimum duration, and forcing an absorption there would shorten an
   // unrelated neighbour to fix something that was never really 5 seconds
-  // in the first place. Only a step the model itself marked as carrying a
-  // real stated duration is D7's case; anything else keeps its prior
-  // pass-through behaviour untouched (handled below via the >= MIN guard,
-  // same as before this phase).
+  // in the first place. D11 handles the narrower zero-duration tie below:
+  // it conserves the floor only when the immediately following tied step
+  // can afford it; other unstated sub-minimum shapes remain pass-through.
   const finalDurationsByIndex = new Map(naturalDurationsByIndex);
   let absorbedShortfall = false;
   let unabsorbedShortfall = false;
@@ -4908,12 +4921,18 @@ function normalizeAbsoluteTimestampDurations(input: {
     if (current >= MIN_BREW_STEP_DURATION_SECONDS) {
       return;
     }
-    if (!input.steps[item.index].duration_is_stated) {
+    // D11 prerequisite: a zero-length landmark tie still occupies the
+    // provider/parser's 10-second floor. When its following timestamped step
+    // can pay for that floor, absorb it there so two actions beginning at the
+    // same source landmark do not manufacture time.
+    const payer = timestamped[order + 1];
+    const isLandmarkTie = current === 0 && payer !== undefined &&
+      payer.timestampSeconds === item.timestampSeconds;
+    if (!input.steps[item.index].duration_is_stated && !isLandmarkTie) {
       return;
     }
 
     const delta = MIN_BREW_STEP_DURATION_SECONDS - current;
-    const payer = timestamped[order + 1];
     const canAbsorb = payer !== undefined &&
       finalDurationsByIndex.get(payer.index)! - delta >=
         MIN_BREW_STEP_DURATION_SECONDS;
@@ -4925,7 +4944,7 @@ function normalizeAbsoluteTimestampDurations(input: {
         finalDurationsByIndex.get(payer.index)! - delta,
       );
       absorbedShortfall = true;
-    } else {
+    } else if (input.steps[item.index].duration_is_stated) {
       // No eligible payer — the step is last, the next step isn't
       // timestamped, or it can't afford the delta without itself dropping
       // below the minimum. Bump to the minimum without conservation,

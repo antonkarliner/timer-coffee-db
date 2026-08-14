@@ -15851,6 +15851,154 @@ Deno.test("Phase D: a record with no stated_range and no range_endpoint rule is 
 });
 
 // ---------------------------------------------------------------------
+// D11: final stated durations, landmark ties, and overlap protection.
+
+type D11BrewStep = NormalizedDraft["steps"][number] & { kind: "brew" };
+
+async function parseD11TimingShape(
+  brewSteps: D11BrewStep[],
+  totalBrewTimeSeconds: number | null = null,
+) {
+  const extraction: ExtractionResult = {
+    ...createExtraction(),
+    extracted_amounts: [],
+    detected_input_language: "en",
+    likely_brewing_method: "Hario V60",
+    name: "D11 timing shape",
+    short_description: "Exercises timestamp duration reconciliation.",
+    grind_size: "Medium",
+    water_temp_celsius: 93,
+    coffee_amount_grams: null,
+    water_amount: null,
+    preparation: "Prepare the brewer.",
+    steps: brewSteps.map((step) => ({
+      title: null,
+      raw_text: step.description_source,
+      duration_seconds: step.duration_seconds,
+      elapsed_seconds: step.elapsed_seconds,
+      starts_timer: step.starts_timer,
+      duration_is_stated: step.duration_is_stated,
+      scalable_amounts: [],
+      step_role: step.step_role,
+    })),
+    notes: [],
+    total_brew_time_seconds: totalBrewTimeSeconds,
+  };
+  const normalized: NormalizedDraft = {
+    ...createNormalized(),
+    extracted_amounts: [],
+    detected_input_language: "en",
+    recipe: {
+      brewing_method_id: "v60",
+      brewing_method_confidence: "high",
+      coffee_amount: null,
+      water_amount: null,
+      water_temp: 93,
+    },
+    localization: {
+      name: "D11 timing shape",
+      grind_size: "Medium",
+      short_description: "Exercises timestamp duration reconciliation.",
+    },
+    steps: [{
+      kind: "preparation",
+      description_source: "Prepare the brewer.",
+      description_template: "Prepare the brewer.",
+      duration_seconds: 0,
+      elapsed_seconds: null,
+      starts_timer: false,
+      duration_is_stated: false,
+      scalable_amounts: [],
+      step_role: "preparation",
+    }, ...brewSteps],
+  };
+  const parser = createRecipeDraftParser({
+    providers: [createMockProvider({
+      name: "groq",
+      extraction,
+      normalized,
+      calls: [],
+    })],
+    now: () => 1776000000000,
+  });
+  return await parser.parseDraft({
+    text: "A timing-only recipe fixture.",
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [
+      { brewing_method_id: "v60", brewing_method: "Hario V60" },
+    ],
+    requestId: "req-d11-timing-shape",
+  });
+}
+
+function d11BrewStep(input: {
+  text: string;
+  duration: number;
+  elapsed: number;
+  stated: boolean;
+  role?: D11BrewStep["step_role"];
+  startsTimer?: boolean;
+}): D11BrewStep {
+  return {
+    kind: "brew",
+    description_source: input.text,
+    description_template: input.text,
+    duration_seconds: input.duration,
+    elapsed_seconds: input.elapsed,
+    starts_timer: input.startsTimer ?? false,
+    duration_is_stated: input.stated,
+    scalable_amounts: [],
+    step_role: input.role ?? null,
+  };
+}
+
+Deno.test("D11: a final timestamped step keeps its stated duration while a landmark tie absorbs its floor", async () => {
+  const result = await parseD11TimingShape([
+    d11BrewStep({ text: "Start at 0:00.", duration: 10, elapsed: 0, stated: true, startsTimer: true }),
+    d11BrewStep({ text: "Stir from 0:10-0:15.", duration: 5, elapsed: 10, stated: true }),
+    d11BrewStep({ text: "Pour from 0:15-0:30.", duration: 15, elapsed: 15, stated: true }),
+    d11BrewStep({ text: "Brew from 0:30.", duration: 30, elapsed: 30, stated: true }),
+    d11BrewStep({ text: "Attach at 1:00.", duration: 40, elapsed: 60, stated: true }),
+    d11BrewStep({ text: "Flip at 1:40.", duration: 10, elapsed: 100, stated: false }),
+    d11BrewStep({ text: "Press from 1:40-2:00.", duration: 20, elapsed: 100, stated: true, role: "drawdown" }),
+    d11BrewStep({ text: "Cool from 2:00-2:30.", duration: 30, elapsed: 120, stated: true, role: "serve" }),
+  ]);
+
+  assertEquals(
+    result.draft.steps.map((step) => step.duration_seconds),
+    [0, 10, 10, 10, 30, 40, 10, 10, 30],
+    "Expected the final stated 30s to survive and the 1:40 tie's floor to be paid by the following press.",
+  );
+  assertEquals(result.draft.recipe.brew_time_seconds, 150, "Expected the source timeline to end at 150s.");
+});
+
+Deno.test("D11 guard: a stated duration equal to the preceding elapsed interval is not counted twice", async () => {
+  const result = await parseD11TimingShape([
+    d11BrewStep({ text: "Start the timer.", duration: 240, elapsed: 0, stated: false, startsTimer: true }),
+    d11BrewStep({ text: "After 4 minutes, stir.", duration: 240, elapsed: 240, stated: true, role: "stir" }),
+  ]);
+
+  assertEquals(
+    result.draft.steps.map((step) => step.duration_seconds),
+    [0, 240, 10],
+    "Expected the 240s interval to belong to the step leading up to the landmark, with only the nominal action after it.",
+  );
+});
+
+Deno.test("D11 control: an unstated final duration still uses the nominal fallback", async () => {
+  const result = await parseD11TimingShape([
+    d11BrewStep({ text: "Start the timer.", duration: 120, elapsed: 0, stated: false, startsTimer: true }),
+    d11BrewStep({ text: "At 2:00, serve.", duration: 45, elapsed: 120, stated: false, role: "serve" }),
+  ]);
+
+  assertEquals(
+    result.draft.steps.map((step) => step.duration_seconds),
+    [0, 120, 10],
+    "Expected an unstated final model guess to remain untrusted.",
+  );
+});
+
+// ---------------------------------------------------------------------
 // D10 (plan 020 §3, following 5cc31dc's "a known start time is not a known
 // duration" precedent): a drawdown step's elapsed_seconds equal to the
 // recipe's own resolved completion target is stating when the brew ENDS,
