@@ -2593,7 +2593,10 @@ Deno.test("D5: 195-205°F range (French press shape) resolves deterministically 
   const result = await parser.parseDraft({
     text: "Use water between 195-205°F.",
     userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
-    brewingMethods: [{ brewing_method_id: "frenchpress", brewing_method: "French Press" }],
+    brewingMethods: [{
+      brewing_method_id: "frenchpress",
+      brewing_method: "French Press",
+    }],
     requestId: "req-d5-195-205",
   });
 
@@ -2838,7 +2841,10 @@ Deno.test("D5: without a structured water_temp_stated_range, an unverifiable ran
   const result = await parser.parseDraft({
     text: "Use water between 195-205°F.",
     userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
-    brewingMethods: [{ brewing_method_id: "frenchpress", brewing_method: "French Press" }],
+    brewingMethods: [{
+      brewing_method_id: "frenchpress",
+      brewing_method: "French Press",
+    }],
     requestId: "req-d5-fallback",
   });
 
@@ -4465,7 +4471,9 @@ Deno.test("D2 (plan 016 §4 Phase 4): a pre-timer amount record folded 2 steps a
     {
       value: 18,
       unit: "g",
-      step_index: 2,
+      // Extraction indexes only timed source steps here; normalization adds
+      // preparation ahead of them, so the affected normalized step is index 2.
+      step_index: 1,
       provenance: "literal" as const,
       source_quote: "18 grams of coffee",
       rule: null,
@@ -4506,8 +4514,7 @@ Deno.test("D2 (plan 016 §4 Phase 4): a pre-timer amount record folded 2 steps a
   });
 
   const result = await parser.parseDraft({
-    text:
-      "Fill the dripper with 200 grams of water. Add 18 grams of coffee. " +
+    text: "Fill the dripper with 200 grams of water. Add 18 grams of coffee. " +
       "Pour up to 250 grams total water.",
     userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
     brewingMethods: [
@@ -11102,7 +11109,9 @@ Deno.test("G22 + F32: an extraction-recorded 25 g bloom that would render as 60 
   });
 
   assert(
-    !result.validation.issues.some((issue) => issue.code === "unverifiable_amount"),
+    !result.validation.issues.some((issue) =>
+      issue.code === "unverifiable_amount"
+    ),
     "Expected F32's repair to resolve the mismatch before G22 ever sees it.",
   );
   assertEquals(
@@ -11324,11 +11333,13 @@ function createD9IceExtraction(): ExtractionResult {
     water_temp_celsius: 94,
     coffee_amount_grams: 25,
     water_amount: 300,
-    preparation: "Add 150 g ice to the server. Rinse the filter and add coffee.",
+    preparation:
+      "Add 150 g ice to the server. Rinse the filter and add coffee.",
     steps: [
       {
         title: null,
-        raw_text: "Add 150 g ice to the server. Rinse the filter and add coffee.",
+        raw_text:
+          "Add 150 g ice to the server. Rinse the filter and add coffee.",
         duration_seconds: null,
         elapsed_seconds: null,
         starts_timer: false,
@@ -11455,14 +11466,18 @@ Deno.test("D9: an ice amount with no coffee/water provenance record traces to th
       "(0.5 x <final_water_amount>)g",
     ),
     `Expected the ice to render as half the water scalar (mirrors the live ` +
-      `flash-chilled captures), got: ${result.draft.steps[0].description_template}`,
+      `flash-chilled captures), got: ${
+        result.draft.steps[0].description_template
+      }`,
   );
   assert(
     !result.validation.issues.some((issue) =>
       issue.code === "unverifiable_amount"
     ),
     `Expected D9's backstop to trace the ice amount so it never blocks as ` +
-      `unverifiable_amount. Issues: ${JSON.stringify(result.validation.issues)}`,
+      `unverifiable_amount. Issues: ${
+        JSON.stringify(result.validation.issues)
+      }`,
   );
   assertEquals(
     result.validation.is_publishable,
@@ -11622,7 +11637,9 @@ Deno.test("Phase B/E4: structured rate metadata restores a model-authored scalab
     result.draft.steps[1].description_template.includes(
       "5g pro Sekunde",
     ),
-    `Expected the structured multilingual rate to be restored as literal prose, got: ${result.draft.steps[1].description_template}`,
+    `Expected the structured multilingual rate to be restored as literal prose, got: ${
+      result.draft.steps[1].description_template
+    }`,
   );
   assert(
     !result.draft.steps[1].expressions.some((expression) =>
@@ -11988,9 +12005,7 @@ Deno.test("F32: a bloom rendered with a copied example multiplier is repaired to
     "Expected the copied 0.2 multiplier to be recomputed to 40/300 = 0.133333.",
   );
   assert(
-    bloomStep.expressions.some((expression) =>
-      expression.preview_value === 40
-    ),
+    bloomStep.expressions.some((expression) => expression.preview_value === 40),
     `Expected the repaired expression to preview as 40, got: ${
       JSON.stringify(bloomStep.expressions)
     }`,
@@ -13245,7 +13260,10 @@ Deno.test("capture_stages: true — a stage that retries on the same provider re
     captureStages: true,
   });
 
-  assert(result.stage_outputs !== null, "Expected stage_outputs to be populated.");
+  assert(
+    result.stage_outputs !== null,
+    "Expected stage_outputs to be populated.",
+  );
   const extractionEntries = result.stage_outputs!.extraction;
   assertEquals(
     extractionEntries.length,
@@ -13491,21 +13509,31 @@ Deno.test("Aug 2026 Fix 1: cumulative_rewrite recomputing an additive pour RANGE
     likely_brewing_method: "V60",
     water_amount: 300,
     coffee_amount_grams: 20,
+    extracted_amounts: [{
+      value: 50,
+      unit: "g",
+      step_index: 2,
+      provenance: "derived",
+      source_quote: null,
+      rule: "range_endpoint",
+      rule_source_quote: "50-70g",
+      rule_inputs: { low: 50, high: 70, endpoint: 0 },
+      unit_kind: "mass",
+      stated_range: { low: 50, high: 70 },
+    }],
   };
 
   const originalStep2Template =
     "Timer starten und langsam (0.0833333333 x <final_water_amount>)g Wasser mittig aufgießen.";
-  // NUMERIC_SCALABLE_RANGE_REGEX/convertNumericValuesToExpressions is what
-  // actually builds a range expression from literal "50-70g" text deep in
-  // the pipeline; this test supplies the already-built range directly (as
-  // buildDraftSteps would have produced it from that literal text) so the
-  // assertions are about the cumulative_rewrite guard specifically, not
-  // about range-detection elsewhere.
+  // Production v50 preserved both endpoints only in stated_range while the
+  // normalized template/scalable_amounts retained the low endpoint alone.
+  // The later deterministic expansion can restore 70 only if cumulative
+  // rewrite does not first replace the 50 anchor with 75.
   const originalStep3Template =
-    "Bei der 30-Sekunden-Marke gieße nun weitere (0.1666666667 x <final_water_amount>)-(0.2333333333 x <final_water_amount>)g Wasser hinzu.";
+    "Bei der 30-Sekunden-Marke gieße nun weitere (0.1666666667 x <final_water_amount>)g Wasser hinzu.";
 
   const normalized: NormalizedDraft = {
-    extracted_amounts: [],
+    extracted_amounts: germanExtraction.extracted_amounts,
     detected_input_language: "de",
     warnings: [],
     recipe: {
@@ -13553,15 +13581,15 @@ Deno.test("Aug 2026 Fix 1: cumulative_rewrite recomputing an additive pour RANGE
         elapsed_seconds: 30,
         starts_timer: false,
         duration_is_stated: false,
-        scalable_amounts: [{ value: 50, unit: "g" }, { value: 70, unit: "g" }],
+        scalable_amounts: [{ value: 50, unit: "g" }],
         step_role: "pour",
       },
     ],
   };
 
   // Reproduces the live bug: step 2 (bloom) is left alone, exactly as the
-  // real capture did, but step 3's RANGE is recomputed into new cumulative
-  // figures (75g/95g) that do not trace to the source.
+  // real v50 capture did, but step 3's sole rendered range endpoint is
+  // recomputed from 50g to the new cumulative 75g figure.
   const badCumulativeRewrite: CumulativeRewriteResult = {
     warnings: [
       "Later brew steps were rewritten to cumulative water totals in the source language.",
@@ -13572,7 +13600,7 @@ Deno.test("Aug 2026 Fix 1: cumulative_rewrite recomputing an additive pour RANGE
       {
         ...normalized.steps[2],
         description_template:
-          "Bei 0:30 auf insgesamt (0.25 x <final_water_amount>)-(0.3166666667 x <final_water_amount>)g Wasser aufgießen.",
+          "Bei der 30-Sekunden-Marke gieße nun auf insgesamt (0.25 x <final_water_amount>)g Wasser auf.",
       },
     ],
   };
@@ -13607,7 +13635,10 @@ Deno.test("Aug 2026 Fix 1: cumulative_rewrite recomputing an additive pour RANGE
   const rangeStep = result.draft.steps.find((step) =>
     step.description_source.includes("weitere 50-70g")
   );
-  assert(rangeStep !== undefined, "Expected to find the additive-range step in the final draft.");
+  assert(
+    rangeStep !== undefined,
+    "Expected to find the additive-range step in the final draft.",
+  );
 
   const waterValues = rangeStep!.expressions
     .filter((expression) => expression.placeholder === "<final_water_amount>")
@@ -13627,9 +13658,229 @@ Deno.test("Aug 2026 Fix 1: cumulative_rewrite recomputing an additive pour RANGE
   );
   assert(
     result.warnings.some((warning) =>
-      warning.includes("recomputed") && warning.includes("do not trace")
+      warning.includes("source-traceable") && warning.includes("invented")
     ),
     "Expected a warning explaining the reverted range rewrite.",
+  );
+});
+
+Deno.test("round 5 Russian: recurrence cadence is not anchored as the whole duration and cumulative rewrite cannot corrupt temperature", async () => {
+  const extraction: ExtractionResult = {
+    ...createExtraction(),
+    detected_input_language: "ru",
+    likely_brewing_method: "V60",
+    coffee_amount_grams: 20,
+    water_amount: 300,
+    water_temp_celsius: 92.5,
+    water_temp_stated_range: {
+      low: 92,
+      high: 93,
+      unit: "celsius",
+    },
+    total_brew_time_seconds: 180,
+    total_brew_time_is_approximate: true,
+    preparation: null,
+    steps: [
+      {
+        title: null,
+        raw_text: "Запустите таймер и влейте 60 мл воды температурой 92,5°C.",
+        duration_seconds: 30,
+        elapsed_seconds: 0,
+        starts_timer: true,
+        duration_is_stated: false,
+        repeat_interval_seconds: null,
+        scalable_amounts: [{ value: 60, unit: "мл" }],
+        step_role: "bloom",
+      },
+      {
+        title: null,
+        raw_text:
+          "Через 30 секунд вливайте по 60 мл каждые 30 секунд, пока не используете 300 мл.",
+        duration_seconds: 30,
+        elapsed_seconds: 30,
+        starts_timer: false,
+        // Defensive production shape: the cadence was also incorrectly marked
+        // as a whole-step duration. Structured recurrence metadata must win.
+        duration_is_stated: true,
+        repeat_interval_seconds: 30,
+        scalable_amounts: [
+          { value: 60, unit: "мл" },
+          { value: 300, unit: "мл" },
+        ],
+        step_role: "pour",
+      },
+    ],
+  };
+  const normalized: NormalizedDraft = {
+    extracted_amounts: [],
+    detected_input_language: "ru",
+    warnings: [],
+    recipe: {
+      brewing_method_id: "v60",
+      brewing_method_confidence: "high",
+      coffee_amount: 20,
+      water_amount: 300,
+      water_temp: 92.5,
+    },
+    localization: {
+      name: "V60",
+      grind_size: "средне-мелкий",
+      short_description: "Повторяющиеся вливания.",
+    },
+    steps: [
+      {
+        kind: "brew",
+        description_source: extraction.steps[0].raw_text,
+        description_template:
+          "Запустите таймер и влейте (0.2 x <final_water_amount>)мл воды температурой 92,5°C.",
+        duration_seconds: 30,
+        elapsed_seconds: 0,
+        starts_timer: true,
+        duration_is_stated: false,
+        repeat_interval_seconds: null,
+        scalable_amounts: [{ value: 60, unit: "мл" }],
+        step_role: "bloom",
+      },
+      {
+        kind: "brew",
+        description_source: extraction.steps[1].raw_text,
+        description_template:
+          "Через 30 секунд вливайте по (0.2 x <final_water_amount>)мл каждые 30 секунд, пока не используете (1 x <final_water_amount>)мл.",
+        duration_seconds: 30,
+        elapsed_seconds: 30,
+        starts_timer: false,
+        duration_is_stated: true,
+        scalable_amounts: [
+          { value: 60, unit: "мл" },
+          { value: 300, unit: "мл" },
+        ],
+        step_role: "pour",
+      },
+    ],
+  };
+  const badRewrite: CumulativeRewriteResult = {
+    warnings: [],
+    steps: [
+      {
+        ...normalized.steps[0],
+        description_template:
+          "Запустите таймер и влейте (0.2 x <final_water_amount>)мл воды температурой 92,92.5°C.",
+      },
+      {
+        ...normalized.steps[1],
+        // The normalization stub omitted this optional field. The parser's
+        // extraction fallback restored it before cumulative rewrite ran.
+        repeat_interval_seconds: 30,
+      },
+    ],
+  };
+  const calls: Array<{ provider: string; stage: string }> = [];
+  const parser = createRecipeDraftParser({
+    providers: [createMockProvider({
+      name: "openai",
+      extraction,
+      normalized,
+      cumulativeRewrite: badRewrite,
+      calls,
+    })],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: extraction.steps.map((step) => step.raw_text).join(" ") +
+      " Общее время приготовления — около 3 минут.",
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [{ brewing_method_id: "v60", brewing_method: "V60" }],
+    requestId: "req-round5-russian-recurrence",
+  });
+
+  assert(
+    calls.some((call) => call.stage === "cumulative_rewrite"),
+    "Expected the cumulative rewrite stage to run.",
+  );
+  const brewSteps = result.draft.steps.filter((step) => step.kind === "brew");
+  assertEquals(
+    brewSteps.map((step) => step.duration_seconds),
+    [30, 150],
+    "Expected the 30-second cadence to remain metadata while the repeated-pour step receives the 150-second remainder.",
+  );
+  assertEquals(
+    brewSteps.reduce((sum, step) => sum + step.duration_seconds, 0),
+    180,
+    "Expected the final brew timeline to match the stated approximate total.",
+  );
+  assert(
+    brewSteps[0].description_template.includes("92,5°C") &&
+      !brewSteps[0].description_template.includes("92,92.5°C"),
+    `Expected non-amount numeric temperature prose to survive cumulative rewrite unchanged. Got: ${
+      brewSteps[0].description_template
+    }`,
+  );
+  assert(
+    result.warnings.some((warning) =>
+      warning.includes("changed non-amount numeric content")
+    ),
+    "Expected a deterministic warning for the reverted numeric mutation.",
+  );
+  assert(
+    !result.validation.issues.some((issue) =>
+      issue.code === "total_brew_time_mismatch"
+    ),
+    "Expected no total-time mismatch after allocating the stated total.",
+  );
+});
+
+Deno.test("round 6 safety backstop: malformed multi-separator temperature text cannot publish", async () => {
+  const extraction: ExtractionResult = {
+    ...createExtraction(),
+    water_temp_celsius: 92.5,
+  };
+  const normalized: NormalizedDraft = {
+    ...createNormalized(),
+    recipe: {
+      ...createNormalized().recipe,
+      water_temp: 92.5,
+    },
+    steps: createNormalized().steps.map((step, index) =>
+      index === 1
+        ? {
+          ...step,
+          description_template: "Pour 50g of water at 92,92.5°C and bloom.",
+        }
+        : step
+    ),
+  };
+  const calls: Array<{ provider: string; stage: string }> = [];
+  const parser = createRecipeDraftParser({
+    providers: [createMockProvider({
+      name: "openai",
+      extraction,
+      normalized,
+      failCumulativeRewrite: true,
+      calls,
+    })],
+    now: () => 1776000000000,
+  });
+
+  const result = await parser.parseDraft({
+    text: "V60 with 15g coffee and 250g water at 92.5°C.",
+    userId: "800792ab-c2ef-49f3-8d6a-c5dceaf71459",
+    brewingMethods: [{ brewing_method_id: "v60", brewing_method: "V60" }],
+    requestId: "req-round6-malformed-temperature-backstop",
+  });
+
+  assert(
+    result.validation.issues.some((issue) =>
+      issue.code === "malformed_temperature_text" &&
+      issue.field === "steps[1].description_template"
+    ),
+    `Expected malformed temperature text to become a blocking validation issue. Got: ${
+      JSON.stringify(result.validation.issues)
+    }`,
+  );
+  assert(
+    !result.validation.is_publishable,
+    "Expected malformed temperature text to block publication.",
   );
 });
 
@@ -13652,8 +13903,7 @@ Deno.test("Aug 2026 Fix 1: cumulative_rewrite recomputing an additive pour RANGE
 // then rendered next to the already-correct sentence.
 // ---------------------------------------------------------------------
 Deno.test("Aug 2026 Fix 2/3: a Japanese unit immediately followed by a trailing clause is captured as just the unit, not swallowed", async () => {
-  const template =
-    "タイマーを開始し、(0.2 x <final_water_amount>)mlまで注ぐ。";
+  const template = "タイマーを開始し、(0.2 x <final_water_amount>)mlまで注ぐ。";
 
   const normalized: NormalizedDraft = {
     extracted_amounts: [],
@@ -13737,8 +13987,7 @@ Deno.test("Aug 2026 Fix 2/3: a Japanese unit immediately followed by a trailing 
 });
 
 Deno.test("Aug 2026 Fix 2: Latin-script control — a unit directly followed by a sentence period is not swallowed", async () => {
-  const template =
-    "Pour until you reach the full (1 x <final_water_amount>)g.";
+  const template = "Pour until you reach the full (1 x <final_water_amount>)g.";
 
   const normalized: NormalizedDraft = {
     ...createNormalized(),
@@ -13876,8 +14125,7 @@ Deno.test("Aug 2026 Fix 2: a legitimate non-Latin unit (Chinese, no space before
 Deno.test("defect-2: warns when a suspiciously long, sentence-shaped grind_size looks like a leaked instruction", async () => {
   // Reproduces the exact live shape: an instruction sentence about brew
   // time, not a grind descriptor, ends up in grind_size.
-  const badGrindSize =
-    "Grind fine for a total brew time of 2 to 2.5 minutes.";
+  const badGrindSize = "Grind fine for a total brew time of 2 to 2.5 minutes.";
   const parser = createRecipeDraftParser({
     providers: [
       createMockProvider({
@@ -14050,7 +14298,8 @@ Deno.test("defect-2: warns (does not silently trust) a stated grind_size for a n
 
   assert(
     result.warnings.some((warning) =>
-      warning.includes("Mittelfein") && warning.includes("cannot be automatically verified")
+      warning.includes("Mittelfein") &&
+      warning.includes("cannot be automatically verified")
     ),
     `Expected an honest "cannot verify" warning for a stated non-English grind_size. Got: ${
       JSON.stringify(result.warnings)
@@ -14530,7 +14779,12 @@ async function assertTotalBrewTimeVerdict(
 }
 
 Deno.test("D6: cold brew 64,800s stated vs 64,820s emitted (ratio 1.0003) must pass — live-capture control", async () => {
-  await assertTotalBrewTimeVerdict("cold-brew-live-control", 64800, 64820, false);
+  await assertTotalBrewTimeVerdict(
+    "cold-brew-live-control",
+    64800,
+    64820,
+    false,
+  );
 });
 
 Deno.test("D6: French press 480s stated vs 510s emitted (ratio 1.06) blocks under the 1.05 threshold", async () => {
@@ -15954,14 +16208,57 @@ function d11BrewStep(input: {
 
 Deno.test("D11: a final timestamped step keeps its stated duration while a landmark tie absorbs its floor", async () => {
   const result = await parseD11TimingShape([
-    d11BrewStep({ text: "Start at 0:00.", duration: 10, elapsed: 0, stated: true, startsTimer: true }),
-    d11BrewStep({ text: "Stir from 0:10-0:15.", duration: 5, elapsed: 10, stated: true }),
-    d11BrewStep({ text: "Pour from 0:15-0:30.", duration: 15, elapsed: 15, stated: true }),
-    d11BrewStep({ text: "Brew from 0:30.", duration: 30, elapsed: 30, stated: true }),
-    d11BrewStep({ text: "Attach at 1:00.", duration: 40, elapsed: 60, stated: true }),
-    d11BrewStep({ text: "Flip at 1:40.", duration: 10, elapsed: 100, stated: false }),
-    d11BrewStep({ text: "Press from 1:40-2:00.", duration: 20, elapsed: 100, stated: true, role: "drawdown" }),
-    d11BrewStep({ text: "Cool from 2:00-2:30.", duration: 30, elapsed: 120, stated: true, role: "serve" }),
+    d11BrewStep({
+      text: "Start at 0:00.",
+      duration: 10,
+      elapsed: 0,
+      stated: true,
+      startsTimer: true,
+    }),
+    d11BrewStep({
+      text: "Stir from 0:10-0:15.",
+      duration: 5,
+      elapsed: 10,
+      stated: true,
+    }),
+    d11BrewStep({
+      text: "Pour from 0:15-0:30.",
+      duration: 15,
+      elapsed: 15,
+      stated: true,
+    }),
+    d11BrewStep({
+      text: "Brew from 0:30.",
+      duration: 30,
+      elapsed: 30,
+      stated: true,
+    }),
+    d11BrewStep({
+      text: "Attach at 1:00.",
+      duration: 40,
+      elapsed: 60,
+      stated: true,
+    }),
+    d11BrewStep({
+      text: "Flip at 1:40.",
+      duration: 10,
+      elapsed: 100,
+      stated: false,
+    }),
+    d11BrewStep({
+      text: "Press from 1:40-2:00.",
+      duration: 20,
+      elapsed: 100,
+      stated: true,
+      role: "drawdown",
+    }),
+    d11BrewStep({
+      text: "Cool from 2:00-2:30.",
+      duration: 30,
+      elapsed: 120,
+      stated: true,
+      role: "serve",
+    }),
   ]);
 
   assertEquals(
@@ -15969,13 +16266,29 @@ Deno.test("D11: a final timestamped step keeps its stated duration while a landm
     [0, 10, 10, 10, 30, 40, 10, 10, 30],
     "Expected the final stated 30s to survive and the 1:40 tie's floor to be paid by the following press.",
   );
-  assertEquals(result.draft.recipe.brew_time_seconds, 150, "Expected the source timeline to end at 150s.");
+  assertEquals(
+    result.draft.recipe.brew_time_seconds,
+    150,
+    "Expected the source timeline to end at 150s.",
+  );
 });
 
 Deno.test("D11 guard: a stated duration equal to the preceding elapsed interval is not counted twice", async () => {
   const result = await parseD11TimingShape([
-    d11BrewStep({ text: "Start the timer.", duration: 240, elapsed: 0, stated: false, startsTimer: true }),
-    d11BrewStep({ text: "After 4 minutes, stir.", duration: 240, elapsed: 240, stated: true, role: "stir" }),
+    d11BrewStep({
+      text: "Start the timer.",
+      duration: 240,
+      elapsed: 0,
+      stated: false,
+      startsTimer: true,
+    }),
+    d11BrewStep({
+      text: "After 4 minutes, stir.",
+      duration: 240,
+      elapsed: 240,
+      stated: true,
+      role: "stir",
+    }),
   ]);
 
   assertEquals(
@@ -15987,8 +16300,20 @@ Deno.test("D11 guard: a stated duration equal to the preceding elapsed interval 
 
 Deno.test("D11 control: an unstated final duration still uses the nominal fallback", async () => {
   const result = await parseD11TimingShape([
-    d11BrewStep({ text: "Start the timer.", duration: 120, elapsed: 0, stated: false, startsTimer: true }),
-    d11BrewStep({ text: "At 2:00, serve.", duration: 45, elapsed: 120, stated: false, role: "serve" }),
+    d11BrewStep({
+      text: "Start the timer.",
+      duration: 120,
+      elapsed: 0,
+      stated: false,
+      startsTimer: true,
+    }),
+    d11BrewStep({
+      text: "At 2:00, serve.",
+      duration: 45,
+      elapsed: 120,
+      stated: false,
+      role: "serve",
+    }),
   ]);
 
   assertEquals(
@@ -16467,7 +16792,8 @@ Deno.test("D10: two consecutive brew steps sharing the same elapsed_seconds are 
     detected_input_language: "en",
     likely_brewing_method: "V60",
     name: "D10 landmark collision",
-    short_description: "Tests shared elapsed noise is not turned into a zero anchor.",
+    short_description:
+      "Tests shared elapsed noise is not turned into a zero anchor.",
     grind_size: "Medium",
     water_temp_celsius: 93,
     coffee_amount_grams: 18,
@@ -16876,7 +17202,8 @@ Deno.test("D12: a drawdown that is BOTH an untrustworthy end-marker (D10) AND ha
       },
       {
         title: null,
-        raw_text: "Remove from heat when steam appears, at approximately 4 minutes.",
+        raw_text:
+          "Remove from heat when steam appears, at approximately 4 minutes.",
         duration_seconds: 10,
         elapsed_seconds: 240,
         starts_timer: false,
@@ -16886,7 +17213,8 @@ Deno.test("D12: a drawdown that is BOTH an untrustworthy end-marker (D10) AND ha
       },
       {
         title: null,
-        raw_text: "Cool the base under running water to stop extraction, then serve.",
+        raw_text:
+          "Cool the base under running water to stop extraction, then serve.",
         duration_seconds: 10,
         elapsed_seconds: null,
         starts_timer: false,

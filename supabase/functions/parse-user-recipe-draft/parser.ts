@@ -133,6 +133,10 @@ const extractedStepSchema = z.object({
   // total. An elapsed timestamp ("at 1:30") is not a stated duration — see
   // elapsed_seconds. A model that omits this must not fail the stage.
   duration_is_stated: z.boolean().default(false),
+  // Semantic timing metadata for actions repeated on a cadence, e.g. "pour
+  // 60 ml every 30 seconds". This is not the duration of the complete step.
+  // Optional + nullable keeps stored captures and fixtures backward-compatible.
+  repeat_interval_seconds: z.number().int().nonnegative().nullable().optional(),
   // F5: amounts in THIS step's raw_text that are genuine recipe
   // quantities — coffee or water that this recipe's own brew actually
   // uses — and therefore should scale with the recipe. Never equipment
@@ -293,6 +297,9 @@ const normalizedStepSchema = z.object({
   starts_timer: z.boolean().default(false),
   // See extractedStepSchema.duration_is_stated — carried through unchanged.
   duration_is_stated: z.boolean().default(false),
+  // See extractedStepSchema.repeat_interval_seconds — carried through with
+  // the action and never interpreted as a whole-step duration.
+  repeat_interval_seconds: z.number().int().nonnegative().nullable().optional(),
   // See extractedStepSchema.scalable_amounts — carried through unchanged
   // (split or merge this list along with the step it describes).
   scalable_amounts: z.array(
@@ -381,6 +388,8 @@ export type DraftStep = {
   elapsed_seconds: number | null;
   starts_timer: boolean;
   duration_is_stated: boolean;
+  // A stated cadence for a repeated action, not the complete step duration.
+  repeat_interval_seconds?: number | null;
   // See extractedStepSchema.scalable_amounts.
   scalable_amounts: Array<{ value: number; unit: string }>;
   // See extractedStepSchema.rate_amounts. Internal provenance metadata; it
@@ -1161,7 +1170,14 @@ function normalizeTemperatureToCelsius(
 }
 
 const TEMPERATURE_MENTION_REGEX =
-  /\b(\d+(?:\.\d+)?)\s*(?:[°º]\s*)?(?:degrees?\s*)?(c|f|celsius|fahrenheit|centigrade)\b/gi;
+  /(?<![\d.,])\b(\d+(?:[.,]\d+)?)\s*(?:[°º]\s*)?(?:degrees?\s*)?(c|f|celsius|fahrenheit|centigrade)\b/gi;
+
+// A valid temperature has at most one decimal separator. This is a final
+// publication backstop for model/deterministic rewrites such as the live
+// Russian `92,5°C` -> `92,92.5°C` corruption. The normalizer below should
+// prevent that shape; this guard keeps any future path from publishing it.
+const MALFORMED_TEMPERATURE_MENTION_REGEX =
+  /\d+(?:[.,]\d+){2,}\s*(?:[°º]\s*)?(?:degrees?\s*)?(?:c|f|celsius|fahrenheit|centigrade)\b/i;
 
 function normalizeTemperatureMentionsInText(
   value: string,
@@ -1172,7 +1188,8 @@ function normalizeTemperatureMentionsInText(
   const normalizedText = value.replace(
     TEMPERATURE_MENTION_REGEX,
     (fullMatch, numericValue, unitValue) => {
-      const numeric = Number(numericValue);
+      const numericText = String(numericValue);
+      const numeric = Number(numericText.replace(",", "."));
       if (!Number.isFinite(numeric)) {
         return fullMatch;
       }
@@ -1182,7 +1199,11 @@ function normalizeTemperatureMentionsInText(
         (unit.startsWith("f")
           ? convertFahrenheitToCelsius(numeric)
           : Number(numeric.toFixed(1)));
-      const replacement = `${formatTemperatureNumber(normalizedNumeric)}${
+      const formattedTemperature = formatTemperatureNumber(normalizedNumeric);
+      const localizedTemperature = numericText.includes(",")
+        ? formattedTemperature.replace(".", ",")
+        : formattedTemperature;
+      const replacement = `${localizedTemperature}${
         resolvedTemperatureCelsius !== undefined ? "°C" : "C"
       }`;
 
@@ -2730,6 +2751,7 @@ function buildExtractionSystemPrompt(): string {
     "Times may be spelled as words, such as 'three fifteen to three forty-five' or 'a minute 30'; convert them to seconds.",
     "starts_timer is true only for the single step where the recipe says to start the timer or begin the first pour. At most one step may have starts_timer true.",
     "duration_is_stated is true only when the source text explicitly gives a duration for that specific step, such as 'steep for 18 hours' or 'bloom for 45 seconds'. It is false when the duration was inferred, estimated, or carried over from a recipe-level total. An elapsed timestamp like 'at 1:30' is never a stated duration — that belongs in elapsed_seconds instead.",
+    "repeat_interval_seconds is the cadence of a repeated action, such as 30 for 'pour 60 ml every 30 seconds'. Set it from the meaning in the source language, not from an English keyword list. It is null when no repetition cadence is stated. A repetition cadence is NOT the complete duration of the step, so duration_is_stated must be false when the only stated time is repeat_interval_seconds.",
     "total_brew_time_seconds must come only from a statement about this recipe's own stated brew time. Ignore timing mentioned in commentary, comparisons to other brewers, equipment asides, anecdotes, or general advice unrelated to this recipe's own brew.",
     "This applies in EVERY language the source may be written in, not just English. A labelled total-time field is the same field regardless of what language it's labelled in — for example German 'Brühzeit: 2:30 - 3:30', Spanish 'tiempo de extracción', French 'temps d'infusion', or Japanese '抽出時間' are all total_brew_time_seconds, exactly like an English 'Brew time: 2:30-3:30'. Example: German 'Brühzeit: 2:30 - 3:30' becomes total_brew_time_seconds 180 (the midpoint, per the rounding rule below).",
     "A sentence stating this recipe should finish within roughly some amount of time — such as 'should be finished within about 3 minutes' or its equivalent in another language — is a STATED total brew time, not commentary, and must populate total_brew_time_seconds. Only commentary about OTHER setups, other people's brews, or general advice unrelated to this recipe's own brew should be excluded, exactly as above.",
@@ -2777,6 +2799,7 @@ function buildExtractionUserPrompt(input: {
             elapsed_seconds: "number|null",
             starts_timer: "boolean",
             duration_is_stated: "boolean",
+            repeat_interval_seconds: "number|null",
             scalable_amounts: [{ value: "number", unit: "string" }],
             rate_amounts: [{ value: "number", unit: "string" }],
             step_role: "preparation|bloom|pour|stir|drawdown|serve|null",
@@ -2875,10 +2898,11 @@ function buildNormalizationSystemPrompt(mode: RecipeDraftParserMode): string {
   ];
 
   const timingCarryRules = [
-    "Each extracted step carries elapsed_seconds, starts_timer, and duration_is_stated. Carry all three through onto whichever normalized step corresponds to that original action, even if you split one extracted step into several normalized steps or merge several extracted steps into one.",
+    "Each extracted step carries elapsed_seconds, starts_timer, duration_is_stated, and repeat_interval_seconds. Carry all four through onto whichever normalized step corresponds to that original action, even if you split one extracted step into several normalized steps or merge several extracted steps into one.",
     "elapsed_seconds is an elapsed timestamp from timer start, not a duration; never compute or invent it, only carry forward the value already present on the source step it came from.",
     "starts_timer must stay true on only the single normalized step that starts the timer or begins the first pour, and false on every other step.",
     "duration_is_stated must stay true only when the source text explicitly gave a duration for that step; never set it true because you inferred or estimated a duration_seconds value yourself.",
+    "repeat_interval_seconds is a stated cadence for a repeated action, not the complete step duration. Carry it through unchanged; when it is non-null, duration_is_stated must not be made true merely because that cadence was stated.",
     "Each extracted step also carries scalable_amounts. Carry it through onto whichever normalized step corresponds to that original action, splitting or merging the list along with the step. scalable_amounts must list ONLY amounts that are genuine coffee or water quantities this recipe's own brew uses — never equipment capacities, product specifications, paper or filter weights, ratios quoted as an aside, comparisons to other recipes, or numbers in commentary. Only convert a fixed numeric amount into a scalable expression in description_template when it is listed in that step's scalable_amounts.",
     "Each extracted step also carries rate_amounts. Carry every stated numeric rate through onto the corresponding normalized step, splitting or merging the list with the step. A rate must stay literal prose in description_template and must never become a scalable expression or appear in scalable_amounts.",
     "Each extracted step also carries step_role, labelling what that step DOES independent of the language it is written in: 'preparation' (setup before brewing starts), 'bloom' (the initial wetting pour), 'pour' (any subsequent water addition), 'stir' (stir/swirl/agitate with no water added), 'drawdown' (waiting for the bed to drain after the last pour), or 'serve' (decanting, straining, or serving). Carry it through onto whichever normalized step corresponds to that original action, splitting or merging steps as needed; if you split or merge a step, assign step_role yourself so it still correctly describes the resulting step's function. Example: a German 'Vollständig durchlaufen lassen.' (let it drain completely) is step_role 'drawdown', exactly like an English 'Let it fully draw down.'",
@@ -2938,6 +2962,7 @@ function buildNormalizationUserPrompt(input: {
             elapsed_seconds: "number|null",
             starts_timer: "boolean",
             duration_is_stated: "boolean",
+            repeat_interval_seconds: "number|null",
             scalable_amounts: [{ value: "number", unit: "string" }],
             rate_amounts: [{ value: "number", unit: "string" }],
             step_role: "preparation|bloom|pour|stir|drawdown|serve|null",
@@ -3034,10 +3059,11 @@ function buildRepairSystemPrompt(mode: RecipeDraftParserMode): string {
   ];
 
   const timingCarryRules = [
-    "Each normalized step carries elapsed_seconds, starts_timer, and duration_is_stated from the extraction stage. Keep already-correct values stable and carry them onto whichever step corresponds to the original action, splitting or merging steps as needed.",
+    "Each normalized step carries elapsed_seconds, starts_timer, duration_is_stated, and repeat_interval_seconds from the extraction stage. Keep already-correct values stable and carry them onto whichever step corresponds to the original action, splitting or merging steps as needed.",
     "elapsed_seconds is an elapsed timestamp from timer start, not a duration; never compute or invent it, only carry forward the value already present.",
     "starts_timer must stay true on only the single step that starts the timer or begins the first pour, and false on every other step.",
     "duration_is_stated must stay true only when the source text explicitly gave a duration for that step; never set it true because you inferred or estimated a duration_seconds value yourself.",
+    "repeat_interval_seconds is a stated cadence for a repeated action, not the complete step duration. Keep it attached to the action and never promote it into duration_is_stated.",
     "Each normalized step also carries scalable_amounts from the extraction stage. Keep already-correct values stable and carry them onto whichever step corresponds to the original action. scalable_amounts must list ONLY amounts that are genuine coffee or water quantities this recipe's own brew uses — never equipment capacities, product specifications, paper or filter weights, ratios quoted as an aside, comparisons to other recipes, or numbers in commentary.",
     "Each normalized step also carries rate_amounts from extraction. Keep those rates attached to the corresponding step and literal in description_template; never turn one into a scalable expression or move it into scalable_amounts.",
     "Each normalized step also carries step_role from the extraction stage — one of preparation, bloom, pour, stir, drawdown, or serve, labelling what that step DOES independent of the language it is written in (e.g. a German 'Vollständig durchlaufen lassen.' is step_role 'drawdown', exactly like an English 'Let it fully draw down.'). Keep already-correct values stable and carry them onto whichever step corresponds to the original action.",
@@ -3093,7 +3119,7 @@ function buildCumulativeRewriteSystemPrompt(
     "You rewrite coffee recipe brew-step wording for Timer.Coffee.",
     "Return only valid JSON.",
     "Preserve the original language of the step descriptions. Do not translate.",
-    "Keep step count, step order, kind, duration_seconds, description_source, elapsed_seconds, starts_timer, duration_is_stated, scalable_amounts, rate_amounts, and step_role unchanged.",
+    "Keep step count, step order, kind, duration_seconds, description_source, elapsed_seconds, starts_timer, duration_is_stated, repeat_interval_seconds, scalable_amounts, rate_amounts, and step_role unchanged.",
     "Only rewrite brew-step description_template fields when needed.",
   ];
 
@@ -3114,6 +3140,7 @@ function buildCumulativeRewriteSystemPrompt(
 
   const tailRules = [
     "Preserve all valid scalable quantity placeholders and keep numeric multipliers valid.",
+    "Every numeric value outside a supported scalable quantity expression must remain byte-for-byte unchanged; only scalable water-expression multipliers may change.",
     "Never emit <t1>..<t8> or any other time placeholder.",
   ];
 
@@ -3144,6 +3171,7 @@ function buildCumulativeRewriteUserPrompt(input: {
             elapsed_seconds: "number|null",
             starts_timer: "boolean",
             duration_is_stated: "boolean",
+            repeat_interval_seconds: "number|null",
             scalable_amounts: [{ value: "number", unit: "string" }],
             rate_amounts: [{ value: "number", unit: "string" }],
             step_role: "preparation|bloom|pour|stir|drawdown|serve|null",
@@ -3544,10 +3572,11 @@ function buildDraftSteps(input: {
       elapsed_seconds: step.elapsed_seconds,
       starts_timer: step.starts_timer,
       duration_is_stated: step.duration_is_stated,
-      scalable_amounts: step.scalable_amounts,
-      ...(step.rate_amounts?.length
-        ? { rate_amounts: step.rate_amounts }
+      ...(step.repeat_interval_seconds != null
+        ? { repeat_interval_seconds: step.repeat_interval_seconds }
         : {}),
+      scalable_amounts: step.scalable_amounts,
+      ...(step.rate_amounts?.length ? { rate_amounts: step.rate_amounts } : {}),
       step_role: step.step_role,
       expressions: extractExpressions(
         normalizedTemplate,
@@ -4221,12 +4250,19 @@ function resolveTotalBrewTimeTargetSeconds(input: {
 // not a source fact — so it must NOT be anchored; it competes for the
 // derived remainder like any other unstated step, which is precisely where
 // a source-stated total should end up being enforced.
+function hasStatedWholeStepDuration(
+  step: Pick<DraftStep, "duration_is_stated" | "repeat_interval_seconds">,
+): boolean {
+  return step.duration_is_stated === true &&
+    (step.repeat_interval_seconds ?? null) === null;
+}
+
 function isAnchoredBrewStep(
   step: DraftStep,
   index: number,
   timestampDifferencedIndexes: ReadonlySet<number>,
 ): boolean {
-  return step.duration_is_stated === true ||
+  return hasStatedWholeStepDuration(step) ||
     timestampDifferencedIndexes.has(index) ||
     // Defensive guard: this parser never itself infers a duration above the
     // cap, so a duration that exceeds it cannot be one of our own guesses —
@@ -4884,13 +4920,14 @@ function normalizeAbsoluteTimestampDurations(input: {
     // duration=240). The preceding step already owns that exact interval
     // through timestamp differencing, so reusing it after the landmark
     // would count the same source time twice.
+    const hasStatedDuration = hasStatedWholeStepDuration(step);
     const statedDurationOverlapsPrecedingInterval = !nextTimestamp &&
-      step.duration_is_stated && previousTimestamp !== undefined &&
+      hasStatedDuration && previousTimestamp !== undefined &&
       step.duration_seconds ===
         item.timestampSeconds - previousTimestamp.timestampSeconds;
     const duration = nextTimestamp
       ? nextTimestamp.timestampSeconds - item.timestampSeconds
-      : step.duration_is_stated && !statedDurationOverlapsPrecedingInterval
+      : hasStatedDuration && !statedDurationOverlapsPrecedingInterval
       ? step.duration_seconds
       : FINAL_TIMESTAMPED_STEP_DURATION_SECONDS;
     naturalDurationsByIndex.set(item.index, duration);
@@ -4928,7 +4965,9 @@ function normalizeAbsoluteTimestampDurations(input: {
     const payer = timestamped[order + 1];
     const isLandmarkTie = current === 0 && payer !== undefined &&
       payer.timestampSeconds === item.timestampSeconds;
-    if (!input.steps[item.index].duration_is_stated && !isLandmarkTie) {
+    if (
+      !hasStatedWholeStepDuration(input.steps[item.index]) && !isLandmarkTie
+    ) {
       return;
     }
 
@@ -4944,7 +4983,7 @@ function normalizeAbsoluteTimestampDurations(input: {
         finalDurationsByIndex.get(payer.index)! - delta,
       );
       absorbedShortfall = true;
-    } else if (input.steps[item.index].duration_is_stated) {
+    } else if (hasStatedWholeStepDuration(input.steps[item.index])) {
       // No eligible payer — the step is last, the next step isn't
       // timestamped, or it can't afford the delta without itself dropping
       // below the minimum. Bump to the minimum without conservation,
@@ -5120,6 +5159,22 @@ function applyExtractionFallbacks(args: {
       short_description: args.normalized.localization.short_description ??
         args.extraction.short_description,
     },
+    // Normalization/repair are instructed to carry semantic cadence metadata,
+    // but an omitted optional key must not silently erase a value extraction
+    // already established. Match by the required, source-preserved text so a
+    // split/merge does not inherit metadata merely because its array index
+    // happens to align. An explicit null remains authoritative.
+    steps: args.normalized.steps.map((step) => {
+      const extractedStep = args.extraction.steps.find((candidate) =>
+        candidate.raw_text === step.description_source
+      );
+      return {
+        ...step,
+        repeat_interval_seconds: step.repeat_interval_seconds !== undefined
+          ? step.repeat_interval_seconds
+          : extractedStep?.repeat_interval_seconds ?? null,
+      };
+    }),
     // G22: normalization/repair fully replace the working NormalizedDraft
     // with their own LLM output (unlike the cumulative_rewrite merge,
     // which only overwrites `steps`/`warnings`), so a provider that
@@ -5299,6 +5354,13 @@ function validateCumulativeRewriteSteps(args: {
       return `cumulative rewrite changed duration_is_stated for step ${index}`;
     }
 
+    if (
+      (originalStep.repeat_interval_seconds ?? null) !==
+        (rewrittenStep.repeat_interval_seconds ?? null)
+    ) {
+      return `cumulative rewrite changed repeat_interval_seconds for step ${index}`;
+    }
+
     if (originalStep.step_role !== rewrittenStep.step_role) {
       return `cumulative rewrite changed step_role for step ${index}`;
     }
@@ -5326,6 +5388,56 @@ function validateRewrittenStepTemplates(
   }
 
   return null;
+}
+
+// Cumulative rewriting may change the arithmetic inside supported scalable
+// expressions, but it is never licensed to change temperatures, timestamps,
+// ratios, or any other number in the surrounding prose. Mask expressions and
+// compare the remaining numeric lexemes exactly, without guessing their
+// language-dependent meaning.
+const NON_AMOUNT_NUMERIC_LEXEME_REGEX = /[+-]?\d+(?:(?:[.,:])\d+)*/g;
+
+function collectNonAmountNumericLexemes(template: string): string[] {
+  const withoutExpressions = template.replace(
+    cloneRegex(EXPRESSION_REGEX),
+    "<scalable_amount>",
+  );
+  return withoutExpressions.match(NON_AMOUNT_NUMERIC_LEXEME_REGEX) ?? [];
+}
+
+function revertCumulativeRewritesWithChangedNonAmountNumbers(args: {
+  original: DraftStep[];
+  rewritten: NormalizedDraft["steps"];
+}): { steps: NormalizedDraft["steps"]; warnings: string[] } {
+  const warnings: string[] = [];
+  const steps = args.rewritten.map((rewrittenStep, index) => {
+    const originalStep = args.original[index];
+    if (!originalStep) return rewrittenStep;
+
+    const originalNumbers = collectNonAmountNumericLexemes(
+      originalStep.description_template,
+    );
+    const rewrittenNumbers = collectNonAmountNumericLexemes(
+      rewrittenStep.description_template,
+    );
+    const unchanged = originalNumbers.length === rewrittenNumbers.length &&
+      originalNumbers.every((value, position) =>
+        value === rewrittenNumbers[position]
+      );
+    if (unchanged) return rewrittenStep;
+
+    warnings.push(
+      `Cumulative rewrite changed non-amount numeric content in step ${
+        index + 1
+      }; the original wording was kept instead.`,
+    );
+    return {
+      ...rewrittenStep,
+      description_template: originalStep.description_template,
+    };
+  });
+
+  return { steps, warnings };
 }
 
 // Fix 1 (Aug 2026 live pass): the cumulative_rewrite stage is explicitly
@@ -5363,6 +5475,7 @@ function revertUntraceableRangeCumulativeRewrites(args: {
   original: DraftStep[];
   // What the cumulative_rewrite stage returned.
   rewritten: NormalizedDraft["steps"];
+  provenance: AmountProvenanceRecord[];
   coffeeAmount: number | null;
   waterAmount: number | null;
 }): { steps: NormalizedDraft["steps"]; warnings: string[] } {
@@ -5410,11 +5523,63 @@ function revertUntraceableRangeCumulativeRewrites(args: {
       }
 
       warnings.push(
-        `Cumulative rewrite recomputed step ${
-          index + 1
-        }'s ${
+        `Cumulative rewrite recomputed step ${index + 1}'s ${
           placeholder === "<final_water_amount>" ? "water" : "coffee"
         } amount range into new figures that do not trace to the source; the original wording was kept instead.`,
+      );
+      return {
+        ...rewrittenStep,
+        description_template: originalStep.description_template,
+      };
+    }
+
+    // Production v50 exposed a second range shape: extraction retained both
+    // endpoints in stated_range, but normalization rendered only the selected
+    // endpoint as one expression. Protect that provenance anchor before the
+    // later deterministic endpoint-expansion pass reconstructs its pair.
+    const statedRangeRecords = args.provenance.filter((record) =>
+      // Normalization may insert preparation ahead of extraction's timed-step
+      // indexes. Match the same one-step drift provenance.ts permits, then
+      // require the concrete value/unit/placeholder anchor below.
+      Math.abs(record.step_index - index) <= 1 &&
+      record.step_index >= 0 &&
+      record.stated_range != null &&
+      !isRecipeLevelScalarValue(
+        record,
+        args.coffeeAmount,
+        args.waterAmount,
+      ) &&
+      resolveRangeEndpointTrigger(record) !== null
+    );
+    for (const record of statedRangeRecords) {
+      const targetUnit = normalizeUnitForRangeCheck(record.unit);
+      const originalAnchor = originalStep.expressions.find((expression) =>
+        expression.preview_value !== null &&
+        Math.abs(expression.preview_value - record.value) <=
+          RANGE_ENDPOINT_MATCH_TOLERANCE &&
+        (normalizeUnitForRangeCheck(expression.unit) === "" ||
+          normalizeUnitForRangeCheck(expression.unit) === targetUnit)
+      );
+      if (!originalAnchor) continue;
+
+      const rewrittenAnchorPreserved = extractExpressions(
+        rewrittenStep.description_template,
+        args.coffeeAmount,
+        args.waterAmount,
+      ).some((expression) =>
+        expression.placeholder === originalAnchor.placeholder &&
+        expression.preview_value !== null &&
+        Math.abs(expression.preview_value - record.value) <=
+          RANGE_ENDPOINT_MATCH_TOLERANCE &&
+        (normalizeUnitForRangeCheck(expression.unit) === "" ||
+          normalizeUnitForRangeCheck(expression.unit) === targetUnit)
+      );
+      if (rewrittenAnchorPreserved) continue;
+
+      warnings.push(
+        `Cumulative rewrite replaced step ${
+          index + 1
+        }'s source-traceable ${record.value}${record.unit} range endpoint with an invented cumulative figure; the original wording was kept instead.`,
       );
       return {
         ...rewrittenStep,
@@ -5757,6 +5922,17 @@ function validateDraft(input: {
         code: "forbidden_time_placeholder",
         field: `steps[${index}].description_template`,
         message: "User recipes must not contain <tN> timer placeholders.",
+      });
+    }
+
+    if (
+      MALFORMED_TEMPERATURE_MENTION_REGEX.test(step.description_template)
+    ) {
+      issues.push({
+        code: "malformed_temperature_text",
+        field: `steps[${index}].description_template`,
+        message:
+          "Step description contains a malformed temperature with multiple decimal separators.",
       });
     }
 
@@ -6441,8 +6617,7 @@ function findRangeEndpointCollapseIssues(
         field: record.step_index >= 0
           ? `steps[${record.step_index}].description_template`
           : "extraction.range_endpoint",
-        message:
-          `The source states a range of ${low}-${high}${record.unit}, ` +
+        message: `The source states a range of ${low}-${high}${record.unit}, ` +
           `but the final draft only shows ${record.value}${record.unit} — ` +
           `the other endpoint (${otherValue}${record.unit}) does not ` +
           `appear anywhere in the draft.`,
@@ -6493,7 +6668,11 @@ function reconstructRangeEndpointStep(args: {
   high: number;
   coffeeAmount: number | null;
   waterAmount: number | null;
-}): { step: DraftStep; warning: string; syntheticRecord: AmountProvenanceRecord } | null {
+}): {
+  step: DraftStep;
+  warning: string;
+  syntheticRecord: AmountProvenanceRecord;
+} | null {
   const { step, stepIndex, record, low, high, coffeeAmount, waterAmount } =
     args;
 
@@ -6598,12 +6777,17 @@ function reconstructRangeEndpointStep(args: {
       coffeeAmount,
       waterAmount,
     ),
-    expressions: extractExpressions(repairedTemplate, coffeeAmount, waterAmount),
+    expressions: extractExpressions(
+      repairedTemplate,
+      coffeeAmount,
+      waterAmount,
+    ),
   };
 
-  const warning = `D1 backstop: step ${
-    stepIndex + 1
-  }'s stated range of ${low}-${high}${record.unit} had collapsed to a ` +
+  const warning =
+    `D1 backstop: step ${
+      stepIndex + 1
+    }'s stated range of ${low}-${high}${record.unit} had collapsed to a ` +
     `single ${record.value}${record.unit} rendering; reconstructed the ` +
     `missing endpoint (${otherValue}${record.unit}) from stated_range so ` +
     `both endpoints survive into the draft.`;
@@ -7004,9 +7188,7 @@ function deriveNonBrewAmountProvenance(args: {
           stepIndex + 1
         }'s ${previewValue}${renderedUnit} has no coffee/water provenance ` +
           `record (it is not itself a coffee or water amount) but renders ` +
-          `as ${
-            formatMultiplier(expression.multiplier)
-          } x the recipe's own ${
+          `as ${formatMultiplier(expression.multiplier)} x the recipe's own ${
             isCoffee ? "coffee" : "water"
           } amount; traced it to that scalar so it verifies and scales ` +
           `correctly.`,
@@ -7202,10 +7384,10 @@ function planStepMultiplierRepairs(args: {
     );
     const recordsForBase = args.literalRecords.filter((record) =>
       getCleanestPlaceholder({
-        value: record.value,
-        coffeeAmount: args.coffeeAmount,
-        waterAmount: args.waterAmount,
-      }) === placeholder &&
+          value: record.value,
+          coffeeAmount: args.coffeeAmount,
+          waterAmount: args.waterAmount,
+        }) === placeholder &&
       isRecordCompatibleWithPlaceholder(record, placeholder)
     );
     if (recordsForBase.length !== occurrencesForBase.length) {
@@ -7839,14 +8021,12 @@ function finalizeDraftResponse(input: {
       ...timingResult.findings.filter((finding) =>
         finding.code !== "total_brew_time_mismatch"
       ),
-      ...(emittedTotalIsInsideStatedRange
-        ? []
-        : [{
-          code: "total_brew_time_mismatch" as const,
-          step_index: -1,
-          message:
-            `The source states a total brew time range of ${statedTotalBrewTimeRange.low}-${statedTotalBrewTimeRange.high}s, but the final brew steps sum to ${emittedTotalBrewTimeSeconds}s.`,
-        }]),
+      ...(emittedTotalIsInsideStatedRange ? [] : [{
+        code: "total_brew_time_mismatch" as const,
+        step_index: -1,
+        message:
+          `The source states a total brew time range of ${statedTotalBrewTimeRange.low}-${statedTotalBrewTimeRange.high}s, but the final brew steps sum to ${emittedTotalBrewTimeSeconds}s.`,
+      }]),
     ];
   const severeTotalBrewTimeMismatch = statedTotalBrewTimeRange !== null
     ? !emittedTotalIsInsideStatedRange
@@ -8241,10 +8421,16 @@ export function replayFinalizeDraftResponseFromStageOutputs(input: {
       );
       if (rewrittenTemplateValidationError) continue;
 
+      const { steps: numericSafeSteps, warnings: numericSafeWarnings } =
+        revertCumulativeRewritesWithChangedNonAmountNumbers({
+          original: provisionalDraftSteps,
+          rewritten: rewritten.steps,
+        });
       const { steps: rangeSafeSteps, warnings: rangeSafeWarnings } =
         revertUntraceableRangeCumulativeRewrites({
           original: provisionalDraftSteps,
-          rewritten: rewritten.steps,
+          rewritten: numericSafeSteps,
+          provenance: normalized.extracted_amounts,
           coffeeAmount: normalized.recipe.coffee_amount,
           waterAmount: normalized.recipe.water_amount,
         });
@@ -8254,6 +8440,7 @@ export function replayFinalizeDraftResponseFromStageOutputs(input: {
         warnings: uniqueStrings([
           ...normalized.warnings,
           ...rewritten.warnings,
+          ...numericSafeWarnings,
           ...rangeSafeWarnings,
         ]),
         steps: rangeSafeSteps,
@@ -8447,7 +8634,12 @@ export function createRecipeDraftParser(
       // repair, its nested per-provider attempt loop too) without
       // interfering with the other stages' counters.
       const stageOutputs: StageOutputs | null = input.captureStages
-        ? { extraction: [], normalization: [], repair: [], cumulative_rewrite: [] }
+        ? {
+          extraction: [],
+          normalization: [],
+          repair: [],
+          cumulative_rewrite: [],
+        }
         : null;
       const extractionAttemptCounter = { count: 0 };
       const normalizationAttemptCounter = { count: 0 };
@@ -8812,10 +9004,16 @@ export function createRecipeDraftParser(
             // invents a figure with no traceable provenance record. Falls
             // back to that one step's pre-rewrite (already-traceable)
             // template; every other step's legitimate rewrite is kept.
+            const { steps: numericSafeSteps, warnings: numericSafeWarnings } =
+              revertCumulativeRewritesWithChangedNonAmountNumbers({
+                original: provisionalDraftSteps,
+                rewritten: rewritten.steps,
+              });
             const { steps: rangeSafeSteps, warnings: rangeSafeWarnings } =
               revertUntraceableRangeCumulativeRewrites({
                 original: provisionalDraftSteps,
-                rewritten: rewritten.steps,
+                rewritten: numericSafeSteps,
+                provenance: normalized.extracted_amounts,
                 coffeeAmount: normalized.recipe.coffee_amount,
                 waterAmount: normalized.recipe.water_amount,
               });
@@ -8825,6 +9023,7 @@ export function createRecipeDraftParser(
               warnings: uniqueStrings([
                 ...normalized.warnings,
                 ...rewritten.warnings,
+                ...numericSafeWarnings,
                 ...rangeSafeWarnings,
               ]),
               steps: rangeSafeSteps,
