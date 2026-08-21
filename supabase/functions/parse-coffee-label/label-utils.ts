@@ -146,6 +146,20 @@ Roast date rules:
 - The roast date can never be after today's date.
 - Coffee bags often print a best-by/expiration date (typically 12-24 months after roasting) — never return that as roastDate; if only a best-by/expiration date is printed, return null.
 - If no explicit roast date is visible on the label, return null rather than guessing.
+- A roast-date stamp may carry a leading lot prefix such as "L", "L1" or "Lote". That prefix is not part of the date: read "L1 0 JUN 2026" as 10 June 2026.
+
+Lot and batch numbers:
+- Labels commonly print a lot or batch number, often beside a lot glyph or after "Lote"/"Lot"/"L" (for example "74158"). It identifies the batch and says nothing about the coffee.
+- Never return a lot or batch number as variety, cuppingScore, elevation, packageWeightGrams, or any other field. If the only thing you can attribute to a field is a lot number, return null for that field.
+
+Cupping score:
+- Only return cuppingScore when the label explicitly labels it as a cupping score, SCA score, or puntuación. Never derive it from another number on the bag, and never estimate one.
+
+Tasting notes:
+- Flavour/tasting notes are usually printed on the front of the bag, under or beside the coffee name, as a short comma-separated list of flavours. Extract them whenever such a list is present.
+
+Elevation:
+- Elevation may be written with "." or "," as a thousands separator. Read "2.350 m" as 2350 — not 2358, and not 2.35. Return metres as a plain number.
 
 Use null for any field that is not visible on the label — never "Unknown", "N/A", or "".
 
@@ -156,7 +170,7 @@ Use the following JSON structure:
     "origin": "origin (country of origin, translated to the target locale)",
     "farm": "farm",
     "farmer": "farmer",
-    "variety": "variety",
+    "variety": "variety (botanical coffee variety such as Bourbon, Caturra, Geisha, Heirloom — null unless the label names one; never a lot number)",
     "processingMethod": "Processing Method (translated to the target locale)",
     "elevation": "elevation (number only)",
     "roastDate": "roast date (YYYY-MM-DD; if the label omits the year, infer it from today's date)",
