@@ -12,6 +12,27 @@
 // 2026-07-17 deactivation, per Groq's recommended migration.
 export const GROQ_DEFAULT_MODEL = "qwen/qwen3.6-27b";
 
+/**
+ * Groq-only sampling override that disables Qwen 3 "thinking".
+ *
+ * Qwen 3 models reason by default on Groq. The thinking tokens are emitted
+ * into `content`, which breaks `response_format: { type: "json_object" }` with
+ * a 400 `json_validate_failed`, and they consume `max_completion_tokens`
+ * before the JSON can finish. `reasoning_effort: "none"` turns reasoning off
+ * outright (`reasoning_format: "hidden"` only hides the tokens — they are
+ * still generated and still spend the budget).
+ *
+ * The parameter is qwen3-only: `llama-3.3-70b-versatile`, which sits in
+ * roaster-enrichment-worker's GROQ_TRIAGE_MODELS cascade, does not accept it,
+ * and gpt-oss accepts only low/medium/high. So it must be applied per model
+ * rather than unconditionally — spread the result into the request body.
+ */
+export function groqReasoningOverride(
+  model: string,
+): { reasoning_effort?: "none" } {
+  return model.startsWith("qwen/") ? { reasoning_effort: "none" } : {};
+}
+
 export type OpenAiModelTier = "BIG" | "MEDIUM" | "SMALL";
 
 export type OpenAiModelEnvReader = (name: string) => string | undefined;

@@ -1,4 +1,6 @@
 import {
+  GROQ_DEFAULT_MODEL,
+  groqReasoningOverride,
   OPENAI_MODELS,
   OPENAI_SPECIALIZED_MODELS,
   resolveOpenAiModelSettings,
@@ -125,5 +127,29 @@ Deno.test("runtime OpenAI model registries expose immutable public objects", () 
     Object.keys(OPENAI_SPECIALIZED_MODELS),
     ["EMBEDDING", "MODERATION"],
     "The specialized registry should expose embedding and moderation.",
+  );
+});
+
+Deno.test("groqReasoningOverride disables reasoning for Qwen 3 models", () => {
+  assertEquals(
+    groqReasoningOverride(GROQ_DEFAULT_MODEL),
+    { reasoning_effort: "none" },
+    "The default Groq model is a Qwen 3 model and must run with reasoning off; leaving it on emits thinking tokens into `content` and fails json_object with 400 json_validate_failed.",
+  );
+});
+
+Deno.test("groqReasoningOverride omits the parameter for non-Qwen models", () => {
+  // llama-3.3-70b-versatile is the second entry in roaster-enrichment-worker's
+  // GROQ_TRIAGE_MODELS cascade. It does not accept reasoning_effort, so the
+  // override must spread to nothing rather than sending an unsupported field.
+  assertEquals(
+    groqReasoningOverride("llama-3.3-70b-versatile"),
+    {},
+    "Non-Qwen Groq models must not receive reasoning_effort.",
+  );
+  assertEquals(
+    groqReasoningOverride("openai/gpt-oss-20b"),
+    {},
+    "gpt-oss accepts only low/medium/high, never 'none'.",
   );
 });

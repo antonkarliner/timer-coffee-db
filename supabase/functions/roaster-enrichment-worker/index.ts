@@ -4,6 +4,7 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2.42.5";
 import { getCorsHeaders } from "../_shared/cors.ts";
 import {
   GROQ_DEFAULT_MODEL,
+  groqReasoningOverride,
   OPENAI_MODELS,
 } from "../_shared/ai-models.ts";
 import { fetchWithTimeout } from "../_shared/fetch-with-timeout.ts";
@@ -3026,6 +3027,11 @@ async function callGroqJson(prompt, model, correlationId) {
         type: "json_object",
       },
       temperature: 0.2,
+      // Qwen 3 reasons by default; its thinking tokens land in `content` and
+      // break json_object enforcement with 400 json_validate_failed. Applied
+      // per model because the llama-3.3-70b fallback in GROQ_TRIAGE_MODELS
+      // does not accept reasoning_effort.
+      ...groqReasoningOverride(model),
     }),
   }, {
     correlationId,

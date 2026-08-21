@@ -13,8 +13,18 @@
 
 // [label, model, extra body params]
 const MODELS: [string, string, Record<string, unknown>][] = [
-  ["qwen + reasoning_format:hidden", "qwen/qwen3.6-27b", { reasoning_format: "hidden" }],
-  ["qwen + hidden + json_object", "qwen/qwen3.6-27b", { reasoning_format: "hidden", response_format: { type: "json_object" } }],
+  // The configuration parse-coffee-label actually ships (see
+  // groqReasoningOverride in _shared/ai-models.ts). reasoning_effort:"none"
+  // disables Qwen 3 thinking outright, so the 1024-token budget goes entirely
+  // to the JSON. This is the variant that must pass.
+  ["SHIPPED: qwen + reasoning_effort:none + json_object", "qwen/qwen3.6-27b", { reasoning_effort: "none", response_format: { type: "json_object" } }],
+  // Baseline reproducing the production failure: no reasoning override, so
+  // thinking tokens consume the budget and Groq rejects the truncated output
+  // with 400 json_validate_failed.
+  ["BROKEN BASELINE: qwen + json_object, no override", "qwen/qwen3.6-27b", { response_format: { type: "json_object" } }],
+  // reasoning_format only *hides* the tokens — they are still generated and
+  // still spend max_completion_tokens, so this is expected to still fail.
+  ["qwen + reasoning_format:hidden + json_object", "qwen/qwen3.6-27b", { reasoning_format: "hidden", response_format: { type: "json_object" } }],
 ];
 // Qwen free tier is 8000 TPM and each vision call ~3.8k tokens; pace the calls.
 const DELAY_MS = 35000;

@@ -5,6 +5,7 @@ import {
   CEREBRAS_DEFAULT_MODEL,
   GEMINI_DEFAULT_MODEL,
   GROQ_DEFAULT_MODEL,
+  groqReasoningOverride,
   OPENAI_MODELS,
 } from "../_shared/ai-models.ts";
 import {
@@ -382,6 +383,10 @@ serve(async (req)=>{
       },
       body: JSON.stringify({
         model: GROQ_DEFAULT_MODEL,
+        // Qwen 3 reasons by default; its thinking tokens land in `content`
+        // and exhaust max_completion_tokens, so json_object enforcement fails
+        // with 400 json_validate_failed on every label parse.
+        ...groqReasoningOverride(GROQ_DEFAULT_MODEL),
         messages: [
           {
             role: "system",
