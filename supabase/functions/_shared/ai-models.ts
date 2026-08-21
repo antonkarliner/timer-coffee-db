@@ -121,3 +121,15 @@ export const GEMINI_DEFAULT_MODEL = "gemini-3.1-flash-lite";
 // chat completions API). Accepts base64 PNG/JPEG data URIs only, max 5 images
 // per request. Used as the primary coffee-label parsing model.
 export const CEREBRAS_DEFAULT_MODEL = "gemma-4-31b";
+
+// Vercel AI Gateway — one OpenAI-compatible endpoint fronting many providers
+// at provider list rates with no markup. The free tier grants $5 of credits
+// that refresh every 30 days across a subset of the catalog; buying credits
+// ends that allocation permanently, so do not top up to "test" something.
+//
+// gemma-4-31b-it is the same Gemma 4 31B the coffee-label prompts were tuned
+// for on Cerebras, and it is free-tier eligible (verified 2026-08-21). At the
+// measured label-parse shape (~3.8k in / ~300 out) the whole monthly volume
+// costs roughly $0.42 against the $5 credit.
+export const VERCEL_GATEWAY_BASE_URL = "https://ai-gateway.vercel.sh/v1";
+export const VERCEL_GATEWAY_DEFAULT_MODEL = "google/gemma-4-31b-it";

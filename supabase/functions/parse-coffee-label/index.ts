@@ -7,6 +7,8 @@ import {
   GROQ_DEFAULT_MODEL,
   groqReasoningOverride,
   OPENAI_MODELS,
+  VERCEL_GATEWAY_BASE_URL,
+  VERCEL_GATEWAY_DEFAULT_MODEL,
 } from "../_shared/ai-models.ts";
 import {
   buildSystemPrompt,
@@ -18,6 +20,7 @@ import {
   shouldFallbackProviderError,
 } from "./label-utils.ts";
 // --- Provider credentials ---
+const aiGatewayApiKey = Deno.env.get('AI_GATEWAY_API_KEY');
 const cerebrasApiKey = Deno.env.get('CEREBRAS_API_KEY');
 const groqApiKey = Deno.env.get('GROQ_API_KEY');
 const openaiApiKey = Deno.env.get('OPENAI_API_KEY_NON_PERSONAL');
@@ -282,6 +285,79 @@ serve(async (req)=>{
       throw new Error(`${provider} returned an invalid JSON response`);
     }
   }
+  // --- Vercel AI Gateway processing (primary) ---
+  // OpenAI-compatible wire format, so this mirrors the Cerebras path below.
+  const processWithVercelGateway = async (base64Images, systemPrompt, _responseSchema: ProviderResponseSchema)=>{
+    const userContent = [
+      {
+        type: "text",
+        text: `locale = ${locale}`
+      }
+    ];
+    if (base64Images && base64Images.length > 0) {
+      base64Images.forEach((base64)=>{
+        userContent.push({
+          type: "image_url",
+          image_url: {
+            url: `data:image/jpeg;base64,${base64}`
+          }
+        });
+      });
+    } else if (ocrText && ocrText.trim().length > 0) {
+      userContent.push({
+        type: "text",
+        text: `OCR context from mobile device: ${ocrText}`
+      });
+    }
+    const response = await fetch(`${VERCEL_GATEWAY_BASE_URL}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${aiGatewayApiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: VERCEL_GATEWAY_DEFAULT_MODEL,
+        messages: [
+          {
+            role: "system",
+            content: systemPrompt
+          },
+          {
+            role: "user",
+            content: userContent
+          }
+        ],
+        temperature: 1,
+        top_p: 0.95,
+        // The gateway catalog advertises `max_tokens`, not OpenAI's newer
+        // `max_completion_tokens`, for these models.
+        max_tokens: 1024,
+        stream: false,
+        // json_schema support varies by upstream provider; json_object is the
+        // safe minimum enforcement, matching the other providers here.
+        response_format: {
+          type: "json_object"
+        }
+      })
+    });
+    if (!response.ok) {
+      const errorText = await response.text();
+      const errorCode = extractProviderErrorCode(errorText);
+      logWarnEvent(requestId, 'vercel_gateway_http_error', {
+        status: response.status,
+        code: errorCode || null,
+        responseBodyLength: errorText.length
+      });
+      throw new ProviderHttpError(
+        `Vercel AI Gateway request failed with status ${response.status}`,
+        response.status,
+        errorCode || undefined,
+      );
+    }
+    const jsonResponse = await response.json();
+    const content = jsonResponse.choices[0].message.content;
+    return parseModelResponse(content, 'VercelGateway');
+  };
   // --- Cerebras processing (primary) ---
   const processWithCerebras = async (base64Images, systemPrompt, _responseSchema: ProviderResponseSchema)=>{
     const userContent = [
@@ -601,17 +677,26 @@ serve(async (req)=>{
     }
     const images = hasImages ? imagesBase64.slice(0, 2) : null;
     const primaryPrompt = getSystemPrompt(ocrText);
-    // Ordered provider chain: Cerebras (primary) → Groq → OpenAI → Gemini. Each
-    // tier runs only if its credential is configured; on a retriable error
-    // (incl. a decommissioned model) we cascade to the next configured tier.
+    // Ordered provider chain: Vercel AI Gateway (primary) → Groq → OpenAI →
+    // Gemini. Each tier runs only if its credential is configured; on a
+    // retriable error (incl. a decommissioned model) we cascade to the next
+    // configured tier.
+    //
+    // Cerebras was removed from this chain on 2026-08-21. Cerebras migrated
+    // personal accounts to PayGo, so an unfunded account returns 402 on every
+    // request — it failed 100% of parses while sitting first in line — and its
+    // gemma-4-31b is dropped from the shared tier on 2026-09-03 for
+    // qwen-3.8-27b. processWithCerebras is kept below: if the account is ever
+    // funded, re-adding a `{ key: 'cerebras', ... }` entry here restores it.
+    // The Vercel gateway serves the same Gemma 4 31B on a $5/month free credit.
     const providerChain = [
-      { key: 'cerebras', configured: !!cerebrasApiKey, run: processWithCerebras },
+      { key: 'vercel', configured: !!aiGatewayApiKey, run: processWithVercelGateway },
       { key: 'groq', configured: !!groqApiKey, run: processWithGroq },
       { key: 'openai', configured: !!openaiApiKey, run: processWithOpenAI },
       { key: 'gemini', configured: !!serviceAccountKey, run: processWithGemini }
     ].filter((p)=>p.configured);
     if (providerChain.length === 0) {
-      throw new Error('No AI provider configured (set one of CEREBRAS_API_KEY, GROQ_API_KEY, OPENAI_API_KEY_NON_PERSONAL, GOOGLE_APPLICATION_CREDENTIALS_JSON)');
+      throw new Error('No AI provider configured (set one of AI_GATEWAY_API_KEY, GROQ_API_KEY, OPENAI_API_KEY_NON_PERSONAL, GOOGLE_APPLICATION_CREDENTIALS_JSON)');
     }
     // deno-lint-ignore no-explicit-any
     let result: any;
