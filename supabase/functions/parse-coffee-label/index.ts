@@ -667,19 +667,36 @@ serve(async (req)=>{
         let recheckRoastDate = null;
         let recheckParsed = null;
         let recheckClassification = 'invalid';
-        try {
-          const recheckResult = await used.run(images, strictPrompt, ROAST_DATE_RESPONSE_SCHEMA);
-          if (recheckResult && typeof recheckResult === 'object' && !Array.isArray(recheckResult) && 'roastDate' in recheckResult) {
-            recheckRoastDate = recheckResult.roastDate ?? null;
-            recheckParsed = parseRoastDate(recheckRoastDate);
-            recheckClassification = classifyRoastDate(recheckParsed, today);
+        let recheckProvider = null;
+        // Re-check on a DIFFERENT provider than the one that served the parse.
+        // Firing a second call at the same provider ~40ms after the first trips
+        // its per-minute limit (observed: Groq 429 rate_limit_exceeded), which
+        // silently disables the correction — and the `too_old` branch below
+        // then keeps the bad first-pass date. Tiers after `used` are the more
+        // reliable end of the chain; `used` stays as a last resort so a
+        // single-provider deployment still re-checks.
+        const usedIndex = providerChain.indexOf(used);
+        const recheckChain = [...providerChain.slice(usedIndex + 1), used];
+        for (const candidate of recheckChain) {
+          try {
+            const recheckResult = await candidate.run(images, strictPrompt, ROAST_DATE_RESPONSE_SCHEMA);
+            if (recheckResult && typeof recheckResult === 'object' && !Array.isArray(recheckResult) && 'roastDate' in recheckResult) {
+              recheckRoastDate = recheckResult.roastDate ?? null;
+              recheckParsed = parseRoastDate(recheckRoastDate);
+              recheckClassification = classifyRoastDate(recheckParsed, today);
+              recheckProvider = candidate.key;
+              break;
+            }
+            // Usable response shape but no roastDate field: treat as a failed
+            // attempt and let the next tier try.
+          } catch (recheckError) {
+            logErrorEvent(requestId, 'roast_date_recheck_failed', recheckError, {
+              provider,
+              recheckProvider: candidate.key,
+              classification,
+              originalRoastDate
+            });
           }
-        } catch (recheckError) {
-          logErrorEvent(requestId, 'roast_date_recheck_failed', recheckError, {
-            provider,
-            classification,
-            originalRoastDate
-          });
         }
         let finalRoastDate;
         if (classification === 'future') {
@@ -688,14 +705,29 @@ serve(async (req)=>{
             ? recheckRoastDate
             : null;
         } else {
-          // too_old: keep first-pass date unless re-check returned a valid date (old or fresh).
-          finalRoastDate = recheckParsed !== null && recheckClassification !== 'future'
-            ? recheckRoastDate
-            : originalRoastDate;
+          // too_old, in three cases:
+          //  1. Re-check returned a valid non-future date -> take it.
+          //  2. Re-check ran and deliberately returned null -> trust it. The
+          //     strict prompt instructs the model to return null when the only
+          //     printed date is a best-by / expiry, so the first-pass value was
+          //     a misread of that date. Surfacing it would put a wrong roast
+          //     date in front of the user; an empty field is the honest answer.
+          //     `recheckProvider` is set only when a provider actually returned
+          //     a usable response, which is what separates this from case 3.
+          //  3. No provider produced a usable response -> keep the first-pass
+          //     date rather than destroying data on an infrastructure failure.
+          if (recheckParsed !== null && recheckClassification !== 'future') {
+            finalRoastDate = recheckRoastDate;
+          } else if (recheckProvider !== null && recheckRoastDate === null) {
+            finalRoastDate = null;
+          } else {
+            finalRoastDate = originalRoastDate;
+          }
         }
         result.roastDate = finalRoastDate;
         logInfoEvent(requestId, 'roast_date_recheck_result', {
           provider,
+          recheckProvider,
           classification,
           originalRoastDate,
           recheckRoastDate,
