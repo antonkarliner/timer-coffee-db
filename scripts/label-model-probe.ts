@@ -5,7 +5,8 @@
  * completions, so one script can put them side by side on the same images.
  *
  * Usage:
- *   AI_GATEWAY_API_KEY=... GROQ_API_KEY=... deno run --allow-env --allow-net \
+ *   AI_GATEWAY_API_KEY=... GROQ_API_KEY=... Z_AI_API_KEY=... deno run \
+ *     --allow-env --allow-net \
  *     --allow-read scripts/label-model-probe.ts <front.jpg> [back.jpg] [--locale=en]
  *
  * A provider whose key is absent is skipped rather than failing the run.
@@ -33,10 +34,7 @@ import {
   LABEL_RESPONSE_SCHEMA,
   normalizeResult,
 } from "../supabase/functions/parse-coffee-label/label-utils.ts";
-import {
-  GROQ_DEFAULT_MODEL,
-  VERCEL_GATEWAY_BASE_URL,
-} from "../supabase/functions/_shared/ai-models.ts";
+import { VERCEL_GATEWAY_BASE_URL } from "../supabase/functions/_shared/ai-models.ts";
 
 // Candidates: vision-capable, modern, and cheap enough that the $5/month free
 // credit covers ~650 label parses/month. Prices per 1M input/output tokens and
@@ -65,13 +63,30 @@ const PROVIDERS: Record<string, Provider> = {
     url: `${VERCEL_GATEWAY_BASE_URL}/chat/completions`,
     key: Deno.env.get("AI_GATEWAY_API_KEY"),
     tokenParam: "max_tokens",
-    minSpacingMs: 6000,
+    // 6s was not enough: a 5-round, 3-gateway-variant run lost 8 of 15 calls
+    // to 429 even with the retry, leaving 1-2 usable samples per variant —
+    // too few to say anything about a model. The free tier limits by request
+    // rate across the whole account, so every gateway variant you add eats the
+    // same budget.
+    minSpacingMs: 20000,
   },
   groq: {
     url: "https://api.groq.com/openai/v1/chat/completions",
     key: Deno.env.get("GROQ_API_KEY"),
     tokenParam: "max_completion_tokens",
     minSpacingMs: 35000,
+  },
+  // Z.AI's own OpenAI-compatible endpoint. NOTE the /api/coding/ path: the
+  // plain /api/paas/v4 endpoint answers 429 "insufficient balance" on this
+  // account, because the key is a coding-plan key. That plan's terms are for
+  // coding tools, so this is a measurement channel only — shipping label
+  // parsing here would need a pay-as-you-go key (or the gateway, if it ever
+  // lists GLM).
+  zai: {
+    url: "https://api.z.ai/api/coding/paas/v4/chat/completions",
+    key: Deno.env.get("Z_AI_API_KEY"),
+    tokenParam: "max_tokens",
+    minSpacingMs: 3000,
   },
 };
 
@@ -89,13 +104,33 @@ const PROVIDERS: Record<string, Provider> = {
 // keeps the thinking out of `content` (without it, json_object enforcement
 // fails with 400 json_validate_failed) but does NOT stop the tokens being
 // generated — hence the raised completion budget.
-const MODELS: [string, string, string, Record<string, unknown>][] = [
+const MODELS: [string, string, string, Record<string, unknown>, string?][] = [
   // Reference: what production runs today.
   ["vercel gemma (PROD)", "vercel", "google/gemma-4-31b-it", {}],
-  // What production Groq runs today: fast, but reasoning disabled.
-  ["groq qwen3.6 effort:none (PROD)", "groq", GROQ_DEFAULT_MODEL, {
+  // GLM-5.3-flash think:off across the three prompt variants above — same
+  // model/config, only the translate-instruction placement changes, to see
+  // whether prompt placement (not model choice) is what fixes non-English
+  // field leakage.
+  ["glm think:off prompt:prod", "zai", "glm-5.3-flash", {
+    thinking: { type: "disabled" },
+  }, "prod"],
+  ["glm think:off prompt:tail", "zai", "glm-5.3-flash", {
+    thinking: { type: "disabled" },
+  }, "tail"],
+  ["glm think:off prompt:user", "zai", "glm-5.3-flash", {
+    thinking: { type: "disabled" },
+  }, "user"],
+  // The SAME model served through the Vercel gateway instead of Z.AI direct.
+  // The gateway does not route this to Z.AI: it resolves to baseten (with
+  // fireworks/runware/togetherai/zai and a dozen others as fallbacks), so the
+  // upstream can differ call to call — hence resolvedProvider is logged per
+  // request below. Two configs because the gateway silently DROPS Z.AI's
+  // `thinking: {type:"disabled"}` (verified: reasoning text still came back);
+  // `reasoning_effort: "none"` is the lever that reaches this upstream.
+  ["gw glm default", "vercel", "zai/glm-5.3-flash", {}, "prod"],
+  ["gw glm reasoning:none", "vercel", "zai/glm-5.3-flash", {
     reasoning_effort: "none",
-  }],
+  }, "prod"],
   // NOTE: a `reasoning_format: "hidden"` variant was tested here across two
   // separate 3-round runs and failed 6/6 with 400 json_validate_failed, on top
   // of Groq's 8,000 TPM ceiling making the budget marginal. Reasoning-on Groq
@@ -107,7 +142,8 @@ const MODELS: [string, string, string, Record<string, unknown>][] = [
 // right from one that got lucky: latency on the same model/images has varied
 // 4.1s-10.8s across runs, and field values have varied too (gemma returned
 // variety=null one run and a lot number the next). Repeats expose that.
-const LOOPS = 3;
+const loopsArg = Deno.args.find((a) => a.startsWith("--loops="));
+const LOOPS = loopsArg ? Number(loopsArg.slice("--loops=".length)) : 3;
 
 // Per-request timeout. The slowest legitimate response observed was ~16s
 // (qwen with reasoning on); 60s leaves headroom without hanging the run.
@@ -121,7 +157,7 @@ const RATE_LIMIT_BACKOFF_MS = 20000;
 
 if (!Object.values(PROVIDERS).some((p) => p.key)) {
   console.error(
-    "No provider key set. Export AI_GATEWAY_API_KEY and/or GROQ_API_KEY\n" +
+    "No provider key set. Export AI_GATEWAY_API_KEY, GROQ_API_KEY and/or Z_AI_API_KEY\n" +
       "(or put them in .env.local and pass --env-file=.env.local).",
   );
   Deno.exit(1);
@@ -177,6 +213,44 @@ const systemPrompt = buildSystemPrompt({
   ocrText: "",
 });
 
+// Prompt variants: each is a DELTA on top of the production prompt/user text,
+// never a rewritten copy — the whole point is that this probe cannot drift
+// from what parse-coffee-label actually sends. The production prompt already
+// carries three separate translate instructions, so these variants test
+// PLACEMENT and RECENCY of the instruction (a system-tail reminder right
+// before the model answers vs. moving it into the last user turn) rather than
+// whether the instruction exists at all.
+interface PromptVariant {
+  /** Appended to the production system prompt, or "" for production as-is. */
+  systemSuffix: string;
+  /** The text part of the user message. */
+  userText: string;
+}
+const PROMPT_VARIANTS: Record<string, PromptVariant> = {
+  prod: { systemSuffix: "", userText: `locale = ${locale}` },
+  tail: {
+    systemSuffix:
+      `\n\nBefore you answer, re-read every value you are about to output. If name, origin, processingMethod, region, roastLevel or tastingNotes is still written in the label's own language, translate it into ${locale} now. Those fields must contain no words left in the label's language.`,
+    userText: `locale = ${locale}`,
+  },
+  user: {
+    systemSuffix: "",
+    userText:
+      `locale = ${locale}\nOutput name, origin, processingMethod, region, roastLevel and tastingNotes in ${locale}, translated from whatever language the label uses.`,
+  },
+};
+
+for (const entry of MODELS) {
+  const variantKey = entry[4] ?? "prod";
+  if (!(variantKey in PROMPT_VARIANTS)) {
+    console.error(
+      `MODELS entry "${entry[0]}" names unknown prompt variant "${variantKey}". ` +
+        `Known variants: ${Object.keys(PROMPT_VARIANTS).join(", ")}`,
+    );
+    Deno.exit(1);
+  }
+}
+
 const imageUrls = await Promise.all(selectedImages.map(toImageUrl));
 const payloadMb = imageUrls.reduce((n, u) => n + u.length, 0) / 1024 / 1024;
 console.log(
@@ -220,15 +294,16 @@ async function callModel(
   provider: Provider,
   model: string,
   extra: Record<string, unknown>,
+  variant: PromptVariant,
 ): Promise<{ res: Response; ms: number }> {
   const body: Record<string, unknown> = {
     model,
     messages: [
-      { role: "system", content: systemPrompt },
+      { role: "system", content: systemPrompt + variant.systemSuffix },
       {
         role: "user",
         content: [
-          { type: "text", text: `locale = ${locale}` },
+          { type: "text", text: variant.userText },
           ...imageUrls.map((url) => ({
             type: "image_url",
             image_url: { url },
@@ -282,6 +357,7 @@ async function probe(
   model: string,
   extra: Record<string, unknown>,
   round: number,
+  variant: PromptVariant,
 ): Promise<void> {
   const provider = PROVIDERS[providerName];
   console.log(`\n========================================`);
@@ -291,7 +367,7 @@ async function probe(
   let ms = 0;
   for (let attempt = 0; ; attempt++) {
     try {
-      ({ res, ms } = await callModel(provider, model, extra));
+      ({ res, ms } = await callModel(provider, model, extra, variant));
     } catch (e) {
       console.log(`NETWORK ERROR: ${e}`);
       results.push({
@@ -358,9 +434,15 @@ async function probe(
     // field name varies by upstream provider, so check the known spellings.
     const reasoningTokens = u.completion_tokens_details?.reasoning_tokens ??
       u.reasoning_tokens ?? u.output_tokens_details?.reasoning_tokens ?? null;
+    // Which upstream the gateway actually chose. A gateway model id is not one
+    // vendor's endpoint — latency belongs to whoever it resolved to that call.
+    const routedTo = envelope.choices?.[0]?.message?.provider_metadata?.gateway
+      ?.routing?.resolvedProvider ?? null;
     usage = `prompt=${u.prompt_tokens ?? "?"} completion=${
       u.completion_tokens ?? "?"
-    } reasoning=${reasoningTokens ?? "n/a"}`;
+    } reasoning=${reasoningTokens ?? "n/a"}${
+      routedTo ? ` via=${routedTo}` : ""
+    }`;
     console.log(`usage: ${usage}`);
   } catch {
     console.log("Unexpected envelope:", text.slice(0, 400));
@@ -415,15 +497,28 @@ async function probe(
   });
 }
 
-const RUNNABLE = MODELS.filter(([, prov]) => PROVIDERS[prov].key);
+// --only=<substring> narrows the run to matching variant labels. The gateway
+// free tier limits by request rate across the ACCOUNT, so every variant in a
+// run competes for the same budget; isolating one variant is how you get
+// enough usable samples to say anything about it.
+const onlyArg = Deno.args.find((a) => a.startsWith("--only="));
+const only = onlyArg ? onlyArg.slice("--only=".length) : null;
+const RUNNABLE = MODELS.filter(([label, prov]) =>
+  PROVIDERS[prov].key && (!only || label.includes(only))
+);
+if (RUNNABLE.length === 0) {
+  console.error(`--only=${only} matched no variant with an available key.`);
+  Deno.exit(1);
+}
 // Round-robin rather than all repeats of one variant back to back: provider
 // latency drifts minute to minute, and interleaving stops any single variant
 // from owning a fast or slow window.
 for (let round = 1; round <= LOOPS; round++) {
   console.log(`\n\n############ ROUND ${round} of ${LOOPS} ############`);
-  for (const [label, prov, model, extra] of RUNNABLE) {
+  for (const [label, prov, model, extra, variantKey] of RUNNABLE) {
+    const variant = PROMPT_VARIANTS[variantKey ?? "prod"];
     try {
-      await probe(`${label}`, prov, model, extra, round);
+      await probe(`${label}`, prov, model, extra, round, variant);
     } catch (e) {
       console.log(`\n=== ${label} (round ${round}) ===\nUNEXPECTED: ${e}`);
     }
