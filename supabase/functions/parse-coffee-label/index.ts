@@ -9,11 +9,14 @@ import {
   OPENAI_MODELS,
   VERCEL_GATEWAY_BASE_URL,
   VERCEL_GATEWAY_DEFAULT_MODEL,
+  ZAI_BASE_URL,
+  ZAI_DEFAULT_MODEL,
 } from "../_shared/ai-models.ts";
 import {
   buildSystemPrompt,
   isPlausibleLabelResult,
   LABEL_RESPONSE_SCHEMA,
+  needsRoastDateConfirmation,
   normalizeResult,
   type ProviderResponseSchema,
   ROAST_DATE_RESPONSE_SCHEMA,
@@ -24,6 +27,7 @@ const aiGatewayApiKey = Deno.env.get('AI_GATEWAY_API_KEY');
 const cerebrasApiKey = Deno.env.get('CEREBRAS_API_KEY');
 const groqApiKey = Deno.env.get('GROQ_API_KEY');
 const openaiApiKey = Deno.env.get('OPENAI_API_KEY_NON_PERSONAL');
+const zaiApiKey = Deno.env.get('Z_AI_API_KEY');
 const serviceAccountKey = Deno.env.get('GOOGLE_APPLICATION_CREDENTIALS_JSON');
 const geminiProjectId = Deno.env.get('GEMINI_PROJECT_ID') ?? '';
 const geminiRegion = Deno.env.get('GEMINI_REGION') ?? '';
@@ -358,6 +362,90 @@ serve(async (req)=>{
     const content = jsonResponse.choices[0].message.content;
     return parseModelResponse(content, 'VercelGateway');
   };
+  // --- Z.ai (GLM) processing (primary) ---
+  // OpenAI-compatible wire format, so this mirrors processWithVercelGateway
+  // above except for the endpoint/model/credential and the disabled-thinking
+  // override.
+  const processWithZai = async (base64Images: string[] | null | undefined, systemPrompt: string, _responseSchema: ProviderResponseSchema)=>{
+    // Typed (unlike the sibling processWith* functions) so this new code adds
+    // no fresh implicit-any errors to a file that already has plenty.
+    const userContent: Record<string, unknown>[] = [
+      {
+        type: "text",
+        text: `locale = ${locale}`
+      }
+    ];
+    if (base64Images && base64Images.length > 0) {
+      base64Images.forEach((base64: string)=>{
+        userContent.push({
+          type: "image_url",
+          image_url: {
+            url: `data:image/jpeg;base64,${base64}`
+          }
+        });
+      });
+    } else if (ocrText && ocrText.trim().length > 0) {
+      userContent.push({
+        type: "text",
+        text: `OCR context from mobile device: ${ocrText}`
+      });
+    }
+    const response = await fetch(`${ZAI_BASE_URL}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${zaiApiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: ZAI_DEFAULT_MODEL,
+        messages: [
+          {
+            role: "system",
+            content: systemPrompt
+          },
+          {
+            role: "user",
+            content: userContent
+          }
+        ],
+        temperature: 1,
+        top_p: 0.95,
+        // The gateway catalog advertises `max_tokens`, not OpenAI's newer
+        // `max_completion_tokens`, for these models.
+        max_tokens: 1024,
+        stream: false,
+        // json_schema support varies by upstream provider; json_object is the
+        // safe minimum enforcement, matching the other providers here.
+        response_format: {
+          type: "json_object"
+        },
+        // GLM thinks by default, which costs 15-30s per call versus ~3s with
+        // thinking disabled. Measurement on the 150-label sample showed the
+        // reasoning pass does not improve roast-date accuracy, so it is
+        // turned off deliberately here.
+        thinking: {
+          type: "disabled"
+        }
+      })
+    });
+    if (!response.ok) {
+      const errorText = await response.text();
+      const errorCode = extractProviderErrorCode(errorText);
+      logWarnEvent(requestId, 'zai_http_error', {
+        status: response.status,
+        code: errorCode || null,
+        responseBodyLength: errorText.length
+      });
+      throw new ProviderHttpError(
+        `Z.ai API request failed with status ${response.status}`,
+        response.status,
+        errorCode || undefined,
+      );
+    }
+    const jsonResponse = await response.json();
+    const content = jsonResponse.choices[0].message.content;
+    return parseModelResponse(content, 'Zai');
+  };
   // --- Cerebras processing (primary) ---
   const processWithCerebras = async (base64Images, systemPrompt, _responseSchema: ProviderResponseSchema)=>{
     const userContent = [
@@ -677,10 +765,15 @@ serve(async (req)=>{
     }
     const images = hasImages ? imagesBase64.slice(0, 2) : null;
     const primaryPrompt = getSystemPrompt(ocrText);
-    // Ordered provider chain: Vercel AI Gateway (primary) → Groq → OpenAI →
-    // Gemini. Each tier runs only if its credential is configured; on a
-    // retriable error (incl. a decommissioned model) we cascade to the next
-    // configured tier.
+    // Ordered provider chain: Z.ai/GLM (primary) → Vercel AI Gateway → Groq →
+    // OpenAI → Gemini. Each tier runs only if its credential is configured;
+    // on a retriable error (incl. a decommissioned model) we cascade to the
+    // next configured tier.
+    //
+    // GLM-5.3-flash became the primary tier on 2026-09-03: measured against
+    // 150 real user labels it beat the Vercel-gateway Gemma primary 84.8% vs
+    // 56% precision on roast dates, 0.7% vs 21% error rate, median 2.9s, and
+    // calls are free on the flat-rate coding plan.
     //
     // Cerebras was removed from this chain on 2026-08-21. Cerebras migrated
     // personal accounts to PayGo, so an unfunded account returns 402 on every
@@ -690,13 +783,14 @@ serve(async (req)=>{
     // funded, re-adding a `{ key: 'cerebras', ... }` entry here restores it.
     // The Vercel gateway serves the same Gemma 4 31B on a $5/month free credit.
     const providerChain = [
+      { key: 'zai', configured: !!zaiApiKey, run: processWithZai },
       { key: 'vercel', configured: !!aiGatewayApiKey, run: processWithVercelGateway },
       { key: 'groq', configured: !!groqApiKey, run: processWithGroq },
       { key: 'openai', configured: !!openaiApiKey, run: processWithOpenAI },
       { key: 'gemini', configured: !!serviceAccountKey, run: processWithGemini }
     ].filter((p)=>p.configured);
     if (providerChain.length === 0) {
-      throw new Error('No AI provider configured (set one of AI_GATEWAY_API_KEY, GROQ_API_KEY, OPENAI_API_KEY_NON_PERSONAL, GOOGLE_APPLICATION_CREDENTIALS_JSON)');
+      throw new Error('No AI provider configured (set one of Z_AI_API_KEY, AI_GATEWAY_API_KEY, GROQ_API_KEY, OPENAI_API_KEY_NON_PERSONAL, GOOGLE_APPLICATION_CREDENTIALS_JSON)');
     }
     // deno-lint-ignore no-explicit-any
     let result: any;
@@ -820,6 +914,14 @@ serve(async (req)=>{
           finalRoastDate
         });
       }
+    }
+    // Surface whether the app should ask the user to confirm the roast date.
+    // CRITICAL: never modify or null result.roastDate based on this flag —
+    // old app versions ignore unknown keys and must keep behaving exactly as
+    // they do today; only new versions read roastDateNeedsConfirmation. Skip
+    // it on the error envelope, where there is no roastDate to confirm.
+    if (result && typeof result === 'object' && !Array.isArray(result) && typeof result.error !== 'string') {
+      result.roastDateNeedsConfirmation = needsRoastDateConfirmation(result);
     }
     logInfoEvent(requestId, 'parse_succeeded', {
       provider,

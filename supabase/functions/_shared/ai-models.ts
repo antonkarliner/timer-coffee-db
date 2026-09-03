@@ -133,3 +133,16 @@ export const CEREBRAS_DEFAULT_MODEL = "gemma-4-31b";
 // costs roughly $0.42 against the $5 credit.
 export const VERCEL_GATEWAY_BASE_URL = "https://ai-gateway.vercel.sh/v1";
 export const VERCEL_GATEWAY_DEFAULT_MODEL = "google/gemma-4-31b-it";
+
+// Z.ai (GLM) — OpenAI-compatible endpoint. Measured against 150 real
+// parse-coffee-label user labels: GLM-5.3-flash beat the Vercel-gateway
+// Gemma primary 84.8% vs 56% precision on roast dates, 0.7% vs 21% error
+// rate, median 2.9s — so it becomes the primary tier.
+//
+// The /api/coding/ path is required for a coding-plan key: the documented
+// /api/paas/v4 endpoint answers 429 "insufficient balance" for such keys.
+// Z_AI_BASE_URL exists so moving to a pay-as-you-go key is a config change,
+// not a code change.
+export const ZAI_BASE_URL = Deno.env.get("Z_AI_BASE_URL") ??
+  "https://api.z.ai/api/coding/paas/v4";
+export const ZAI_DEFAULT_MODEL = "glm-5.3-flash";

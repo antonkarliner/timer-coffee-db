@@ -27,6 +27,7 @@ const LABEL_FIELDS: Record<string, LabelFieldType> = {
   processingMethod: "string",
   elevation: "number",
   roastDate: "string",
+  roastDateRawText: "string",
   region: "string",
   roastLevel: "string",
   cuppingScore: "number",
@@ -174,6 +175,7 @@ Use the following JSON structure:
     "processingMethod": "Processing Method (translated to the target locale)",
     "elevation": "elevation (number only)",
     "roastDate": "roast date (YYYY-MM-DD; if the label omits the year, infer it from today's date)",
+    "roastDateRawText": "the roast date EXACTLY as printed on the label (for example \"02/06\" or \"L1 0 JUN 2026\") — do not reformat it; null if no roast date is visible",
     "region": "region (region of country of origin, translated to the target locale)",
     "roastLevel": "roast level (translated to the target locale)",
     "cuppingScore": "cupping score",
@@ -336,4 +338,58 @@ export function normalizeResult(parsedContent: unknown): unknown {
   }
 
   return record;
+}
+
+// ---------------------------------------------------------------------------
+// Roast-date confirmation flag
+// ---------------------------------------------------------------------------
+
+const FOUR_DIGIT_RUN = /\d{4}/;
+
+/**
+ * Decide whether the app should ask the user to confirm the extracted roast
+ * date rather than trust it outright.
+ *
+ * Returns true when:
+ * - `roastDate` is null/undefined/empty — nothing to confirm.
+ * - `roastDateRawText` is null/undefined/empty — a date we cannot trace back
+ *   to printed text on the label is not verifiable.
+ * - `roastDateRawText` contains no 4-digit run — the label printed no year,
+ *   so DD/MM vs MM/DD is genuinely ambiguous. Measured: 3 of the 5 wrong
+ *   dates in a 150-label sample were exactly this.
+ *
+ * IMPORTANT: the `/\d{4}/` test below is a SYNTACTIC check — does this
+ * string contain a four-digit number — not a semantic judgement about what
+ * the text means. It does not violate the CLAUDE.md rule against putting
+ * semantic judgements in regexes over model-produced text; the model is
+ * still the one that decided what `roastDateRawText` is and whether a
+ * roastDate could be extracted at all.
+ *
+ * Known, accepted gap: a label stating only a week or month (e.g. "4ª semana
+ * de Marzo 2026") does carry a four-digit year, so it is NOT flagged here
+ * even though "which week" is itself imprecise. That was 1 of 150 labels in
+ * the measured sample and is deliberately left to the existing future/
+ * too_old backstop and the user, rather than adding another English-only (or
+ * locale-specific) heuristic here.
+ */
+export function needsRoastDateConfirmation(
+  result: { roastDate?: unknown; roastDateRawText?: unknown },
+): boolean {
+  const roastDate = result?.roastDate;
+  if (
+    roastDate === null || roastDate === undefined ||
+    (typeof roastDate === "string" && roastDate.trim().length === 0)
+  ) {
+    return true;
+  }
+
+  const rawText = result?.roastDateRawText;
+  if (
+    rawText === null || rawText === undefined ||
+    typeof rawText !== "string" || rawText.trim().length === 0
+  ) {
+    return true;
+  }
+
+  return !FOUR_DIGIT_RUN.test(rawText);
 }

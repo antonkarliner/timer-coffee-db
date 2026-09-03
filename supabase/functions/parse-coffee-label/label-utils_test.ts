@@ -1,6 +1,7 @@
 import {
   buildSystemPrompt,
   isPlausibleLabelResult,
+  needsRoastDateConfirmation,
   normalizeResult,
   shouldFallbackProviderError,
   titleCaseIfAllCaps,
@@ -483,4 +484,84 @@ Deno.test("shouldFallbackProviderError rejects non-error HTTP statuses", () => {
       `HTTP ${status} is outside the provider-error range`,
     );
   }
+});
+
+// ---------------------------------------------------------------------------
+// needsRoastDateConfirmation
+// ---------------------------------------------------------------------------
+
+Deno.test("needsRoastDateConfirmation flags a null roastDate", () => {
+  assertEquals(
+    needsRoastDateConfirmation({ roastDate: null, roastDateRawText: null }),
+    true,
+    "no roastDate means nothing to confirm",
+  );
+});
+
+Deno.test("needsRoastDateConfirmation accepts raw text containing a 4-digit year", () => {
+  assertEquals(
+    needsRoastDateConfirmation({
+      roastDate: "2026-06-26",
+      roastDateRawText: "26.06.2026",
+    }),
+    false,
+    "raw text with an explicit 4-digit year is unambiguous",
+  );
+});
+
+Deno.test("needsRoastDateConfirmation flags raw text with no year, e.g. \"02/08\"", () => {
+  assertEquals(
+    needsRoastDateConfirmation({
+      roastDate: "2026-08-02",
+      roastDateRawText: "02/08",
+    }),
+    true,
+    "no 4-digit run means the label printed no year — DD/MM vs MM/DD is genuinely ambiguous",
+  );
+});
+
+Deno.test("needsRoastDateConfirmation flags raw text like \"26.06.26\" (2-digit year)", () => {
+  assertEquals(
+    needsRoastDateConfirmation({
+      roastDate: "2026-06-26",
+      roastDateRawText: "26.06.26",
+    }),
+    true,
+    "a 2-digit year has no 4-digit run and is genuinely ambiguous",
+  );
+});
+
+Deno.test("needsRoastDateConfirmation flags a missing roastDateRawText", () => {
+  assertEquals(
+    needsRoastDateConfirmation({ roastDate: "2026-06-26" }),
+    true,
+    "a roastDate we cannot trace back to printed text is not verifiable",
+  );
+});
+
+Deno.test("needsRoastDateConfirmation flags an empty roastDateRawText", () => {
+  assertEquals(
+    needsRoastDateConfirmation({
+      roastDate: "2026-06-26",
+      roastDateRawText: "   ",
+    }),
+    true,
+    "a blank raw text is treated the same as a missing one",
+  );
+});
+
+Deno.test("needsRoastDateConfirmation does NOT flag a week/month-only date with a year (known, accepted gap)", () => {
+  // "4a semana de Marzo 2026" carries a 4-digit year, so this passes the
+  // syntactic check even though "which week" is itself imprecise. This is 1
+  // of 150 labels in the measured sample and is deliberately left to the
+  // existing future/too_old backstop and the user rather than adding another
+  // locale-specific heuristic here.
+  assertEquals(
+    needsRoastDateConfirmation({
+      roastDate: "2026-03-01",
+      roastDateRawText: "4a semana de Marzo 2026",
+    }),
+    false,
+    "known gap: week/month-only text with a year is not flagged",
+  );
 });
