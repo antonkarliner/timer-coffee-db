@@ -77,6 +77,17 @@ const IMAGE_DIR = dirArg
 const loopsArg = Deno.args.find((a) => a.startsWith("--loops="));
 const LOOPS = loopsArg ? Number(loopsArg.slice("--loops=".length)) : 6;
 
+// --thinking=on enables the reasoning pass for every call in the run.
+const THINKING =
+  Deno.args.some((a) => a === "--thinking=on" || a === "--thinking=enabled");
+// --res=1200,2000 narrows the grid. Each resolution multiplies the call count,
+// and thinking-on calls are ~5x slower, so a focused grid is often the only
+// one that finishes.
+const resArg = Deno.args.find((a) => a.startsWith("--res="));
+const RES_FILTER = resArg
+  ? new Set(resArg.slice("--res=".length).split(",").map((r) => r.trim()))
+  : null;
+
 const localeArg = Deno.args.find((a) => a.startsWith("--locale="));
 const locale = localeArg ? localeArg.slice("--locale=".length) : "en";
 
@@ -146,7 +157,17 @@ async function discoverPairs(dir: string): Promise<ImagePair[]> {
   return pairs;
 }
 
-const allPairs = await discoverPairs(IMAGE_DIR);
+const discovered = await discoverPairs(IMAGE_DIR);
+const allPairs = RES_FILTER
+  ? discovered.filter((p) => RES_FILTER.has(p.res))
+  : discovered;
+if (RES_FILTER && allPairs.length === 0) {
+  console.error(
+    `--res=${[...RES_FILTER].join(",")} matched none of the discovered ` +
+      `resolutions: ${[...new Set(discovered.map((p) => p.res))].join(", ")}`,
+  );
+  Deno.exit(1);
+}
 if (allPairs.length === 0) {
   console.error(
     `No usable <bag>-<res>-f.jpg / <bag>-<res>-b.jpg pairs found under ${IMAGE_DIR}.\n` +
@@ -256,11 +277,15 @@ async function callModel(
     top_p: 0.95,
     stream: false,
     response_format: { type: "json_object" },
-    max_tokens: 1024,
-    // Disables GLM's reasoning pass. Held fixed across every resolution —
-    // this probe isolates image size, not thinking-on-vs-off (that is
-    // label-model-probe's job).
-    thinking: { type: "disabled" },
+    // Thinking-on needs far more room: the reasoning pass alone spends
+    // ~650-900 tokens, so the production 1024 cap would truncate the JSON.
+    max_tokens: THINKING ? 4096 : 1024,
+    // Held fixed across every resolution within a run — this probe isolates
+    // image size. --thinking=on re-runs the whole grid with the reasoning
+    // pass enabled, because resolution and thinking interact: reasoning is
+    // what lets the model apply the prompt's lot-number rule, and fewer image
+    // tokens is what makes thinking affordable in wall-clock.
+    thinking: { type: THINKING ? "enabled" : "disabled" },
   };
   await respectSpacing();
   const started = Date.now();
