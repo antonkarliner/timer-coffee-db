@@ -1,5 +1,6 @@
 import {
   buildBatchResponseFormat,
+  buildSingleResponseFormat,
   buildTranslationRows,
   chunkLocales,
   MAX_TRANSLATION_LOCALES,
@@ -140,7 +141,7 @@ Deno.test("batch parser accepts only requested non-empty translations", () => {
 
   assertEquals(
     Object.fromEntries(parsed),
-    { fr: "Bonjour" },
+    { fr: { content: "Bonjour" } },
     "Only requested non-empty translations should be returned.",
   );
   assertEquals(
@@ -150,13 +151,13 @@ Deno.test("batch parser accepts only requested non-empty translations", () => {
   );
   assertEquals(
     parseSingleTranslationContent('{"translation":"Bonjour"}'),
-    "Bonjour",
+    { content: "Bonjour" },
     "Single fallback JSON should parse.",
   );
 });
 
 Deno.test("row planning distinguishes legacy, source-linked, and dry-run requests", () => {
-  const translations = new Map([["fr", "Bonjour"]]);
+  const translations = new Map([["fr", { content: "Bonjour" }]]);
   const legacy = validateTranslationRequest({
     text: "Hello",
     locales: ["fr"],
@@ -221,5 +222,172 @@ Deno.test("request deadline budget is pure and bounded", () => {
     remainingTranslationTimeMs(1_120_000, 1_120_001),
     0,
     "Expired requests should never expose a negative operation budget.",
+  );
+});
+
+// ── Plan 054 Item C — optional per-popup title ──────────────────────────────
+//
+// The guard below exists because the whole safety argument for this feature is
+// that a titleless popup takes a byte-identical path. If someone later
+// "simplifies" the two modes into one, this test is what fails.
+
+Deno.test("untitled batch schema is unchanged from the pre-title shape", () => {
+  const format = buildBatchResponseFormat(["fr", "de"]);
+  assertEquals(
+    JSON.stringify(format),
+    JSON.stringify({
+      type: "json_schema",
+      json_schema: {
+        name: "launch_popup_translations",
+        strict: true,
+        schema: {
+          type: "object",
+          additionalProperties: false,
+          required: ["translations"],
+          properties: {
+            translations: {
+              type: "object",
+              additionalProperties: false,
+              required: ["fr", "de"],
+              properties: {
+                fr: { type: "string", minLength: 1 },
+                de: { type: "string", minLength: 1 },
+              },
+            },
+          },
+        },
+      },
+    }),
+    "The untitled batch schema must stay byte-identical to the pre-title one.",
+  );
+
+  assertEquals(
+    JSON.stringify(buildSingleResponseFormat()),
+    JSON.stringify({
+      type: "json_schema",
+      json_schema: {
+        name: "launch_popup_translation",
+        strict: true,
+        schema: {
+          type: "object",
+          additionalProperties: false,
+          required: ["translation"],
+          properties: { translation: { type: "string", minLength: 1 } },
+        },
+      },
+    }),
+    "The untitled single schema must stay byte-identical too.",
+  );
+});
+
+Deno.test("titled batch schema requires a content/title object per locale", () => {
+  const format = buildBatchResponseFormat(["fr"], true);
+  const localeSchema =
+    format.json_schema.schema.properties.translations.properties.fr;
+  assertEquals(
+    JSON.stringify(localeSchema),
+    JSON.stringify({
+      type: "object",
+      additionalProperties: false,
+      required: ["content", "title"],
+      properties: {
+        content: { type: "string", minLength: 1 },
+        title: { type: "string", minLength: 1 },
+      },
+    }),
+    "A titled request must declare a per-locale object.",
+  );
+});
+
+Deno.test("titled batch parser keeps a locale whose title is missing", () => {
+  const parsed = parseBatchTranslationContent(
+    JSON.stringify({
+      translations: {
+        fr: { content: "Bonjour", title: "Salut" },
+        de: { content: "Hallo", title: "  " },
+        es: { title: "Hola" },
+      },
+    }),
+    ["fr", "de", "es"],
+    true,
+  );
+
+  assertEquals(
+    Object.fromEntries(parsed),
+    { fr: { content: "Bonjour", title: "Salut" }, de: { content: "Hallo" } },
+    "A blank title drops only the title; a missing body drops the locale.",
+  );
+});
+
+Deno.test("title validation bounds the length and treats null as absent", () => {
+  const withTitle = validateTranslationRequest({
+    text: "Hello",
+    locales: ["fr"],
+    title: "  Happy Coffee Day  ",
+  });
+  assert(withTitle.ok, "A valid title should pass validation.");
+  if (withTitle.ok) {
+    assertEquals(
+      withTitle.value.title,
+      "Happy Coffee Day",
+      "A valid title should be trimmed.",
+    );
+  }
+
+  const nullTitle = validateTranslationRequest({
+    text: "Hello",
+    locales: ["fr"],
+    title: null,
+  });
+  assert(nullTitle.ok, "A null title is how the database says 'no title'.");
+  if (nullTitle.ok) {
+    assert(
+      !("title" in nullTitle.value),
+      "A null title must be absent, not undefined-valued.",
+    );
+  }
+
+  assert(
+    !validateTranslationRequest({ text: "Hi", locales: ["fr"], title: "" }).ok,
+    "An empty title must be rejected.",
+  );
+  assert(
+    !validateTranslationRequest({
+      text: "Hi",
+      locales: ["fr"],
+      title: "x".repeat(201),
+    }).ok,
+    "A title over 200 characters must be rejected.",
+  );
+});
+
+Deno.test("rows carry a title only when the entry has one", () => {
+  const request = validateTranslationRequest({
+    text: "Hello",
+    locales: ["fr", "de"],
+    platform: "internal_canary",
+    source_popup_id: 77,
+    title: "Happy Coffee Day",
+  });
+  assert(request.ok, "Fixture should validate.");
+  if (!request.ok) return;
+
+  const rows = buildTranslationRows(
+    request.value,
+    new Map([
+      ["fr", { content: "Bonjour", title: "Bonne journée du café" }],
+      ["de", { content: "Hallo" }],
+    ]),
+  );
+
+  assertEquals(rows.length, 2, "Both locales should produce a row.");
+  assertEquals(
+    rows[0].title,
+    "Bonne journée du café",
+    "A translated title should reach the row.",
+  );
+  assert(
+    !("title" in rows[1]),
+    "A locale without a translated title must omit the column entirely.",
   );
 });

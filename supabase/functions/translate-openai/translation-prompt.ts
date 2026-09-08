@@ -19,22 +19,57 @@ const LAUNCH_POPUP_TRANSLATION_SYSTEM_PROMPT = [
   "Return no commentary.",
 ].join(" ");
 
+// A popup may carry an optional short title (plan 054 Item C). When it does,
+// the response shape becomes one object per locale instead of one string.
+// When it does not — which is every popup that existed before that plan — the
+// prompt and the declared shape are byte-identical to the pre-title version,
+// so the overwhelmingly common path cannot regress.
+const LAUNCH_POPUP_TITLE_INSTRUCTION =
+  "The popup also has a short title; translate it too, keeping it short and " +
+  "in the same voice as the body.";
+
 export function buildBatchTranslationMessages(
   text: string,
   locales: string[],
+  title?: string,
 ): ChatMessage[] {
+  if (title === undefined) {
+    return [
+      {
+        role: "system",
+        content:
+          `${LAUNCH_POPUP_TRANSLATION_SYSTEM_PROMPT} Return ONLY a JSON object of this exact shape: ` +
+          `{"translations":{"<locale>":"translated popup"}} with one string entry per requested locale.`,
+      },
+      {
+        role: "user",
+        content: JSON.stringify({
+          locales,
+          text,
+          terminology_by_locale: selectTerminologyByLocale(text, locales),
+        }),
+      },
+    ];
+  }
+
   return [
     {
       role: "system",
       content:
-        `${LAUNCH_POPUP_TRANSLATION_SYSTEM_PROMPT} Return ONLY a JSON object of this exact shape: ` +
-        `{"translations":{"<locale>":"translated popup"}} with one string entry per requested locale.`,
+        `${LAUNCH_POPUP_TRANSLATION_SYSTEM_PROMPT} ${LAUNCH_POPUP_TITLE_INSTRUCTION} ` +
+        `Return ONLY a JSON object of this exact shape: ` +
+        `{"translations":{"<locale>":{"content":"translated popup","title":"translated title"}}} ` +
+        `with one object entry per requested locale.`,
     },
     {
       role: "user",
       content: JSON.stringify({
         locales,
         text,
+        title,
+        // The glossary is deliberately keyed on the body text only: the title
+        // is a few words and selecting terminology from it would change which
+        // terms the body receives, altering existing translations.
         terminology_by_locale: selectTerminologyByLocale(text, locales),
       }),
     },
@@ -44,19 +79,42 @@ export function buildBatchTranslationMessages(
 export function buildSingleTranslationMessages(
   text: string,
   locale: string,
+  title?: string,
 ): ChatMessage[] {
+  if (title === undefined) {
+    return [
+      {
+        role: "system",
+        content:
+          `${LAUNCH_POPUP_TRANSLATION_SYSTEM_PROMPT} Translate the source text into ${locale}. ` +
+          'Return ONLY JSON of this exact shape: {"translation":"translated popup"}.',
+      },
+      {
+        role: "user",
+        content: JSON.stringify({
+          locale,
+          text,
+          terminology: selectTranslationTerms(text, locale),
+        }),
+      },
+    ];
+  }
+
   return [
     {
       role: "system",
       content:
-        `${LAUNCH_POPUP_TRANSLATION_SYSTEM_PROMPT} Translate the source text into ${locale}. ` +
-        'Return ONLY JSON of this exact shape: {"translation":"translated popup"}.',
+        `${LAUNCH_POPUP_TRANSLATION_SYSTEM_PROMPT} ${LAUNCH_POPUP_TITLE_INSTRUCTION} ` +
+        `Translate the source text into ${locale}. ` +
+        "Return ONLY JSON of this exact shape: " +
+        '{"translation":"translated popup","title":"translated title"}.',
     },
     {
       role: "user",
       content: JSON.stringify({
         locale,
         text,
+        title,
         terminology: selectTranslationTerms(text, locale),
       }),
     },

@@ -191,3 +191,65 @@ Deno.test("unmatched source retains stable empty terminology shapes", () => {
     "Unmatched fallback requests should retain an empty terminology list.",
   );
 });
+
+// ── Plan 054 Item C — optional per-popup title ──────────────────────────────
+
+Deno.test("untitled prompts are unchanged and carry no title key", () => {
+  const batch = buildBatchTranslationMessages("Hello", ["fr"]);
+  assert(
+    batch[0].content.endsWith(
+      'Return ONLY a JSON object of this exact shape: {"translations":{"<locale>":"translated popup"}} with one string entry per requested locale.',
+    ),
+    "The untitled batch system prompt must be unchanged.",
+  );
+  assert(
+    !batch[0].content.includes("title"),
+    "The untitled batch system prompt must not mention a title.",
+  );
+  assert(
+    !("title" in JSON.parse(batch[1].content)),
+    "The untitled batch payload must not carry a title key.",
+  );
+
+  const single = buildSingleTranslationMessages("Hello", "fr");
+  assert(
+    single[0].content.endsWith(
+      'Return ONLY JSON of this exact shape: {"translation":"translated popup"}.',
+    ),
+    "The untitled single system prompt must be unchanged.",
+  );
+  assert(
+    !("title" in JSON.parse(single[1].content)),
+    "The untitled single payload must not carry a title key.",
+  );
+});
+
+Deno.test("titled prompts declare the nested shape and pass the title", () => {
+  const batch = buildBatchTranslationMessages("Hello", ["fr"], "Coffee Day");
+  assert(
+    batch[0].content.includes(
+      '{"translations":{"<locale>":{"content":"translated popup","title":"translated title"}}}',
+    ),
+    "The titled batch system prompt must declare the nested shape.",
+  );
+  const batchPayload = JSON.parse(batch[1].content) as { title?: string };
+  assertEquals(
+    batchPayload.title,
+    "Coffee Day",
+    "The titled batch payload must carry the title.",
+  );
+
+  const single = buildSingleTranslationMessages("Hello", "fr", "Coffee Day");
+  assert(
+    single[0].content.includes(
+      '{"translation":"translated popup","title":"translated title"}',
+    ),
+    "The titled single system prompt must declare the nested shape.",
+  );
+  const singlePayload = JSON.parse(single[1].content) as { title?: string };
+  assertEquals(
+    singlePayload.title,
+    "Coffee Day",
+    "The titled single payload must carry the title.",
+  );
+});

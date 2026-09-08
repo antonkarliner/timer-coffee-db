@@ -31,6 +31,7 @@ import {
   remainingTranslationTimeMs,
   shouldWriteTranslationState,
   summarizeTranslationError,
+  type TranslatedEntry,
   TRANSLATION_REQUEST_DEADLINE_MS,
   type TranslationFailure,
   type TranslationRequest,
@@ -50,12 +51,14 @@ type SourcePopup = {
   platform: string | null;
   is_translated: boolean;
   source_popup_id: number | null;
+  title: string | null;
 };
 
 type LocaleResult = {
   locale: string;
   status: "translated" | "failed";
   content?: string;
+  title?: string;
   phase?: "translation" | "database";
   error?: string;
 };
@@ -87,8 +90,9 @@ async function translateBatchWithRetry(
   requestId: string,
   chunkIndex: number,
   deadlineAt: number,
-): Promise<Map<string, string>> {
-  const translations = new Map<string, string>();
+  title?: string,
+): Promise<Map<string, TranslatedEntry>> {
+  const translations = new Map<string, TranslatedEntry>();
 
   for (let attempt = 1; attempt <= MAX_OPENAI_ATTEMPTS; attempt += 1) {
     const remainingTimeMs = remainingTranslationTimeMs(deadlineAt);
@@ -105,10 +109,13 @@ async function translateBatchWithRetry(
     try {
       const completion = await client.chat.completions.create(
         {
-          messages: buildBatchTranslationMessages(text, pendingLocales),
+          messages: buildBatchTranslationMessages(text, pendingLocales, title),
           model: OPENAI_MODELS.BIG,
           reasoning_effort: "none",
-          response_format: buildBatchResponseFormat(pendingLocales),
+          response_format: buildBatchResponseFormat(
+            pendingLocales,
+            title !== undefined,
+          ),
           max_completion_tokens: MAX_BATCH_COMPLETION_TOKENS,
         },
         { timeout: Math.min(OPENAI_REQUEST_TIMEOUT_MS, remainingTimeMs) },
@@ -116,6 +123,7 @@ async function translateBatchWithRetry(
       const parsed = parseBatchTranslationContent(
         completion.choices[0]?.message?.content ?? "",
         pendingLocales,
+        title !== undefined,
       );
       for (const [locale, translation] of parsed) {
         translations.set(locale, translation);
@@ -145,7 +153,8 @@ async function translateSingleWithRetry(
   text: string,
   locale: string,
   deadlineAt: number,
-): Promise<string | undefined> {
+  title?: string,
+): Promise<TranslatedEntry | undefined> {
   for (let attempt = 1; attempt <= MAX_FALLBACK_ATTEMPTS; attempt += 1) {
     const remainingTimeMs = remainingTranslationTimeMs(deadlineAt);
     if (remainingTimeMs === 0) {
@@ -154,16 +163,17 @@ async function translateSingleWithRetry(
     try {
       const completion = await client.chat.completions.create(
         {
-          messages: buildSingleTranslationMessages(text, locale),
+          messages: buildSingleTranslationMessages(text, locale, title),
           model: OPENAI_MODELS.BIG,
           reasoning_effort: "none",
-          response_format: buildSingleResponseFormat(),
+          response_format: buildSingleResponseFormat(title !== undefined),
           max_completion_tokens: MAX_SINGLE_COMPLETION_TOKENS,
         },
         { timeout: Math.min(OPENAI_REQUEST_TIMEOUT_MS, remainingTimeMs) },
       );
       const translated = parseSingleTranslationContent(
         completion.choices[0]?.message?.content ?? "",
+        title !== undefined,
       );
       if (translated) {
         return translated;
@@ -184,7 +194,9 @@ async function fetchCanonicalSourcePopup(
 > {
   const { data, error } = await supabase
     .from("launch_popup")
-    .select("id, content, locale, platform, is_translated, source_popup_id")
+    .select(
+      "id, content, locale, platform, is_translated, source_popup_id, title",
+    )
     .eq("id", sourcePopupId)
     .maybeSingle();
 
@@ -228,7 +240,7 @@ async function updateSourceStatus(
 async function persistChunk(
   supabase: SupabaseClient,
   request: TranslationRequest,
-  translations: ReadonlyMap<string, string>,
+  translations: ReadonlyMap<string, TranslatedEntry>,
 ): Promise<string | undefined> {
   const rows = buildTranslationRows(request, translations);
   if (rows.length === 0 || !shouldWriteTranslationState(request)) {
@@ -357,12 +369,18 @@ serve(async (req) => {
       );
     }
 
+    // The canonical row is the source of truth for everything a caller could
+    // otherwise inject. The title follows the same rule as the body text: a
+    // NULL or blank title in the database takes the untitled path regardless
+    // of what the request body claimed.
+    const canonicalTitle = sourceResult.popup.title?.trim();
     translationRequest = {
       ...translationRequest,
       text: sourceResult.popup.content,
       ...(sourceResult.popup.platform !== null
         ? { platform: sourceResult.popup.platform }
         : { platform: undefined }),
+      ...(canonicalTitle ? { title: canonicalTitle } : { title: undefined }),
     };
 
     if (shouldWriteTranslationState(translationRequest)) {
@@ -408,7 +426,7 @@ serve(async (req) => {
     maxRetries: 0,
     timeout: OPENAI_REQUEST_TIMEOUT_MS,
   });
-  const translated = new Map<string, string>();
+  const translated = new Map<string, TranslatedEntry>();
   const persistedLocales = new Set<string>();
   const failures: TranslationFailure[] = [];
   const chunks = chunkLocales(translationRequest.locales);
@@ -439,6 +457,7 @@ serve(async (req) => {
       requestId,
       chunkIndex,
       deadlineAt,
+      translationRequest.title,
     );
 
     const failureCountBeforeFallbacks = failures.length;
@@ -464,6 +483,7 @@ serve(async (req) => {
         translationRequest.text,
         locale,
         deadlineAt,
+        translationRequest.title,
       );
       if (fallback) {
         chunkTranslations.set(locale, fallback);
@@ -584,7 +604,12 @@ serve(async (req) => {
       : {
         locale,
         status: "translated",
-        content: translated.get(locale),
+        content: translated.get(locale)?.content,
+        // Only present when this popup carried a title, so the untitled
+        // response body is unchanged.
+        ...(translated.get(locale)?.title !== undefined
+          ? { title: translated.get(locale)?.title }
+          : {}),
       };
   });
   const httpStatus = sourceStatusError

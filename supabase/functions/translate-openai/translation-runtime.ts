@@ -3,12 +3,23 @@ export const MAX_TRANSLATION_LOCALES = 25;
 export const MAX_TRANSLATION_TEXT_LENGTH = 10_000;
 export const TRANSLATION_REQUEST_DEADLINE_MS = 120_000;
 
+export const MAX_TRANSLATION_TITLE_LENGTH = 200;
+
 export type TranslationRequest = {
   text: string;
   locales: string[];
   platform?: string;
   source_popup_id?: number;
+  title?: string;
   dry_run: boolean;
+};
+
+/// One locale's translated output. `title` is present only when the request
+/// carried one (plan 054 Item C); a titleless request produces entries whose
+/// `title` is undefined, which is what the pre-title code path always did.
+export type TranslatedEntry = {
+  content: string;
+  title?: string;
 };
 
 export type TranslationFailure = {
@@ -23,6 +34,7 @@ export type TranslationRow = {
   is_translated: true;
   platform?: string;
   source_popup_id?: number;
+  title?: string;
 };
 
 export type ValidationResult =
@@ -39,6 +51,7 @@ export function validateTranslationRequest(input: unknown): ValidationResult {
   const locales = input.locales;
   const platform = input.platform;
   const sourcePopupId = input.source_popup_id;
+  const title = input.title;
   const dryRun = input.dry_run;
 
   if (typeof text !== "string" || text.trim().length === 0) {
@@ -96,6 +109,20 @@ export function validateTranslationRequest(input: unknown): ValidationResult {
     errors.push("source_popup_id must be a positive safe integer.");
   }
 
+  // A null title is how the database sends "this popup has no title", so it is
+  // accepted and treated as absent rather than rejected.
+  if (
+    title !== undefined &&
+    title !== null &&
+    (typeof title !== "string" ||
+      title.trim().length === 0 ||
+      [...title].length > MAX_TRANSLATION_TITLE_LENGTH)
+  ) {
+    errors.push(
+      `title must be a non-empty string of at most ${MAX_TRANSLATION_TITLE_LENGTH} characters.`,
+    );
+  }
+
   if (dryRun !== undefined && typeof dryRun !== "boolean") {
     errors.push("dry_run must be a boolean.");
   }
@@ -113,6 +140,7 @@ export function validateTranslationRequest(input: unknown): ValidationResult {
       ...(sourcePopupId !== undefined
         ? { source_popup_id: sourcePopupId as number }
         : {}),
+      ...(typeof title === "string" ? { title: title.trim() } : {}),
       dry_run: (dryRun as boolean | undefined) ?? false,
     },
   };
@@ -133,7 +161,20 @@ export function chunkLocales(
   return chunks;
 }
 
-export function buildBatchResponseFormat(locales: string[]) {
+export function buildBatchResponseFormat(locales: string[], titled = false) {
+  // Untitled requests keep the original per-locale string schema exactly.
+  const localeSchema = titled
+    ? {
+      type: "object",
+      additionalProperties: false,
+      required: ["content", "title"],
+      properties: {
+        content: { type: "string", minLength: 1 },
+        title: { type: "string", minLength: 1 },
+      },
+    }
+    : { type: "string", minLength: 1 };
+
   return {
     type: "json_schema" as const,
     json_schema: {
@@ -149,10 +190,7 @@ export function buildBatchResponseFormat(locales: string[]) {
             additionalProperties: false,
             required: locales,
             properties: Object.fromEntries(
-              locales.map((locale) => [
-                locale,
-                { type: "string", minLength: 1 },
-              ]),
+              locales.map((locale) => [locale, localeSchema]),
             ),
           },
         },
@@ -161,7 +199,7 @@ export function buildBatchResponseFormat(locales: string[]) {
   };
 }
 
-export function buildSingleResponseFormat() {
+export function buildSingleResponseFormat(titled = false) {
   return {
     type: "json_schema" as const,
     json_schema: {
@@ -170,10 +208,15 @@ export function buildSingleResponseFormat() {
       schema: {
         type: "object",
         additionalProperties: false,
-        required: ["translation"],
-        properties: {
-          translation: { type: "string", minLength: 1 },
-        },
+        required: titled ? ["translation", "title"] : ["translation"],
+        properties: titled
+          ? {
+            translation: { type: "string", minLength: 1 },
+            title: { type: "string", minLength: 1 },
+          }
+          : {
+            translation: { type: "string", minLength: 1 },
+          },
       },
     },
   };
@@ -182,8 +225,9 @@ export function buildSingleResponseFormat() {
 export function parseBatchTranslationContent(
   content: string,
   requestedLocales: string[],
-): Map<string, string> {
-  const result = new Map<string, string>();
+  titled = false,
+): Map<string, TranslatedEntry> {
+  const result = new Map<string, TranslatedEntry>();
   const parsed = parseJsonRecord(content);
   if (!parsed) {
     return result;
@@ -196,41 +240,77 @@ export function parseBatchTranslationContent(
 
   for (const locale of requestedLocales) {
     const value = translations[locale];
-    if (typeof value === "string" && value.trim().length > 0) {
-      result.set(locale, value);
+
+    if (!titled) {
+      if (typeof value === "string" && value.trim().length > 0) {
+        result.set(locale, { content: value });
+      }
+      continue;
     }
+
+    if (!isRecord(value)) {
+      continue;
+    }
+    const localeContent = value.content;
+    if (
+      typeof localeContent !== "string" || localeContent.trim().length === 0
+    ) {
+      continue;
+    }
+    const localeTitle = value.title;
+    // A usable body with a missing or empty title keeps the locale, with the
+    // title dropped: the client falls back to its localized "What's new", which
+    // is a far better outcome than dropping the locale and shipping no popup
+    // at all in that language.
+    result.set(
+      locale,
+      typeof localeTitle === "string" && localeTitle.trim().length > 0
+        ? { content: localeContent, title: localeTitle }
+        : { content: localeContent },
+    );
   }
   return result;
 }
 
 export function parseSingleTranslationContent(
   content: string,
-): string | undefined {
+  titled = false,
+): TranslatedEntry | undefined {
   const parsed = parseJsonRecord(content);
   const translation = parsed?.translation;
-  return typeof translation === "string" && translation.trim().length > 0
-    ? translation
-    : undefined;
+  if (typeof translation !== "string" || translation.trim().length === 0) {
+    return undefined;
+  }
+
+  if (!titled) {
+    return { content: translation };
+  }
+
+  const title = parsed?.title;
+  return typeof title === "string" && title.trim().length > 0
+    ? { content: translation, title }
+    : { content: translation };
 }
 
 export function buildTranslationRows(
   request: TranslationRequest,
-  translations: ReadonlyMap<string, string>,
+  translations: ReadonlyMap<string, TranslatedEntry>,
 ): TranslationRow[] {
   return request.locales.flatMap((locale) => {
-    const content = translations.get(locale);
-    if (!content) {
+    const entry = translations.get(locale);
+    if (!entry || !entry.content) {
       return [];
     }
 
     return [{
-      content,
+      content: entry.content,
       locale,
       is_translated: true as const,
       ...(request.platform !== undefined ? { platform: request.platform } : {}),
       ...(request.source_popup_id !== undefined
         ? { source_popup_id: request.source_popup_id }
         : {}),
+      ...(entry.title !== undefined ? { title: entry.title } : {}),
     }];
   });
 }
