@@ -13,6 +13,12 @@ import {
 import { authorizeServiceRole } from "../_shared/service-role-auth.ts";
 import { createSecureResponse } from "../_shared/security-headers.ts";
 
+// Kept in step with admin-launch-popup and with
+// MAX_TRANSLATION_TITLE_LENGTH in translate-openai: a title accepted here must
+// also survive the translation request's validation, or the popup would be
+// scheduled and then fail to fan out.
+const MAX_TITLE_LENGTH = 200;
+
 function jsonResponse(
   body: unknown,
   status: number,
@@ -81,6 +87,7 @@ serve(async (req) => {
     locale?: string;
     platform?: string;
     publication_time?: string;
+    title?: string;
   };
   try {
     body = await req.json();
@@ -88,10 +95,24 @@ serve(async (req) => {
     return jsonResponse({ error: "Invalid JSON" }, 400, cors);
   }
 
-  const { content, locale, platform, publication_time } = body;
+  const { content, locale, platform, publication_time, title } = body;
   if (!content || !locale || !publication_time) {
     return jsonResponse({ error: "Missing required fields" }, 400, cors);
   }
+
+  // Optional per-popup dialog title (plan 054 Item C). Kept in step with the
+  // 200-character bound in admin-launch-popup and translate-openai; a blank
+  // title must reach the column as NULL so the app's localized "What's new"
+  // fallback fires rather than a blank heading.
+  const trimmedTitle = typeof title === "string" ? title.trim() : "";
+  if ([...trimmedTitle].length > MAX_TITLE_LENGTH) {
+    return jsonResponse(
+      { error: `Title must be at most ${MAX_TITLE_LENGTH} characters` },
+      400,
+      cors,
+    );
+  }
+  const titleValue: string | null = trimmedTitle || null;
 
   const runAt = new Date(publication_time);
   if (isNaN(runAt.valueOf())) {
@@ -119,6 +140,7 @@ serve(async (req) => {
     _locale: locale,
     _platform: platformValue,
     _run_at: runAt.toISOString(),
+    _title: titleValue,
   });
   if (error) {
     logError(

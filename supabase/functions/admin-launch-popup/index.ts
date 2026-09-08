@@ -30,11 +30,17 @@ const LOCALE_PATTERN = /^en(?:[-_].+)?$/i;
 const PLATFORM_VALUES = ["ios", "android", "web", "all"] as const;
 type PlatformValue = typeof PLATFORM_VALUES[number];
 
+// Kept in step with MAX_TRANSLATION_TITLE_LENGTH in translate-openai: a title
+// this function accepts must also survive the translation request's own
+// validation, or the popup would be created and then fail to fan out.
+const MAX_TITLE_LENGTH = 200;
+
 type RequestBody = {
   content?: string;
   locale?: string;
   platform?: string;
   publication_time?: string;
+  title?: string;
 };
 
 function jsonResponse(
@@ -139,7 +145,7 @@ serve(async (req) => {
   }
 
   const body = await readJson(req);
-  const { content, locale, platform, publication_time } = body;
+  const { content, locale, platform, publication_time, title } = body;
 
   const trimmedContent = typeof content === "string" ? content.trim() : "";
   if (!trimmedContent) {
@@ -164,6 +170,20 @@ serve(async (req) => {
       ? platform as PlatformValue
       : "all";
 
+  // An optional per-popup dialog title (plan 054 Item C). An absent or blank
+  // title must reach the column as SQL NULL, never as an empty string, because
+  // the app renders `popup.title ?? l10n.whatsnewtitle` and an empty string
+  // would satisfy that fallback and render a blank heading.
+  const trimmedTitle = typeof title === "string" ? title.trim() : "";
+  if ([...trimmedTitle].length > MAX_TITLE_LENGTH) {
+    return jsonResponse(
+      { error: `Title must be at most ${MAX_TITLE_LENGTH} characters` },
+      400,
+      cors,
+    );
+  }
+  const titleValue: string | null = trimmedTitle || null;
+
   let runAt: Date | null = null;
   if (publication_time !== undefined && publication_time !== null && publication_time !== "") {
     const parsed = new Date(publication_time);
@@ -187,6 +207,7 @@ serve(async (req) => {
       _locale: "en",
       _platform: platformValue,
       _run_at: runAt.toISOString(),
+      _title: titleValue,
     });
 
     if (error) {
@@ -221,7 +242,12 @@ serve(async (req) => {
 
   const { data: row, error } = await supabase
     .from("launch_popup")
-    .insert({ content: trimmedContent, locale: "en", platform: platformValue })
+    .insert({
+      content: trimmedContent,
+      locale: "en",
+      platform: platformValue,
+      title: titleValue,
+    })
     .select("id")
     .single();
 
