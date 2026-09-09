@@ -33,4 +33,4 @@ END;
 $function$;
 
 -- Add country index on partition parent (inherited by all partitions)
-CREATE INDEX idx_raw_events_country ON ONLY analytics.raw_events USING btree (country, server_ts);
+CREATE INDEX idx_raw_events_country ON analytics.raw_events USING btree (country, server_ts);

@@ -352,12 +352,34 @@ grant update on table "service"."app_release_notifications" to "service_role";
 
 CREATE TRIGGER trg_cancel_orphan_events_on_session_end AFTER UPDATE OF status ON service.live_activity_sessions FOR EACH ROW WHEN (((new.status = ANY (ARRAY['ended'::text, 'stale'::text])) AND (old.status = 'active'::text))) EXECUTE FUNCTION service.cancel_orphan_events_on_session_end();
 
+-- storage.protect_delete() exists on the remote project but was created
+-- out-of-band and never captured by a migration, so a replayed chain had no
+-- function for the protect_* triggers below to reference. Defined here, at the
+-- point those triggers first appear.
 do $$ begin
-  drop trigger if exists "objects_delete_delete_prefix" on "storage"."objects";
-  drop trigger if exists "objects_insert_create_prefix" on "storage"."objects";
-  drop trigger if exists "objects_update_create_prefix" on "storage"."objects";
-  drop trigger if exists "prefixes_create_hierarchy" on "storage"."prefixes";
-  drop trigger if exists "prefixes_delete_hierarchy" on "storage"."prefixes";
+  create or replace function storage.protect_delete()
+  returns trigger
+  language plpgsql
+  as $fn$
+  BEGIN
+      -- Check if storage.allow_delete_query is set to 'true'
+      IF COALESCE(current_setting('storage.allow_delete_query', true), 'false') != 'true' THEN
+          RAISE EXCEPTION 'Direct deletion from storage tables is not allowed. Use the Storage API instead.'
+              USING HINT = 'This prevents accidental data loss from orphaned objects.',
+                    ERRCODE = '42501';
+      END IF;
+      RETURN NULL;
+  END;
+  $fn$;
+exception when insufficient_privilege then
+  raise notice 'Cannot create storage.protect_delete() (not owner); assuming the platform provides it.';
+end $$;
+
+do $$ begin
+  -- Removed: five `drop trigger` statements targeting Supabase Storage internals.
+  -- They are owned by supabase_storage_admin, so they raised 42501 and the outer
+  -- `when others` handler swallowed it -- silently skipping the two protect_*
+  -- triggers below as well.
   begin
     CREATE TRIGGER protect_buckets_delete BEFORE DELETE ON storage.buckets FOR EACH STATEMENT EXECUTE FUNCTION storage.protect_delete();
   exception when others then null; end;

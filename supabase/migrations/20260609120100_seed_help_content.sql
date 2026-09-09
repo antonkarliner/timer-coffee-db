@@ -1,3 +1,34 @@
+-- public.supported_locales is created by the very first migration but has never
+-- been seeded by one; its rows were populated out-of-band on the remote project.
+-- The help_categories.locale foreign key below therefore has nothing to point at
+-- on a replayed chain. Seed the reference data here, idempotently, so the chain
+-- is self-sufficient. Values mirror the remote project as of 2026-09-09.
+insert into "public"."supported_locales" ("locale", "locale_name")
+values
+    ('ar', 'العربية'),
+    ('de', 'Deutsch'),
+    ('el', 'Ελληνική'),
+    ('en', 'English'),
+    ('es', 'Español'),
+    ('fa', 'فارسی'),
+    ('fi', 'suomi'),
+    ('fr', 'Français'),
+    ('hr', 'Hrvatski'),
+    ('id', 'Bahasa Indonesia'),
+    ('it', 'Italiano'),
+    ('ja', '日本語'),
+    ('ko', '한국어'),
+    ('nl', 'Nederlands'),
+    ('no', 'Norsk (bokmål)'),
+    ('pl', 'Polski'),
+    ('pt', 'Português'),
+    ('ro', 'Română'),
+    ('ru', 'Русский'),
+    ('tr', 'Türkçe'),
+    ('uk', 'Українська'),
+    ('zh', '中文')
+on conflict ("locale") do nothing;
+
 -- Initial English help content. English is the source locale (is_translated = false);
 -- the translation pipeline can fill localized rows later. Idempotent: re-running
 -- refreshes the text via ON CONFLICT DO UPDATE.

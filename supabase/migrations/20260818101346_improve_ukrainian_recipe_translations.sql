@@ -228,6 +228,11 @@ where locale = 'uk'
 
 do $$
 begin
+  if (select count(*) from public.steps where locale = 'uk') = 0 then
+    raise notice 'No Ukrainian catalog rows present (fresh database); skipping.';
+    return;
+  end if;
+
   if (select count(*) from public.recipe_localization where locale = 'uk') <> 45 then
     raise exception 'Expected 45 Ukrainian metadata rows';
   end if;

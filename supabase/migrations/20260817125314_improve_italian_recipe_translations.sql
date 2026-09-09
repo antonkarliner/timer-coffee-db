@@ -279,6 +279,11 @@ do $$
 declare
   issue_count integer;
 begin
+  if (select count(*) from public.steps where locale = 'it') = 0 then
+    raise notice 'No Italian catalog rows present (fresh database); skipping.';
+    return;
+  end if;
+
   select count(*) into issue_count
   from public.recipe_localization
   where locale = 'it';

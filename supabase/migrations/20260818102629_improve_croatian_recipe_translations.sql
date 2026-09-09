@@ -354,6 +354,11 @@ do $$
 declare
   formal_pattern text := '\m(ulijte|pričekajte|stavite|dodajte|isperite|promiješajte|biste|sameljite|pogledajte|zavrtite|postavite|pustite|dosegnete|umetnite|ostavite|otvorite|poslužite|pritisnite|zagrijte|zatvorite|nemojte|izlijte|protresite|nastavite|pripremite|pročitajte|tarirajte|uklonite|ulijevajte|imajte|možete|napunite|okrenite|uključite|vam|niste|trebate)\M';
 begin
+  if (select count(*) from public.steps where locale = 'hr') = 0 then
+    raise notice 'No Croatian catalog rows present (fresh database); skipping.';
+    return;
+  end if;
+
   if (select count(*) from public.recipe_localization where locale = 'hr') <> 45 then
     raise exception 'Croatian recipe metadata count changed';
   end if;

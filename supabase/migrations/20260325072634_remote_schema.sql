@@ -2,9 +2,9 @@ drop trigger if exists "process_new_coffee_roaster_logo" on "public"."coffee_roa
 
 drop trigger if exists "check_new_roaster" on "public"."global_coffee_beans";
 
-alter table "public"."global_stats" add column "country_code" character(2);
+alter table "public"."global_stats" add column if not exists "country_code" character(2);
 
-alter table "public"."user_coffee_beans" add column "photo_url" text;
+alter table "public"."user_coffee_beans" add column if not exists "photo_url" text;
 
 set check_function_bodies = off;
 

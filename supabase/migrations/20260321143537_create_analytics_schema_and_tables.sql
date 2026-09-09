@@ -43,14 +43,13 @@ create table "analytics"."raw_events_y2026m06" partition of "analytics"."raw_eve
   for values from ('2026-06-01 00:00:00+00') to ('2026-07-01 00:00:00+00');
 
 -- Primary keys and indexes (on parent, inherited by partitions)
-CREATE UNIQUE INDEX raw_events_pkey         ON ONLY analytics.raw_events USING btree (id, server_ts);
-CREATE INDEX idx_raw_events_event_name      ON ONLY analytics.raw_events USING btree (event_name, server_ts);
-CREATE INDEX idx_raw_events_install_id      ON ONLY analytics.raw_events USING btree (install_id, server_ts);
-CREATE INDEX idx_raw_events_category        ON ONLY analytics.raw_events USING btree (category, server_ts);
+CREATE INDEX idx_raw_events_event_name      ON analytics.raw_events USING btree (event_name, server_ts);
+CREATE INDEX idx_raw_events_install_id      ON analytics.raw_events USING btree (install_id, server_ts);
+CREATE INDEX idx_raw_events_category        ON analytics.raw_events USING btree (category, server_ts);
 
 CREATE UNIQUE INDEX daily_metrics_pkey ON analytics.daily_metrics USING btree (date, platform, metric_name, dimensions);
 
-alter table "analytics"."raw_events"    add constraint "raw_events_pkey"    PRIMARY KEY using index "raw_events_pkey";
+alter table "analytics"."raw_events"    add constraint "raw_events_pkey"    PRIMARY KEY (id, server_ts);
 alter table "analytics"."daily_metrics" add constraint "daily_metrics_pkey" PRIMARY KEY using index "daily_metrics_pkey";
 
 alter table "analytics"."raw_events" add constraint "raw_events_category_check"

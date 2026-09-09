@@ -1,3 +1,16 @@
+-- public.brewing_methods and public.vendors are reference tables populated
+-- out-of-band on the remote project rather than by any migration, so the
+-- foreign keys below have nothing to point at on a replayed chain. Seed the two
+-- rows this migration depends on, idempotently. Values mirror remote as of
+-- 2026-09-09.
+insert into public.brewing_methods (brewing_method_id, brewing_method, show_on_main)
+values ('cupping', 'Cupping', true)
+on conflict (brewing_method_id) do nothing;
+
+insert into public.vendors (vendor_id, vendor_name, vendor_description, banner_url, active)
+values ('timercoffee', 'Timer.Coffee', 'Recipes added by author of Timer.Coffee app', null, true)
+on conflict (vendor_id) do nothing;
+
 -- Bundled cupping recipe 1101: James Hoffmann's at-home cupping.
 -- Source: https://www.youtube.com/watch?v=cSEgP4VNynQ
 --

@@ -41,6 +41,11 @@ values
 
 do $$
 begin
+  if (select count(*) from public.steps where locale = 'tr') = 0 then
+    raise notice 'No Turkish catalog rows present (fresh database); skipping.';
+    return;
+  end if;
+
   if exists (
     select 1
     from turkish_recipe_metadata_updates u
@@ -246,6 +251,11 @@ values
 
 do $$
 begin
+  if (select count(*) from public.steps where locale = 'tr') = 0 then
+    raise notice 'No Turkish catalog rows present (fresh database); skipping.';
+    return;
+  end if;
+
   if exists (
     select 1
     from turkish_step_updates u
@@ -276,6 +286,11 @@ declare
   metadata_count integer;
   step_count integer;
 begin
+  if (select count(*) from public.steps where locale = 'tr') = 0 then
+    raise notice 'No Turkish catalog rows present (fresh database); skipping.';
+    return;
+  end if;
+
   select count(*) into metadata_count
   from public.recipe_localization
   where locale = 'tr';
