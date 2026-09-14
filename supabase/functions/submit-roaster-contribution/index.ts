@@ -1,9 +1,15 @@
 // submit-roaster-contribution
 // ────────────────────────────────────────────────────────────────
-// Captures a user-submitted official website (and optional Instagram / city /
-// country) for a roaster that is not yet in public.coffee_roasters, attaches it
-// to the pending candidate cluster, and queues a fresh enrichment pass that will
-// use the website as a high-confidence identity lead. Plan 011, Phase 1.
+// Captures a user-submitted official website or Instagram profile (plus
+// optional city / country) for a roaster that is not yet in
+// public.coffee_roasters, attaches it to the pending candidate cluster, and
+// queues a fresh enrichment pass that will use it as a high-confidence
+// identity lead. Plan 011, Phase 1; URL routing per plan 030, step 2.
+//
+// A contribution needs at least one usable identity URL — a website OR an
+// Instagram account profile. The shared classifier (_shared/roaster-url.ts)
+// moves an Instagram URL out of the website field, deduplicates the same
+// account across both fields, and rejects conflicting accounts.
 //
 // Auth: any signed-in user, including anonymous (the app always has at least an
 // anonymous session). Rate-limited per user. Structural URL validation only —
@@ -16,6 +22,7 @@ import {
   checkUserRateLimit,
   createRateLimitResponse,
 } from "../_shared/rate-limiter.ts";
+import { parseContributionInput } from "./contribution-input.ts";
 
 const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
 const supabaseServiceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
@@ -29,64 +36,6 @@ const supabase = createClient(supabaseUrl, supabaseServiceRoleKey, {
 
 // Max contributions a single user may submit per rate-limit window.
 const CONTRIBUTION_RATE_LIMIT = 20;
-
-const BINARY_EXTENSIONS = [
-  ".pdf", ".zip", ".rar", ".7z", ".tar", ".gz",
-  ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
-];
-
-// Structural-only website validation. Forces a scheme, rejects IP-literals /
-// localhost / direct binary links. Returns the canonical URL or null.
-function normalizeWebsiteUrl(raw: unknown): string | null {
-  if (typeof raw !== "string") return null;
-  let s = raw.trim();
-  if (!s || s.length > 2048) return null;
-  if (!/^https?:\/\//i.test(s)) s = `https://${s}`;
-  let u: URL;
-  try {
-    u = new URL(s);
-  } catch {
-    return null;
-  }
-  if (u.protocol !== "http:" && u.protocol !== "https:") return null;
-  const host = u.hostname.toLowerCase();
-  if (!host || !host.includes(".")) return null; // require a real domain
-  if (host === "localhost" || host.endsWith(".local")) return null;
-  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) return null; // bare IPv4 (SSRF hygiene)
-  if (host.includes(":")) return null; // IPv6 literal
-  const path = u.pathname.toLowerCase();
-  if (BINARY_EXTENSIONS.some((ext) => path.endsWith(ext))) return null;
-  u.hash = "";
-  return u.toString();
-}
-
-function extractDomain(urlStr: string): string | null {
-  try {
-    return new URL(urlStr).hostname.replace(/^www\./i, "").toLowerCase();
-  } catch {
-    return null;
-  }
-}
-
-// Accept a full Instagram URL or a bare handle (@name / name).
-function normalizeInstagram(raw: unknown): string | null {
-  if (typeof raw !== "string") return null;
-  const s = raw.trim();
-  if (!s || s.length > 512) return null;
-  if (/^https?:\/\//i.test(s) || s.includes(".")) {
-    return normalizeWebsiteUrl(s);
-  }
-  const handle = s.replace(/^@/, "").replace(/[^A-Za-z0-9._]/g, "");
-  if (!handle) return null;
-  return `https://www.instagram.com/${handle}`;
-}
-
-function cleanText(raw: unknown, maxLen = 120): string | null {
-  if (typeof raw !== "string") return null;
-  const s = raw.trim();
-  if (!s) return null;
-  return s.slice(0, maxLen);
-}
 
 function json(
   body: Record<string, unknown>,
@@ -135,19 +84,19 @@ Deno.serve(async (req) => {
     return json({ error: "Invalid JSON body" }, 400, cors);
   }
 
-  const roaster = typeof body.roaster === "string" ? body.roaster.trim() : "";
-  if (!roaster) {
-    return json({ error: "Missing or invalid roaster" }, 400, cors);
+  const parsedInput = parseContributionInput(body);
+  if (!parsedInput.ok) {
+    return json({ error: parsedInput.error }, parsedInput.status, cors);
   }
-
-  const websiteUrl = normalizeWebsiteUrl(body.website_url);
-  if (!websiteUrl) {
-    return json({ error: "Invalid website_url" }, 400, cors);
-  }
-  const websiteDomain = extractDomain(websiteUrl);
-  const instagramUrl = normalizeInstagram(body.instagram_url);
-  const city = cleanText(body.city);
-  const country = cleanText(body.country);
+  const {
+    roaster,
+    website_url: websiteUrl,
+    website_domain: websiteDomain,
+    instagram_url: instagramUrl,
+    city,
+    country,
+    routing,
+  } = parsedInput.value;
 
   // 4) Resolve the target: already a known roaster? a pending cluster?
   const { data: target, error: targetErr } = await supabase.rpc(
@@ -172,11 +121,46 @@ Deno.serve(async (req) => {
     return json({ status: "no_cluster" }, 200, cors);
   }
   if (clusterStatus !== "pending") {
-    return json({ status: "not_pending", cluster_status: clusterStatus }, 200, cors);
+    return json(
+      { status: "not_pending", cluster_status: clusterStatus },
+      200,
+      cors,
+    );
   }
 
-  // 5) Upsert the contribution (one per cluster + submitter).
+  // 5) Upsert the contribution (one per cluster + submitter). website_url is
+  //    nullable: an Instagram-only contribution stores it as null (plan 030).
   const nowIso = new Date().toISOString();
+  // When the router moved a URL between fields, record the decision in the
+  // row's signals jsonb under url_routing. Merge with any existing signals
+  // (the upsert replaces the row) instead of clobbering them.
+  let signals: Record<string, unknown> | null = null;
+  if (routing.routed) {
+    const urlRouting = {
+      routed: true,
+      notes: routing.notes,
+      submitted_website: typeof body.website_url === "string"
+        ? body.website_url
+        : null,
+    };
+    console.log(
+      "roaster contribution url_routing:",
+      JSON.stringify({ cluster_id: clusterId, ...urlRouting }),
+    );
+    const { data: existingRow } = await supabase
+      .schema("service")
+      .from("roaster_candidate_contributions")
+      .select("signals")
+      .eq("cluster_id", clusterId)
+      .eq("submitted_by", userId)
+      .maybeSingle();
+    const existingSignals = existingRow?.signals &&
+        typeof existingRow.signals === "object" &&
+        !Array.isArray(existingRow.signals)
+      ? existingRow.signals as Record<string, unknown>
+      : {};
+    signals = { ...existingSignals, url_routing: urlRouting };
+  }
   const { data: contribution, error: upsertErr } = await supabase
     .schema("service")
     .from("roaster_candidate_contributions")
@@ -193,6 +177,7 @@ Deno.serve(async (req) => {
         source: "app_nudge",
         status: "new",
         updated_at: nowIso,
+        ...(signals ? { signals } : {}),
       },
       { onConflict: "cluster_id,submitted_by" },
     )
