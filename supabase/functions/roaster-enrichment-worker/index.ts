@@ -26,6 +26,22 @@ import {
   logInfo,
   logWarning,
 } from "../_shared/monitoring.ts";
+import {
+  buildPolicyV2Context,
+  EVIDENCE_POLICY_VERSION,
+  finalDisposition,
+  shouldRestartForPolicyV2,
+  validationReasons,
+} from "./evidence-policy.ts";
+import {
+  applyInstagramRouting,
+  mergeInstagramRoutingRecords,
+} from "./instagram-routing.ts";
+import {
+  buildSearchQueries,
+  discoverCandidateSources,
+  SearchQuery,
+} from "./search-discovery.ts";
 validateAndLogEnvironment();
 const FUNCTION_NAME = "roaster-enrichment-worker";
 const JOB_LOCKED_BY = "roaster-enrichment-worker";
@@ -33,14 +49,13 @@ const supabaseUrl = getEnvVar("SUPABASE_URL");
 const supabaseServiceRoleKey = getEnvVar("SUPABASE_SERVICE_ROLE_KEY");
 const cronJobSecret = getEnvVar("CRON_JOB_SECRET");
 const groqApiKey = getEnvVar("GROQ_API_KEY");
-const deepseekApiKey = getEnvVar("DEEPSEEK_API_KEY");
 const openaiApiKey = getEnvVar("OPENAI_API_KEY_NON_PERSONAL");
 if (!supabaseUrl || !supabaseServiceRoleKey || !cronJobSecret) {
   throw new Error(
     "Missing required Supabase configuration for roaster enrichment worker",
   );
 }
-if (!groqApiKey || !deepseekApiKey || !openaiApiKey) {
+if (!groqApiKey || !openaiApiKey) {
   throw new Error(
     "Missing required LLM API keys for roaster enrichment worker",
   );
@@ -52,7 +67,6 @@ const supabase = createClient(supabaseUrl, supabaseServiceRoleKey, {
   },
 });
 const GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions";
-const DEEPSEEK_ENDPOINT = "https://api.deepseek.com/v1/chat/completions";
 const MAX_JOB_RETRIES = 3;
 const RETRY_BACKOFF_MINUTES = [
   15,
@@ -68,8 +82,6 @@ const LOGO_BATCH_VERIFY_TIMEOUT_MS = 15000; // 15s max for batched logo verifica
 const RPC_TIMEOUT_MS = 3000; // 3s max for RPC calls
 const FETCH_TIMEOUT_MS = 8000; // 8s max for external page fetches
 const OPENAI_ENDPOINT = "https://api.openai.com/v1/responses";
-const SEARCH_RESULT_LIMIT = 10;
-const CANDIDATE_CONTEXT_LIMIT = 8;
 const SEARCH_AGGREGATOR_DOMAINS = [
   "facebook.com",
   "instagram.com",
@@ -110,7 +122,7 @@ const ADDRESS_REGEX =
 // across calls (enables provider prompt-prefix caching at the 5-min cron
 // cadence). See plans/001-roaster-enrichment-prompt-optimization.md item 5.
 const PROPOSED_SCHEMA_JSON =
-  `{"roaster_name": string|null, "aliases": string[], "roaster_website_url": string|null, "roaster_logo_url": string|null, "city": string|null, "state": string|null, "country": string|null, "address": string|null, "is_roaster": boolean|null}`;
+  `{"roaster_name": string|null, "aliases": string[], "roaster_website_url": string|null, "instagram_url": string|null, "roaster_logo_url": string|null, "city": string|null, "state": string|null, "country": string|null, "address": string|null, "is_roaster": boolean|null}`;
 const EXTRACT_PROMPT_STATIC =
   `You are extracting roaster fields from evidence. Return ONLY JSON with keys:
 {"proposed": ${PROPOSED_SCHEMA_JSON}, "confidence": number|null, "conflicts": string[], "notes": string|null}
@@ -120,21 +132,57 @@ CRITICAL REQUIREMENTS:
 2. Do NOT look for logos in other parts of evidence - only use the provided logos array.
 3. If no valid logo exists in logos array, set roaster_logo_url to null.
 4. Use bean-specific search evidence from candidate_context.search_evidence to disambiguate generic or conflicting roaster names. If the bean-specific evidence points to a different roaster/domain than the proposed website, include a conflict and lower confidence; do not silently pick the generic-domain result.
-5. candidate_context.user_contribution (when present) is a website submitted by an app user who logged this roaster's beans — a high-confidence signal of the official site. Prefer it as roaster_website_url when it is consistent with the other evidence, and prefer a roaster_logo_url whose domain matches it. If it clearly contradicts strong, repeated candidate evidence (e.g. a different country), record a conflict and lower confidence instead of blindly accepting it.`;
+5. candidate_context.user_contribution (when present) is a website submitted by an app user who logged this roaster's beans — a high-confidence signal of the official site. Prefer it as roaster_website_url when it is consistent with the other evidence, and prefer a roaster_logo_url whose domain matches it. Its instagram_url (when present) is the same kind of high-confidence official-profile signal for the instagram_url field. If it clearly contradicts strong, repeated candidate evidence (e.g. a different country), record a conflict and lower confidence instead of blindly accepting it.
+6. Search titles/snippets and contributed city/country values are discovery leads, not proof. Only fetched and parsed page evidence may establish proposed identity, domain, or location fields.
+7. Social networks — Instagram, Facebook, TikTok, X/Twitter, Linktree — are not independent websites and must never be put in roaster_website_url. An official Instagram account belongs in instagram_url as https://www.instagram.com/<handle>/. A roaster whose only web presence is an Instagram account is normal: set roaster_website_url to null and put the account in instagram_url.`;
 const VALIDATE_PROMPT_STATIC =
   `Validate and refine the proposed roaster data. Return ONLY JSON with keys:
 {"proposed": ${PROPOSED_SCHEMA_JSON}, "confidence": number|null, "needs_review": boolean, "notes": string|null}
 
 IMPORTANT: Ensure that roaster_logo_url (if present) ends with .png, .jpg, .jpeg, or .webp extension. If the proposed logo is not in this format, either find a compliant logo from the evidence or set it to null.
 IMPORTANT: Review bean-specific search evidence before accepting the proposed identity. If roaster + bean-name results contradict the proposed roaster/domain, set needs_review=true and explain the conflict instead of approving a clean identity.
-IMPORTANT: If candidate_context.user_contribution is present, it is a user-submitted official website. Honor it as roaster_website_url when it is consistent with the evidence (and prefer a domain-matching logo); only override it when other strong evidence contradicts it, in which case set needs_review=true and explain.`;
+IMPORTANT: If candidate_context.user_contribution is present, it is a user-submitted official website. Honor it as roaster_website_url when it is consistent with the evidence (and prefer a domain-matching logo); only override it when other strong evidence contradicts it, in which case set needs_review=true and explain. Its instagram_url (when present) is a high-confidence official-profile signal, parallel to the contributed website.
+IMPORTANT: Social networks — Instagram, Facebook, TikTok, X/Twitter, Linktree — are not independent websites and must never be put in roaster_website_url; an official Instagram account belongs in instagram_url as https://www.instagram.com/<handle>/, and a roaster with only an Instagram presence is normal (roaster_website_url null). If roaster_website_url and instagram_url name different Instagram accounts, do not choose one: set needs_review=true and explain the conflict.
+IMPORTANT: Search titles/snippets and contributed city/country values are discovery leads, not proof. Validate identity, domain, and every location field only against fetched and parsed page evidence; unresolved conflicts require needs_review=true.`;
 const SUMMARY_PROMPT_STATIC =
   `Summarize the evidence into JSON. Use ONLY the evidence provided.
 IMPORTANT: Only include logo URLs that end with .png, .jpg, .jpeg, or .webp extensions. Exclude all other image formats.
 IMPORTANT: Treat roaster-name + coffee-bean-name search results in candidate_context.search_evidence as disambiguation evidence. If bean-specific results point to a different roaster/domain than generic roaster-name results, preserve that conflict in notes and sources instead of collapsing the identity too early.
+IMPORTANT: Search titles and snippets are discovery metadata, not proof. Only fetched and parsed page evidence may establish names, addresses, logos, domains, or location. User-contributed city/country values are leads that must be verified against fetched page evidence.
 
 Return JSON with keys:
 {"website": string|null, "logos": string[], "addresses": string[], "city": string|null, "state": string|null, "country": string|null, "socials": string[], "sources": string[], "notes": string|null}`;
+const EVIDENCE_SUMMARY_FORMAT = {
+  type: "json_schema",
+  name: "roaster_evidence_summary",
+  strict: true,
+  schema: {
+    type: "object",
+    properties: {
+      website: { type: ["string", "null"] },
+      logos: { type: "array", items: { type: "string" } },
+      addresses: { type: "array", items: { type: "string" } },
+      city: { type: ["string", "null"] },
+      state: { type: ["string", "null"] },
+      country: { type: ["string", "null"] },
+      socials: { type: "array", items: { type: "string" } },
+      sources: { type: "array", items: { type: "string" } },
+      notes: { type: ["string", "null"] },
+    },
+    required: [
+      "website",
+      "logos",
+      "addresses",
+      "city",
+      "state",
+      "country",
+      "socials",
+      "sources",
+      "notes",
+    ],
+    additionalProperties: false,
+  },
+};
 class ProviderRetryableError extends Error {
   status;
   constructor(message, status) {
@@ -523,21 +571,6 @@ function getErrorDetails(error) {
     raw,
   };
 }
-function normalizeUrl(value) {
-  try {
-    const parsed = new URL(value);
-    if (
-      ![
-        "http:",
-        "https:",
-      ].includes(parsed.protocol)
-    ) return null;
-    parsed.hash = "";
-    return parsed.toString();
-  } catch {
-    return null;
-  }
-}
 function isBinaryLikeUrl(value) {
   try {
     const pathname = new URL(value).pathname.toLowerCase();
@@ -606,151 +639,6 @@ function uniqueStrings(values) {
 }
 function safeArray(value) {
   return Array.isArray(value) ? value : [];
-}
-function rawSearchResultUrl(result: any): string | null {
-  return result?.link ?? result?.url ?? null;
-}
-function searchResultKind(result: any, source: string): string {
-  return typeof result?.query_kind === "string" ? result.query_kind : source;
-}
-function searchResultScore(
-  result: any,
-  source: string,
-  domain: string | null,
-): number {
-  const evidenceScore = typeof result?.evidence_score === "number"
-    ? result.evidence_score
-    : 0;
-  const kind = searchResultKind(result, source);
-  const beanBoost = source === "bean" || kind === "roaster_bean" ? 35 : 0;
-  const officialBoost = kind === "roaster_official" ? 8 : 0;
-  const aggregatorPenalty = isAggregatorDomain(domain) ? -30 : 0;
-  return evidenceScore + beanBoost + officialBoost + aggregatorPenalty;
-}
-function compactSearchResult(result: any, source: string, candidate: any) {
-  const rawUrl = rawSearchResultUrl(result);
-  if (!rawUrl) return null;
-  const normalized = normalizeUrl(rawUrl);
-  if (!normalized) return null;
-  const domain = extractDomain(normalized);
-  return {
-    title: typeof result.title === "string" ? result.title : null,
-    url: normalized,
-    domain,
-    snippet: typeof result.snippet === "string" ? result.snippet : null,
-    display_link: typeof result.display_link === "string"
-      ? result.display_link
-      : typeof result.displayLink === "string"
-      ? result.displayLink
-      : null,
-    query: typeof result.query === "string" ? result.query : null,
-    query_kind: searchResultKind(result, source),
-    evidence_score: typeof result.evidence_score === "number"
-      ? result.evidence_score
-      : null,
-    source,
-    candidate_roaster: typeof candidate?.roaster === "string"
-      ? candidate.roaster
-      : null,
-    coffee_bean_name: typeof candidate?.coffee_bean_name === "string"
-      ? candidate.coffee_bean_name
-      : null,
-    rank_score: searchResultScore(result, source, domain),
-  };
-}
-function buildBeanSearchPromptHints(candidates: any[], limit = 6) {
-  const hints: any[] = [];
-  const seenUrls = new Set<string>();
-  for (const candidate of candidates) {
-    for (const result of safeArray(candidate.bean_search_results)) {
-      const compact = compactSearchResult(result, "bean", candidate);
-      if (!compact || seenUrls.has(compact.url)) continue;
-      seenUrls.add(compact.url);
-      hints.push(compact);
-    }
-  }
-  hints.sort((a, b) =>
-    b.rank_score - a.rank_score || a.url.length - b.url.length
-  );
-  return hints.slice(0, limit).map(({ rank_score, ...hint }) => hint);
-}
-function parseCandidateNotes(notes) {
-  if (typeof notes !== "string" || !notes.trim()) return null;
-  try {
-    return JSON.parse(notes);
-  } catch {
-    return null;
-  }
-}
-function compactCandidateLocation(location) {
-  if (!location || typeof location !== "object") return null;
-  const record = location;
-  return {
-    address: typeof record.address === "string" ? record.address : null,
-    lat: typeof record.lat === "number" ? record.lat : null,
-    lng: typeof record.lng === "number" ? record.lng : null,
-    source: typeof record.source === "string" ? record.source : null,
-  };
-}
-function buildCandidateContext(candidates, correlationId) {
-  const compactCandidates = candidates.slice(0, CANDIDATE_CONTEXT_LIMIT).map(
-    (candidate) => {
-      const notesContext = parseCandidateNotes(candidate.notes);
-      return {
-        id: candidate.id ?? null,
-        roaster: typeof candidate.roaster === "string"
-          ? candidate.roaster
-          : null,
-        coffee_bean_name: typeof candidate.coffee_bean_name === "string"
-          ? candidate.coffee_bean_name
-          : null,
-        location: compactCandidateLocation(candidate.location),
-        similar_candidates: safeArray(candidate.similar_candidates).slice(0, 5)
-          .map((match) => ({
-            roaster_name: typeof match.roaster_name === "string"
-              ? match.roaster_name
-              : null,
-            sim_score: typeof match.sim_score === "number"
-              ? match.sim_score
-              : null,
-          })).filter((match) => match.roaster_name),
-        source_record: notesContext?.source_record ?? null,
-      };
-    },
-  );
-  const initialLocations = uniqueStrings(
-    compactCandidates.map((candidate) => candidate.location?.address).filter(
-      (address) => Boolean(address),
-    ),
-  );
-  const likelyExistingMatches = [];
-  const seenMatches = new Set();
-  for (const candidate of compactCandidates) {
-    for (const match of candidate.similar_candidates) {
-      const key = String(match.roaster_name).toLowerCase();
-      if (!key || seenMatches.has(key)) continue;
-      seenMatches.add(key);
-      likelyExistingMatches.push(match);
-      if (likelyExistingMatches.length >= 8) break;
-    }
-    if (likelyExistingMatches.length >= 8) break;
-  }
-  const searchEvidence = buildSearchEvidenceFromCandidates(
-    candidates,
-    correlationId,
-  );
-  logInfo("Candidate context built", {
-    candidate_count: compactCandidates.length,
-    initial_location_count: initialLocations.length,
-    likely_existing_match_count: likelyExistingMatches.length,
-    search_result_count: searchEvidence?.results.length ?? 0,
-  }, correlationId);
-  return {
-    candidates: compactCandidates,
-    initial_locations: initialLocations,
-    likely_existing_matches: likelyExistingMatches,
-    search_evidence: searchEvidence,
-  };
 }
 function extractMetaContent(html, property) {
   const regex = new RegExp(
@@ -1220,15 +1108,22 @@ async function updateJobStage(jobOrId, stage, stageData, correlationId) {
   if (jobOrId && typeof jobOrId === "object") {
     jobId = jobOrId.id;
     const previousReenrichment = jobOrId.stage_data?.reenrichment ?? null;
-    if (
-      previousReenrichment && stageData &&
-      stageData.reenrichment === undefined
-    ) {
-      mergedStageData = {
-        ...stageData,
-        reenrichment: previousReenrichment,
-      };
-    }
+    const previousPolicyVersion = jobOrId.stage_data?.evidence_policy_version;
+    const previousTelemetry = jobOrId.stage_data?.legacy_upstream_telemetry;
+    mergedStageData = {
+      ...stageData,
+      ...(previousReenrichment && stageData?.reenrichment === undefined
+        ? { reenrichment: previousReenrichment }
+        : {}),
+      ...(previousPolicyVersion &&
+          stageData?.evidence_policy_version === undefined
+        ? { evidence_policy_version: previousPolicyVersion }
+        : {}),
+      ...(previousTelemetry &&
+          stageData?.legacy_upstream_telemetry === undefined
+        ? { legacy_upstream_telemetry: previousTelemetry }
+        : {}),
+    };
   } else {
     jobId = jobOrId;
   }
@@ -1287,37 +1182,16 @@ async function processTriageStage(job, correlationId) {
     correlationId,
     reenrichment,
   );
-  const candidateContext = buildCandidateContext(candidates, correlationId);
-  // Store minimal candidate data (first 5) to keep stage_data small
-  const minimalCandidates = candidates.slice(0, 5).map((c) => ({
-    id: c.id,
-    roaster: c.roaster,
-    coffee_bean_name: c.coffee_bean_name,
-    similar_candidates: c.similar_candidates,
-    google_search_results: c.google_search_results,
-    bean_search_results: c.bean_search_results,
-    location: c.location,
-    notes: c.notes,
-    cluster_id: c.cluster_id,
-  }));
-  // Collect URLs from candidates
-  const urls = collectCandidateUrls(candidates, correlationId);
-  // Plan 011: thread the user-submitted website into the evidence so it both
-  // (a) gets fetched/parsed like an official site and (b) reaches every prompt
-  // via candidate_context (a high-confidence lead, still verified downstream).
-  if (contribution) {
-    candidateContext.user_contribution = {
-      website_url: contribution.website_url ?? null,
-      instagram_url: contribution.instagram_url ?? null,
-      city: contribution.city ?? null,
-      country: contribution.country ?? null,
-    };
-    if (contribution.website_url && !urls.includes(contribution.website_url)) {
-      urls.unshift(contribution.website_url);
-    }
-  }
-  // Advance to fetch-candidates stage - include cluster and URLs to avoid re-fetching
-  await updateJobStage(job, "fetch-candidates", {
+  const policyContext = buildPolicyV2Context({
+    candidates,
+    userContribution: contribution,
+  });
+  logInfo("Policy v2 candidate context built", {
+    job_id: job.id,
+    ...policyContext.legacy_upstream_telemetry,
+  }, correlationId);
+  await updateJobStage(job, "search-candidates", {
+    evidence_policy_version: EVIDENCE_POLICY_VERSION,
     triage,
     cluster: {
       id: cluster.id,
@@ -1329,57 +1203,90 @@ async function processTriageStage(job, correlationId) {
       best_match_roaster_id: cluster.best_match_roaster_id,
       confidence: cluster.confidence,
     },
-    candidates: minimalCandidates,
-    candidate_context: candidateContext,
-    candidate_urls: urls,
-    fetched_pages: [],
+    candidate_context: policyContext.candidate_context,
+    candidate_urls: [],
+    legacy_upstream_telemetry: policyContext.legacy_upstream_telemetry,
     reenrichment: reenrichment ?? null,
   }, correlationId);
-  logInfo("Triage stage completed, advanced to fetch-candidates", {
+  logInfo("Triage stage completed, advanced to search-candidates", {
     job_id: job.id,
-    url_count: urls.length,
   }, correlationId);
   return {
-    nextStage: "fetch-candidates",
+    nextStage: "search-candidates",
   };
 }
-async function processEvidenceStage(job, correlationId) {
-  logInfo("Processing evidence stage (legacy)", {
+
+async function runWorkerSearch(query: SearchQuery): Promise<any[]> {
+  const apiKey = Deno.env.get("GOOGLE_SEARCH_API_KEY");
+  const engineId = Deno.env.get("GOOGLE_PROGRAMMABLE_ENGINE_ID");
+  if (!apiKey || !engineId) {
+    throw new Error("Missing worker search configuration");
+  }
+  const url = new URL("https://www.googleapis.com/customsearch/v1");
+  url.searchParams.set("key", apiKey);
+  url.searchParams.set("cx", engineId);
+  url.searchParams.set("q", query.query);
+  const response = await fetchWithRetry(url.toString(), { method: "GET" }, {
+    maxAttempts: 2,
+    label: "worker_cluster_search_v2",
+    timeoutMs: FETCH_TIMEOUT_MS,
+  });
+  if (!response.ok) {
+    throw new Error(`Google Custom Search failed: ${response.status}`);
+  }
+  const payload = await response.json();
+  return safeArray(payload?.items);
+}
+
+async function processSearchCandidatesStage(job: any, correlationId: string) {
+  logInfo("Processing search-candidates stage", {
     job_id: job.id,
     cluster_id: job.cluster_id,
   }, correlationId);
-  // Load stage data from triage
   const stageData = job.stage_data;
-  const { triage, candidates, cluster } = stageData;
-  // Use candidates from stage_data instead of re-fetching
-  const urls = collectCandidateUrls(candidates, correlationId);
-  const baseEvidenceBundle = await buildEvidenceBundle(urls, correlationId);
-  const candidateContext = stageData.candidate_context ??
-    buildCandidateContext(candidates ?? [], correlationId);
-  const evidenceBundle = {
-    ...baseEvidenceBundle,
-    candidate_context: candidateContext,
-    addresses: uniqueStrings([
-      ...baseEvidenceBundle.addresses,
-      ...(candidateContext?.initial_locations ?? []),
-    ]),
+  const candidateContext = stageData.candidate_context;
+  const candidates = safeArray(candidateContext?.candidates);
+  const clusterName = stageData.cluster?.display_name ??
+    stageData.triage?.display_name ?? stageData.cluster?.normalized_name ?? "";
+  const queryCount = buildSearchQueries(clusterName, candidates).length;
+  const discovery = await discoverCandidateSources({
+    clusterName,
+    candidates,
+    contributedWebsite: candidateContext?.user_contribution?.website_url ??
+      null,
+    search: runWorkerSearch,
+  });
+  if (queryCount > 0 && discovery.provider_failure_count === queryCount) {
+    throw new Error("All worker candidate searches failed");
+  }
+  const nextCandidateContext = {
+    ...candidateContext,
+    search_evidence: discovery.search_evidence,
   };
-  // Advance to summary stage - pass cluster through
-  await updateJobStage(job, "summary", {
-    triage,
-    cluster,
-    candidate_context: candidateContext,
-    urls,
-    evidence_bundle: evidenceBundle,
+  await updateJobStage(job, "fetch-candidates", {
+    ...stageData,
+    evidence_policy_version: EVIDENCE_POLICY_VERSION,
+    candidate_context: nextCandidateContext,
+    candidate_urls: discovery.candidate_urls,
+    fetched_pages: [],
   }, correlationId);
-  logInfo("Evidence stage completed, advanced to summary", {
+  logInfo("Search-candidates stage completed, advanced to fetch-candidates", {
     job_id: job.id,
-    url_count: urls.length,
-    page_count: evidenceBundle.pages.length,
+    query_count: queryCount,
+    result_count: discovery.search_evidence.results.length,
+    url_count: discovery.candidate_urls.length,
+    provider_failure_count: discovery.provider_failure_count,
   }, correlationId);
-  return {
-    nextStage: "summary",
-  };
+  return { nextStage: "fetch-candidates" };
+}
+async function processEvidenceStage(job, correlationId) {
+  logWarning("Legacy evidence stage reached after policy restart guard", {
+    job_id: job.id,
+    cluster_id: job.cluster_id,
+  }, correlationId);
+  throw new Error(
+    "Legacy evidence stage is not valid under evidence policy v2",
+  );
 }
 // ==================== NEW MICRO-STAGE HANDLERS ====================
 async function processFetchCandidatesStage(job, correlationId) {
@@ -1992,10 +1899,7 @@ async function processAggregateEvidenceStage(job, correlationId) {
     pages: allPages,
     jsonLd: allJsonLd,
     logos: uniqueStrings(allLogos),
-    addresses: uniqueStrings([
-      ...allAddresses,
-      ...(candidateContext?.initial_locations ?? []),
-    ]),
+    addresses: uniqueStrings(allAddresses),
     names: uniqueStrings(allNames),
     candidate_context: candidateContext ?? null,
   };
@@ -2037,8 +1941,8 @@ async function processSummaryStage(job, correlationId) {
     candidate_context: candidateContext,
   } = stageData;
   const reenrichment = stageData.reenrichment ?? null;
-  // Run DeepSeek summarization
-  const evidenceSummary = await summarizeEvidenceWithDeepSeek(
+  // Run Terra summarization
+  const evidenceSummary = await summarizeEvidenceWithTerra(
     evidenceBundle,
     triage,
     correlationId,
@@ -2209,35 +2113,19 @@ async function processValidateStage(job, correlationId) {
     cluster = context.cluster;
   }
   const reenrichment = stageData.reenrichment ?? null;
-  // Run validation if needed
   let validation = undefined;
-  const requiresValidation = needsValidation(extraction) || !!reenrichment;
-  // SHADOW-ONLY: compute the plan's stricter would-be gating rule and log it
-  // for comparison. Does NOT change whether validateWithOpenAI actually runs.
-  const extractionConfidence = extraction.confidence ?? 0;
-  const conflictCount = extraction.conflicts?.length ?? 0;
-  const shadowWouldRunValidation = extractionConfidence < 0.8 ||
-    conflictCount > 0 || !!reenrichment;
-  logInfo("Validation gating shadow decision", {
+  const reasons = validationReasons({ extraction, reenrichment });
+  const requiresValidation = reasons.length > 0;
+  logInfo("Validation gating decision", {
     job_id: job.id,
-    current_requires_validation: requiresValidation,
-    shadow_would_run_validation: shadowWouldRunValidation,
-    extraction_confidence: extractionConfidence,
-    conflict_count: conflictCount,
-    reenrichment: !!reenrichment,
+    requires_validation: requiresValidation,
+    validation_reasons: reasons,
   }, correlationId);
-  const validationGatingShadow = {
-    would_run: shadowWouldRunValidation,
-    extraction_confidence: extractionConfidence,
-    conflict_count: conflictCount,
-    reenrichment: !!reenrichment,
-  };
   if (requiresValidation) {
-    const searchEvidence = candidateContext?.search_evidence ??
-      buildSearchEvidenceFromCandidates(
-        stageData.candidates ?? [],
-        correlationId,
-      );
+    const searchEvidence = candidateContext?.search_evidence ?? {
+      source: "worker_cluster_search_v2",
+      results: [],
+    };
     validation = await validateWithOpenAI(
       evidence_summary,
       triage,
@@ -2263,7 +2151,7 @@ async function processValidateStage(job, correlationId) {
     candidate_context: candidateContext ?? null,
     validation,
     requires_validation: requiresValidation,
-    validation_gating_shadow: validationGatingShadow,
+    validation_reasons: reasons,
   }, correlationId);
   logInfo("Validate stage completed, advanced to translate-location", {
     job_id: job.id,
@@ -2288,12 +2176,32 @@ async function processTranslateLocationStage(job, correlationId) {
     candidate_context: candidateContext,
     validation,
     requires_validation,
-    validation_gating_shadow: validationGatingShadow,
+    validation_reasons: validationReasonsList,
   } = stageData;
   // Determine final proposed fields
-  const finalProposed = validation?.proposed ?? {
+  let finalProposed = validation?.proposed ?? {
     ...extraction.proposed,
   };
+  // Plan 030: deterministic Instagram/website routing on the final proposed
+  // record, merged with the decisions already recorded after the extract and
+  // validate stages. A conflict forces needs_review via unresolvedConflicts.
+  const routingOutcome = applyInstagramRouting(finalProposed);
+  finalProposed = routingOutcome.proposed;
+  const instagramRouting = mergeInstagramRoutingRecords([
+    extraction.instagram_routing,
+    validation?.instagram_routing,
+    {
+      routed: routingOutcome.routed,
+      conflict: routingOutcome.conflict,
+      notes: routingOutcome.notes,
+    },
+  ]);
+  const unresolvedConflicts = instagramRouting.conflict
+    ? [
+      ...(Array.isArray(extraction.conflicts) ? extraction.conflicts : []),
+      instagramRouting.conflict,
+    ]
+    : extraction.conflicts;
   // Translate location to English if needed
   if (finalProposed.city || finalProposed.country) {
     const translation = await translateLocationToEnglish(
@@ -2307,27 +2215,31 @@ async function processTranslateLocationStage(job, correlationId) {
   // Determine status and confidence
   const finalConfidence = validation?.confidence ?? extraction.confidence ??
     0.5;
-  const status = validation?.needs_review || finalConfidence < 0.6
-    ? "needs_review"
-    : "completed";
+  const status = finalDisposition({
+    confidence: finalConfidence,
+    validatorNeedsReview: validation?.needs_review,
+    unresolvedConflicts,
+  });
   logInfo("Location translation completed", {
     job_id: job.id,
     city: finalProposed.city,
     country: finalProposed.country,
     status,
     confidence: finalConfidence,
+    instagram_routing: instagramRouting,
   }, correlationId);
-  // Advance to find-matches stage
+  // Advance to find-matches stage. The merged routing record rides on the
+  // extraction object because later stages forward extraction verbatim.
   await updateJobStage(job, "find-matches", {
     triage,
     evidence_summary,
-    extraction,
+    extraction: { ...extraction, instagram_routing: instagramRouting },
     urls,
     cluster,
     candidate_context: candidateContext ?? null,
     validation,
     requires_validation,
-    validation_gating_shadow: validationGatingShadow,
+    validation_reasons: validationReasonsList,
     final_proposed: finalProposed,
     final_confidence: finalConfidence,
     status,
@@ -2356,7 +2268,7 @@ async function processFindMatchesStage(job, correlationId) {
     candidate_context: candidateContext,
     validation,
     requires_validation,
-    validation_gating_shadow: validationGatingShadow,
+    validation_reasons: validationReasonsList,
     final_proposed,
     final_confidence,
     status,
@@ -2381,7 +2293,7 @@ async function processFindMatchesStage(job, correlationId) {
     candidate_context: candidateContext ?? null,
     validation,
     requires_validation,
-    validation_gating_shadow: validationGatingShadow,
+    validation_reasons: validationReasonsList,
     final_proposed,
     final_confidence,
     status,
@@ -2407,18 +2319,24 @@ async function processPersistResultStage(job, correlationId) {
     urls,
     validation,
     candidate_context: candidateContext,
-    validation_gating_shadow: validationGatingShadow,
+    validation_reasons: validationReasonsList,
     final_proposed,
     final_confidence,
     status,
     potential_matches,
   } = stageData;
   const reenrichment = stageData.reenrichment ?? null;
+  // Plan 030: persist the deterministic Instagram/website routing decisions
+  // recorded after the extract, validate, and translate-location stages.
+  const instagramRouting = mergeInstagramRoutingRecords([
+    extraction.instagram_routing,
+    validation?.instagram_routing,
+  ]);
   // Build signals object
   const signals = {
     models: {
       triage: triage.model,
-      evidence: "deepseek-chat",
+      evidence: OPENAI_MODELS.MEDIUM,
       extraction: OPENAI_MODELS.BIG,
       validation: validation ? OPENAI_MODELS.BIG : null,
     },
@@ -2433,14 +2351,15 @@ async function processPersistResultStage(job, correlationId) {
         notes: validation.notes,
       }
       : null,
-    validation_gating_shadow: validationGatingShadow ?? null,
+    instagram_routing: instagramRouting,
+    validation_reasons: validationReasonsList ?? [],
     candidate_context: candidateContext
       ? {
-        initial_locations: candidateContext.initial_locations ?? [],
-        likely_existing_matches: candidateContext.likely_existing_matches ?? [],
+        evidence_policy_version: EVIDENCE_POLICY_VERSION,
         search_result_count: candidateContext.search_evidence?.results.length ??
           0,
         candidate_count: candidateContext.candidates?.length ?? 0,
+        user_contribution_present: !!candidateContext.user_contribution,
       }
       : null,
     reenriched_from: reenrichment
@@ -2717,143 +2636,6 @@ async function loadClusterContext(job, correlationId) {
     contribution,
   };
 }
-function collectCandidateUrls(candidates: any[], correlationId: string) {
-  const urlEntries: any[] = [];
-  const seenDomains = new Set<string>();
-  logInfo("Collecting candidate URLs", {
-    candidate_count: candidates.length,
-  }, correlationId);
-  for (const candidate of candidates) {
-    const googleResults = safeArray(candidate.google_search_results);
-    const beanResults = safeArray(candidate.bean_search_results);
-    const mergedResults = [
-      ...beanResults.map((result) => ({ result, source: "bean" })),
-      ...googleResults.map((result) => ({ result, source: "google" })),
-    ];
-    for (const { result, source } of mergedResults) {
-      const rawUrl = rawSearchResultUrl(result);
-      if (!rawUrl) continue;
-      const normalized = normalizeUrl(rawUrl);
-      if (!normalized) continue;
-      if (isBinaryLikeUrl(normalized)) {
-        logInfo("Skipping binary candidate URL", {
-          url: normalized,
-        }, correlationId);
-        continue;
-      }
-      const domain = extractDomain(normalized);
-      urlEntries.push({
-        url: normalized,
-        domain,
-        score: searchResultScore(result, source, domain),
-        source,
-        query_kind: searchResultKind(result, source),
-      });
-    }
-  }
-  urlEntries.sort((a, b) => b.score - a.score || a.url.length - b.url.length);
-  const urls: string[] = [];
-  for (const entry of urlEntries) {
-    if (!entry.domain) continue;
-    if (seenDomains.has(entry.domain)) continue;
-    seenDomains.add(entry.domain);
-    urls.push(entry.url);
-    if (urls.length >= 6) break;
-  }
-  if (urls.length < 3) {
-    for (const entry of urlEntries) {
-      const domain = entry.domain;
-      if (!domain) continue;
-      if (seenDomains.has(domain)) continue;
-      seenDomains.add(domain);
-      urls.push(entry.url);
-      if (urls.length >= 6) break;
-    }
-  }
-  if (!urls.length) {
-    logWarning("No candidate URLs found", {}, correlationId);
-  } else {
-    logInfo("Candidate URLs collected", {
-      url_count: urls.length,
-      urls,
-    }, correlationId);
-  }
-  return urls;
-}
-function buildSearchEvidenceFromCandidates(
-  candidates: any[],
-  correlationId: string,
-) {
-  const rankedResults: any[] = [];
-  for (const candidate of candidates) {
-    for (const result of safeArray(candidate.bean_search_results)) {
-      const compact = compactSearchResult(result, "bean", candidate);
-      if (compact) rankedResults.push(compact);
-    }
-    for (const result of safeArray(candidate.google_search_results)) {
-      const compact = compactSearchResult(result, "google", candidate);
-      if (compact) rankedResults.push(compact);
-    }
-  }
-  rankedResults.sort((a, b) =>
-    b.rank_score - a.rank_score || a.url.length - b.url.length
-  );
-  const results: any[] = [];
-  const seenUrls = new Set<string>();
-  for (const rankedResult of rankedResults) {
-    if (results.length >= SEARCH_RESULT_LIMIT) break;
-    if (seenUrls.has(rankedResult.url)) continue;
-    const result = {
-      title: rankedResult.title,
-      url: rankedResult.url,
-      domain: rankedResult.domain,
-      snippet: rankedResult.snippet,
-      display_link: rankedResult.display_link,
-      query: rankedResult.query,
-      query_kind: rankedResult.query_kind,
-      evidence_score: rankedResult.evidence_score,
-      source: rankedResult.source,
-      candidate_roaster: rankedResult.candidate_roaster,
-      coffee_bean_name: rankedResult.coffee_bean_name,
-    };
-    results.push({
-      ...result,
-    });
-    seenUrls.add(rankedResult.url);
-  }
-  if (!results.length) {
-    logInfo("No stored search evidence found", {
-      candidate_count: candidates.length,
-    }, correlationId);
-    return null;
-  }
-  const officialSite =
-    results.find((result) => !isAggregatorDomain(result.domain))?.url ?? null;
-  const candidateDomains = uniqueStrings(
-    results.map((result) => result.domain).filter((domain) => Boolean(domain)),
-  );
-  const beanResults = results.filter((result) => result.source === "bean");
-  logInfo("Search evidence built from stored results", {
-    result_count: results.length,
-    bean_result_count: beanResults.length,
-    official_site: officialSite,
-  }, correlationId);
-  return {
-    source: "stored_results",
-    results,
-    bean_result_count: beanResults.length,
-    top_bean_domains: uniqueStrings(
-      beanResults.map((result) => result.domain).filter((domain) =>
-        Boolean(domain)
-      ),
-    ),
-    official_site: officialSite,
-    candidate_domains: candidateDomains,
-    queries: uniqueStrings(
-      results.map((result) => result.query).filter((query) => Boolean(query)),
-    ),
-  };
-}
 async function buildEvidenceBundle(urls, correlationId) {
   const pages = [];
   const jsonLd = [];
@@ -3072,12 +2854,10 @@ async function triageAndNormalize(
   const candidateNames = uniqueStrings(
     candidates.map((candidate) => candidate.roaster).filter(Boolean),
   );
-  const beanSearchHints = buildBeanSearchPromptHints(candidates);
   logInfo("Starting triage and normalization", {
     cluster_id: cluster.id,
     candidate_count: candidates.length,
     candidate_name_count: candidateNames.length,
-    bean_search_hint_count: beanSearchHints.length,
     reenrichment: !!reenrichment,
   }, correlationId);
   const reenrichmentBlock = buildReenrichmentPromptBlock({
@@ -3090,10 +2870,9 @@ async function triageAndNormalize(
   const prompt =
     `Normalize the roaster name and detect aliases. Return ONLY JSON with keys:
 {"display_name": string|null, "normalized_name": string|null, "aliases": string[], "is_roaster": boolean|null, "confidence": number|null, "notes": string|null}.
-When the roaster name is generic, ambiguous, or conflicts with the candidate URL evidence, use the roaster-name + coffee-bean-name search hints below to identify the intended entity. Do not ignore bean-specific evidence that points to a different roaster/domain than a generic search result.
+At this stage, use only the raw candidate names. Do not infer identity, aliases, domains, or location from name similarity alone.
 Cluster display name: ${cluster.display_name ?? ""}
-Candidate names: ${candidateNames.join(" | ")}
-Bean-name search hints: ${JSON.stringify(beanSearchHints)}${reenrichmentBlock}`;
+Candidate names: ${candidateNames.join(" | ")}${reenrichmentBlock}`;
   for (const model of GROQ_TRIAGE_MODELS) {
     try {
       const result = await callGroqJson(prompt, model, correlationId);
@@ -3141,7 +2920,7 @@ Bean-name search hints: ${JSON.stringify(beanSearchHints)}${reenrichmentBlock}`;
   }
   throw new Error("All Groq triage models failed");
 }
-async function summarizeEvidenceWithDeepSeek(
+async function summarizeEvidenceWithTerra(
   bundle: any,
   triage: any,
   correlationId: string,
@@ -3152,8 +2931,8 @@ async function summarizeEvidenceWithDeepSeek(
   const isNearDeadline = (bufferMs = 10000) =>
     jobDeadline ? Date.now() + bufferMs > jobDeadline : false;
   const summaryStartTime = Date.now();
-  logInfo("Summarizing evidence with DeepSeek", {
-    model: "deepseek-chat",
+  logInfo("Summarizing evidence with OpenAI", {
+    model: OPENAI_MODELS.MEDIUM,
     url_count: bundle.urls.length,
     page_count: bundle.pages.length,
     reenrichment: !!reenrichment,
@@ -3175,7 +2954,7 @@ async function summarizeEvidenceWithDeepSeek(
     candidate_context: bundle.candidate_context ?? null,
   });
   if (boundedEvidence.truncated) {
-    logWarning("Evidence payload truncated for DeepSeek prompt", {
+    logWarning("Evidence payload truncated for OpenAI summary prompt", {
       original_chars: boundedEvidence.originalChars,
       final_chars: boundedEvidence.finalChars,
       page_count: boundedEvidence.payload.pages.length,
@@ -3193,36 +2972,35 @@ Triage: ${
     })
   }
 Evidence: ${JSON.stringify(boundedEvidence.payload)}${reenrichmentBlock}`;
-  const response = await fetchWithRetry(DEEPSEEK_ENDPOINT, {
+  const response = await fetchWithRetry(OPENAI_ENDPOINT, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${deepseekApiKey}`,
+      Authorization: `Bearer ${openaiApiKey}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      model: "deepseek-chat",
-      messages: [
-        {
-          role: "user",
-          content: prompt,
-        },
-      ],
-      response_format: {
-        type: "json_object",
+      model: OPENAI_MODELS.MEDIUM,
+      reasoning: {
+        effort: "none",
       },
-      temperature: 0.2,
+      text: {
+        format: EVIDENCE_SUMMARY_FORMAT,
+      },
+      input: prompt,
     }),
   }, {
     correlationId,
-    label: "deepseek_preextract",
+    label: "openai_evidence_summary",
     timeoutMs: AI_API_TIMEOUT_MS,
   });
   if (!response.ok) {
     const body = await response.text();
-    throw new Error(`DeepSeek request failed: ${response.status} ${body}`);
+    throw new Error(
+      `OpenAI summary request failed: ${response.status} ${body}`,
+    );
   }
   const json = await response.json();
-  const content = json?.choices?.[0]?.message?.content ?? "{}";
+  const content = extractOpenAiOutputText(json);
   const parsed = parseModelJson(content, {
     website: null,
     logos: [],
@@ -3328,10 +3106,10 @@ Evidence: ${JSON.stringify(boundedEvidence.payload)}${reenrichmentBlock}`;
         notes ?? ""
       }`;
   }
-  const deepSeekDuration = Date.now() - summaryStartTime;
+  const summaryDuration = Date.now() - summaryStartTime;
   logInfo("Evidence summary generated", {
-    model: "deepseek-chat",
-    duration_ms: deepSeekDuration,
+    model: OPENAI_MODELS.MEDIUM,
+    duration_ms: summaryDuration,
     website: parsed.website ?? null,
     logo_count: verifiedLogos.length,
     address_count: addresses.length,
@@ -3426,6 +3204,7 @@ Triage: ${JSON.stringify(triage)}${reenrichmentBlock}`;
       roaster_name: null,
       aliases: [],
       roaster_website_url: null,
+      instagram_url: null,
       roaster_logo_url: null,
       city: null,
       state: null,
@@ -3447,26 +3226,45 @@ Triage: ${JSON.stringify(triage)}${reenrichmentBlock}`;
     proposed_name: parsed.proposed?.roaster_name ?? null,
     proposed_country: parsed.proposed?.country ?? null,
     proposed_website: parsed.proposed?.roaster_website_url ?? null,
+    proposed_instagram: parsed.proposed?.instagram_url ?? null,
   }, correlationId);
+  // Plan 030: deterministic Instagram/website routing after the model stage.
+  // A conflicting pair escalates through extraction.conflicts so the job can
+  // never complete cleanly (finalDisposition treats conflicts as unresolved).
+  const routingOutcome = applyInstagramRouting({
+    roaster_name: parsed.proposed?.roaster_name ?? null,
+    aliases,
+    roaster_website_url: parsed.proposed?.roaster_website_url ?? null,
+    instagram_url: parsed.proposed?.instagram_url ?? null,
+    roaster_logo_url: parsed.proposed?.roaster_logo_url ?? null,
+    city: parsed.proposed?.city ?? null,
+    state: parsed.proposed?.state ?? null,
+    country: parsed.proposed?.country ?? null,
+    address: parsed.proposed?.address ?? null,
+    is_roaster: typeof parsed.proposed?.is_roaster === "boolean"
+      ? parsed.proposed.is_roaster
+      : null,
+  });
+  const resultConflicts = routingOutcome.conflict
+    ? [...conflicts, routingOutcome.conflict]
+    : conflicts;
+  const resultNotes = routingOutcome.notes.length > 0
+    ? parsed.notes
+      ? `${parsed.notes} ${routingOutcome.notes.join(" ")}`
+      : routingOutcome.notes.join(" ")
+    : parsed.notes ?? null;
   return {
-    proposed: {
-      roaster_name: parsed.proposed?.roaster_name ?? null,
-      aliases,
-      roaster_website_url: parsed.proposed?.roaster_website_url ?? null,
-      roaster_logo_url: parsed.proposed?.roaster_logo_url ?? null,
-      city: parsed.proposed?.city ?? null,
-      state: parsed.proposed?.state ?? null,
-      country: parsed.proposed?.country ?? null,
-      address: parsed.proposed?.address ?? null,
-      is_roaster: typeof parsed.proposed?.is_roaster === "boolean"
-        ? parsed.proposed.is_roaster
-        : null,
+    proposed: routingOutcome.proposed,
+    instagram_routing: {
+      routed: routingOutcome.routed,
+      conflict: routingOutcome.conflict,
+      notes: routingOutcome.notes,
     },
     confidence: typeof parsed.confidence === "number"
       ? parsed.confidence
       : null,
-    conflicts,
-    notes: parsed.notes ?? null,
+    conflicts: resultConflicts,
+    notes: resultNotes,
   };
 }
 async function validateWithOpenAI(
@@ -3559,43 +3357,44 @@ Proposed: ${JSON.stringify(extraction)}.${reenrichmentBlock}`;
       ? parsed.needs_review
       : true,
   }, correlationId);
+  // Plan 030: deterministic Instagram/website routing after the model stage.
+  // A conflicting pair forces needs_review so the job is never completed.
+  const routingOutcome = applyInstagramRouting({
+    roaster_name: parsed.proposed?.roaster_name ?? null,
+    aliases: safeArray(parsed.proposed?.aliases),
+    roaster_website_url: parsed.proposed?.roaster_website_url ?? null,
+    instagram_url: parsed.proposed?.instagram_url ?? null,
+    roaster_logo_url: parsed.proposed?.roaster_logo_url ?? null,
+    city: parsed.proposed?.city ?? null,
+    state: parsed.proposed?.state ?? null,
+    country: parsed.proposed?.country ?? null,
+    address: parsed.proposed?.address ?? null,
+    is_roaster: typeof parsed.proposed?.is_roaster === "boolean"
+      ? parsed.proposed.is_roaster
+      : null,
+  });
+  const resultNotes = routingOutcome.notes.length > 0
+    ? parsed.notes
+      ? `${parsed.notes} ${routingOutcome.notes.join(" ")}`
+      : routingOutcome.notes.join(" ")
+    : parsed.notes ?? null;
   return {
-    proposed: {
-      roaster_name: parsed.proposed?.roaster_name ?? null,
-      aliases: safeArray(parsed.proposed?.aliases),
-      roaster_website_url: parsed.proposed?.roaster_website_url ?? null,
-      roaster_logo_url: parsed.proposed?.roaster_logo_url ?? null,
-      city: parsed.proposed?.city ?? null,
-      state: parsed.proposed?.state ?? null,
-      country: parsed.proposed?.country ?? null,
-      address: parsed.proposed?.address ?? null,
-      is_roaster: typeof parsed.proposed?.is_roaster === "boolean"
-        ? parsed.proposed.is_roaster
-        : null,
+    proposed: routingOutcome.proposed,
+    instagram_routing: {
+      routed: routingOutcome.routed,
+      conflict: routingOutcome.conflict,
+      notes: routingOutcome.notes,
     },
     confidence: typeof parsed.confidence === "number"
       ? parsed.confidence
       : null,
-    needs_review: typeof parsed.needs_review === "boolean"
+    needs_review: routingOutcome.conflict
+      ? true
+      : typeof parsed.needs_review === "boolean"
       ? parsed.needs_review
       : true,
-    notes: parsed.notes ?? null,
+    notes: resultNotes,
   };
-}
-function getValidationReasons(extraction) {
-  const reasons = [];
-  const proposed = extraction.proposed;
-  if (
-    !proposed.roaster_name || !proposed.roaster_website_url || !proposed.country
-  ) {
-    reasons.push("missing_required_fields");
-  }
-  if (extraction.conflicts.length > 0) reasons.push("conflicts");
-  if ((extraction.confidence ?? 0) < 0.6) reasons.push("low_confidence");
-  return reasons;
-}
-function needsValidation(extraction) {
-  return getValidationReasons(extraction).length > 0;
 }
 function computeRetryDelayMinutes(attempts) {
   const index = Math.max(0, attempts - 1);
@@ -3721,9 +3520,26 @@ async function processJob(job, correlationId) {
     stage: job.stage,
     attempts: job.attempts,
   }, correlationId);
+  if (shouldRestartForPolicyV2(job)) {
+    logWarning(
+      "Restarting legacy active job at triage for evidence policy v2",
+      {
+        job_id: job.id,
+        previous_stage: job.stage,
+        reason: "missing_evidence_policy_v2",
+      },
+      correlationId,
+    );
+    await updateJobStage(job, "triage", {
+      policy_v2_restart_applied: true,
+      reenrichment: job.stage_data?.reenrichment ?? null,
+    }, correlationId);
+    return { status: "in_progress" };
+  }
   // Stage router - dispatch to appropriate stage handler
   const stageHandlers = {
     triage: processTriageStage,
+    "search-candidates": processSearchCandidatesStage,
     // Legacy evidence stage (for backwards compatibility with existing jobs)
     evidence: processEvidenceStage,
     // New micro-stages for evidence collection
@@ -3932,6 +3748,7 @@ serve(async (req) => {
                 roaster_name: null,
                 aliases: [],
                 roaster_website_url: null,
+                instagram_url: null,
                 roaster_logo_url: null,
                 city: null,
                 state: null,
