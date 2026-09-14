@@ -1,26 +1,38 @@
+/**
+ * Legacy entry point for roaster dominant-colour extraction.
+ *
+ * The extraction pipeline now lives in `_shared/roaster-color-core.ts` so
+ * that this function and the durable `roaster-postprocess-worker` share ONE
+ * implementation. Supports the same request shapes as before: a direct
+ * `{ roaster_id }` body, or a database webhook payload.
+ *
+ * Behavioural change (2026-09 hardening): SVG mirrors are no longer answered
+ * with a silent null colour. When no colour can be produced the response is
+ * `success: false` with a typed error; only the documented "fully
+ * transparent image" rule yields success with a null colour.
+ */
+
 import { serve } from "https://deno.land/std@0.223.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.42.5";
+import { getCorsHeaders } from "../_shared/cors.ts";
+import { getEnvVar } from "../_shared/env-validation.ts";
+import { ensureImageMagickReady } from "../_shared/magick-init.ts";
 import {
-  ImageMagick,
-  initializeImageMagick,
-  MagickFormat,
-  MagickGeometry,
-} from "npm:@imagemagick/magick-wasm@0.0.30";
+  ColorCoreDeps,
+  decodeColorWithImageMagick,
+  extractRoasterDominantColor,
+} from "../_shared/roaster-color-core.ts";
 import {
-  DEFAULT_RGBA_BYTE_LENGTH,
-  DEFAULT_RESIZE_TO,
-  extractRepresentativeColorHexFromRgba,
-} from "../_shared/roaster-color.ts";
+  DbError,
+  errorToMessage,
+  SvgRasterizationUnsupportedError,
+} from "../_shared/roaster-postprocess-errors.ts";
+import { fetchLogoWithGuards } from "../_shared/roaster-logo-mirror-core.ts";
 
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers":
-    "authorization, x-client-info, apikey, content-type",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-};
+const corsHeaders = getCorsHeaders();
 
-const supabaseUrl = Deno.env.get("SUPABASE_URL");
-const supabaseServiceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+const supabaseUrl = getEnvVar("SUPABASE_URL");
+const supabaseServiceRoleKey = getEnvVar("SUPABASE_SERVICE_ROLE_KEY");
 
 if (!supabaseUrl || !supabaseServiceRoleKey) {
   throw new Error("Missing required Supabase configuration");
@@ -33,14 +45,22 @@ const supabase = createClient(supabaseUrl, supabaseServiceRoleKey, {
   },
 });
 
-const magickWasmBytes = await Deno.readFile(
-  new URL(
-    "magick.wasm",
-    import.meta.resolve("npm:@imagemagick/magick-wasm@0.0.30"),
-  ),
-);
-
-await initializeImageMagick(magickWasmBytes);
+const colorDeps: ColorCoreDeps = {
+  fetchAsset: fetchLogoWithGuards,
+  decodeColor: decodeColorWithImageMagick,
+  ensureReady: ensureImageMagickReady,
+  updateDominantColor: async (roasterId, hex) => {
+    const { error } = await supabase
+      .from("coffee_roasters")
+      .update({ dominant_color_hex: hex })
+      .eq("id", roasterId);
+    if (error) {
+      throw new DbError(
+        `Failed to update dominant color for roaster ${roasterId}: ${error.message}`,
+      );
+    }
+  },
+};
 
 interface RoasterRow {
   id: number;
@@ -75,19 +95,6 @@ function isWebhookPayload(value: unknown): value is WebhookPayload {
     "schema" in value;
 }
 
-function isSvgAsset(url: string, contentType: string | null): boolean {
-  if (contentType?.toLowerCase().includes("image/svg")) {
-    return true;
-  }
-
-  try {
-    const pathname = new URL(url).pathname.toLowerCase();
-    return pathname.endsWith(".svg");
-  } catch {
-    return url.toLowerCase().includes(".svg");
-  }
-}
-
 async function loadRoaster(roasterId: number): Promise<RoasterRow | null> {
   const { data, error } = await supabase
     .from("coffee_roasters")
@@ -102,128 +109,6 @@ async function loadRoaster(roasterId: number): Promise<RoasterRow | null> {
   return data as RoasterRow | null;
 }
 
-async function updateDominantColor(
-  roasterId: number,
-  dominantColorHex: string | null,
-): Promise<void> {
-  const { error } = await supabase
-    .from("coffee_roasters")
-    .update({
-      dominant_color_hex: dominantColorHex,
-    })
-    .eq("id", roasterId);
-
-  if (error) {
-    throw new Error(
-      `Failed to update dominant color for roaster ${roasterId}: ${error.message}`,
-    );
-  }
-}
-
-function normalizeRawPixelsToRgba(
-  rawBytes: Uint8Array,
-  pixelCount: number,
-): Uint8Array {
-  if (rawBytes.length === pixelCount * 4) {
-    return rawBytes;
-  }
-
-  if (rawBytes.length === pixelCount * 3) {
-    const rgba = new Uint8Array(pixelCount * 4);
-    for (let pixelIndex = 0; pixelIndex < pixelCount; pixelIndex += 1) {
-      const rawIndex = pixelIndex * 3;
-      const rgbaIndex = pixelIndex * 4;
-      rgba[rgbaIndex] = rawBytes[rawIndex];
-      rgba[rgbaIndex + 1] = rawBytes[rawIndex + 1];
-      rgba[rgbaIndex + 2] = rawBytes[rawIndex + 2];
-      rgba[rgbaIndex + 3] = 255;
-    }
-    return rgba;
-  }
-
-  if (rawBytes.length === pixelCount * 2) {
-    const rgba = new Uint8Array(pixelCount * 4);
-    for (let pixelIndex = 0; pixelIndex < pixelCount; pixelIndex += 1) {
-      const rawIndex = pixelIndex * 2;
-      const rgbaIndex = pixelIndex * 4;
-      const gray = rawBytes[rawIndex];
-      rgba[rgbaIndex] = gray;
-      rgba[rgbaIndex + 1] = gray;
-      rgba[rgbaIndex + 2] = gray;
-      rgba[rgbaIndex + 3] = rawBytes[rawIndex + 1];
-    }
-    return rgba;
-  }
-
-  if (rawBytes.length === pixelCount * 5) {
-    const rgba = new Uint8Array(pixelCount * 4);
-    for (let pixelIndex = 0; pixelIndex < pixelCount; pixelIndex += 1) {
-      const rawIndex = pixelIndex * 5;
-      const rgbaIndex = pixelIndex * 4;
-      const c = rawBytes[rawIndex] / 255;
-      const m = rawBytes[rawIndex + 1] / 255;
-      const y = rawBytes[rawIndex + 2] / 255;
-      const k = rawBytes[rawIndex + 3] / 255;
-
-      rgba[rgbaIndex] = Math.round(255 * (1 - c) * (1 - k));
-      rgba[rgbaIndex + 1] = Math.round(255 * (1 - m) * (1 - k));
-      rgba[rgbaIndex + 2] = Math.round(255 * (1 - y) * (1 - k));
-      rgba[rgbaIndex + 3] = rawBytes[rawIndex + 4];
-    }
-    return rgba;
-  }
-
-  if (rawBytes.length === pixelCount) {
-    const rgba = new Uint8Array(pixelCount * 4);
-    for (let pixelIndex = 0; pixelIndex < pixelCount; pixelIndex += 1) {
-      const gray = rawBytes[pixelIndex];
-      const rgbaIndex = pixelIndex * 4;
-      rgba[rgbaIndex] = gray;
-      rgba[rgbaIndex + 1] = gray;
-      rgba[rgbaIndex + 2] = gray;
-      rgba[rgbaIndex + 3] = 255;
-    }
-    return rgba;
-  }
-
-  throw new Error(
-    `Unexpected RGBA payload size ${rawBytes.length}, expected ${DEFAULT_RGBA_BYTE_LENGTH}`,
-  );
-}
-
-async function extractDominantColorHex(
-  imageUrl: string,
-): Promise<string | null> {
-  const response = await fetch(imageUrl);
-  if (!response.ok) {
-    throw new Error(`Image fetch failed with status ${response.status}`);
-  }
-
-  const contentType = response.headers.get("content-type");
-  if (isSvgAsset(imageUrl, contentType)) {
-    return null;
-  }
-
-  const bytes = new Uint8Array(await response.arrayBuffer());
-  const resizeGeometry = new MagickGeometry(DEFAULT_RESIZE_TO, DEFAULT_RESIZE_TO);
-  resizeGeometry.ignoreAspectRatio = true;
-
-  const rawPixelBytes = ImageMagick.read(bytes, (image): Uint8Array => {
-    image.resize(resizeGeometry);
-    return image.write(MagickFormat.Rgba, (data) => data);
-  });
-  const rgbaBytes = normalizeRawPixelsToRgba(
-    rawPixelBytes,
-    DEFAULT_RESIZE_TO * DEFAULT_RESIZE_TO,
-  );
-
-  return extractRepresentativeColorHexFromRgba(
-    rgbaBytes,
-    DEFAULT_RESIZE_TO,
-    DEFAULT_RESIZE_TO,
-  );
-}
-
 async function processRoaster(roaster: RoasterRow): Promise<{
   success: boolean;
   roaster_id: number;
@@ -231,7 +116,8 @@ async function processRoaster(roaster: RoasterRow): Promise<{
   error?: string;
 }> {
   if (!roaster.roaster_logo_mirror_url) {
-    await updateDominantColor(roaster.id, null);
+    // No mirror: the documented null rule — nothing to represent.
+    await colorDeps.updateDominantColor(roaster.id, null);
     return {
       success: true,
       roaster_id: roaster.id,
@@ -240,19 +126,25 @@ async function processRoaster(roaster: RoasterRow): Promise<{
   }
 
   try {
-    const dominantColorHex = await extractDominantColorHex(
-      roaster.roaster_logo_mirror_url,
-    );
-    await updateDominantColor(roaster.id, dominantColorHex);
-
+    const result = await extractRoasterDominantColor(colorDeps, {
+      roasterId: roaster.id,
+      mirrorUrl: roaster.roaster_logo_mirror_url,
+    });
     return {
       success: true,
       roaster_id: roaster.id,
-      dominant_color_hex: dominantColorHex,
+      dominant_color_hex: result.color,
     };
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    await updateDominantColor(roaster.id, null);
+    const message = errorToMessage(error);
+
+    // SVG-without-raster-asset must stay VISIBLE: writing null here would
+    // recreate the silently-null-colour behaviour this module is being
+    // migrated away from. Every other failure keeps the legacy behaviour of
+    // clearing the stored colour.
+    if (!(error instanceof SvgRasterizationUnsupportedError)) {
+      await colorDeps.updateDominantColor(roaster.id, null).catch(() => {});
+    }
     console.error("Failed to generate dominant color", {
       roasterId: roaster.id,
       roasterName: roaster.roaster_name,
@@ -361,7 +253,7 @@ serve(async (req) => {
       },
     );
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const message = errorToMessage(error);
     console.error("Unhandled dominant-color error", { error: message });
     return new Response(JSON.stringify({ error: message }), {
       status: 500,

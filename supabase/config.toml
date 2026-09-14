@@ -192,3 +192,11 @@ verify_jwt = true
 # Custom service-role bearer validation runs inside the function so this also
 # supports non-JWT `sb_secret_...` service-role keys.
 verify_jwt = false
+
+[functions.roaster-postprocess-worker]
+# Invoked by the pg_cron dispatcher via pg_net, which sends the service key
+# either as `Authorization: Bearer <legacy JWT>` or in the `apikey` header
+# (once `edge_functions_api_key` is provisioned in Vault). Platform JWT
+# verification rejects the `sb_secret_...` form, so the function validates the
+# service-role credential itself via _shared/service-role-auth.ts.
+verify_jwt = false
