@@ -6,11 +6,11 @@
  * defaults keep local development and new deployments deterministic.
  */
 
-// Groq default model — currently Qwen 3.6 27B (vision-capable: max 5 images,
+// Groq default model — currently Qwen 3.8 27B (vision-capable: max 5 images,
 // ≤4 MB base64 per request). Used for coffee-label parsing and as the primary
-// roaster-enrichment triage model. Replaced Llama 4 Scout ahead of its
-// 2026-07-17 deactivation, per Groq's recommended migration.
-export const GROQ_DEFAULT_MODEL = "qwen/qwen3.6-27b";
+// roaster-enrichment triage model. Groq withdrew the Qwen 3.6 ID, which began
+// returning 404 on 2026-09-15; Qwen 3.8 is the current Qwen 3 generation.
+export const GROQ_DEFAULT_MODEL = "qwen/qwen3.8-27b";
 
 /**
  * Groq-only sampling override that disables Qwen 3 "thinking".
@@ -22,7 +22,7 @@ export const GROQ_DEFAULT_MODEL = "qwen/qwen3.6-27b";
  * outright (`reasoning_format: "hidden"` only hides the tokens — they are
  * still generated and still spend the budget).
  *
- * The parameter is qwen3-only: `llama-3.3-70b-versatile`, which sits in
+ * The parameter is qwen3-only: `openai/gpt-oss-120b`, which sits in
  * roaster-enrichment-worker's GROQ_TRIAGE_MODELS cascade, does not accept it,
  * and gpt-oss accepts only low/medium/high. So it must be applied per model
  * rather than unconditionally — spread the result into the request body.

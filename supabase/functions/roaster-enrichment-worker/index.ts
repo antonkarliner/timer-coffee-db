@@ -113,7 +113,9 @@ const PARSE_BATCH_SIZE = 3; // Process 3 pages per invocation (increased from 1)
 const FETCH_BATCH_SIZE = 3; // Fetch 3 URLs per invocation (increased from 1)
 const GROQ_TRIAGE_MODELS = [
   GROQ_DEFAULT_MODEL,
-  "llama-3.3-70b-versatile",
+  // llama-3.3-70b-versatile was decommissioned on 2026-08-16. Keep the
+  // fallback outside the qwen/ family so it exercises a different model family.
+  "openai/gpt-oss-120b",
 ];
 const ADDRESS_REGEX =
   /\b\d{1,5}\s+[\w\.,'\-\s]{3,120},?\s+[\p{L}\s\.-]{2,80},?\s+[\p{L}\.\-\s]{2,80}\b/giu;
@@ -184,10 +186,12 @@ const EVIDENCE_SUMMARY_FORMAT = {
   },
 };
 class ProviderRetryableError extends Error {
-  status;
-  constructor(message, status) {
+  status: number;
+  body: string | null;
+  constructor(message: string, status: number, body: string | null = null) {
     super(message);
     this.status = status;
+    this.body = body;
   }
 }
 function buildReenrichmentPromptBlock(opts) {
@@ -2811,8 +2815,8 @@ async function callGroqJson(prompt, model, correlationId) {
       temperature: 0.2,
       // Qwen 3 reasons by default; its thinking tokens land in `content` and
       // break json_object enforcement with 400 json_validate_failed. Applied
-      // per model because the llama-3.3-70b fallback in GROQ_TRIAGE_MODELS
-      // does not accept reasoning_effort.
+      // per model because the openai/gpt-oss-120b fallback in
+      // GROQ_TRIAGE_MODELS does not accept reasoning_effort.
       ...groqReasoningOverride(model),
     }),
   }, {
@@ -2823,8 +2827,9 @@ async function callGroqJson(prompt, model, correlationId) {
   if (!response.ok) {
     const errorText = await response.text();
     // Retry on transient errors (429/5xx) and on a decommissioned/unavailable
-    // model, so the loop cascades to the next GROQ_TRIAGE_MODELS entry
-    // (Llama 4 Scout deactivates 2026-07-17 and returns a 4xx, not a 5xx).
+    // model, so the loop cascades to the next GROQ_TRIAGE_MODELS entry. Groq
+    // withdraws both deprecated production models and superseded preview IDs,
+    // and those failures can be 4xx responses rather than 5xx responses.
     const code = errorText.toLowerCase();
     const modelUnavailable = response.status === 404 ||
       code.includes("decommission") || code.includes("deactiv") ||
@@ -2834,6 +2839,7 @@ async function callGroqJson(prompt, model, correlationId) {
       throw new ProviderRetryableError(
         `Groq retryable error: ${response.status}`,
         response.status,
+        errorText,
       );
     }
     throw new Error(`Groq request failed: ${response.status}`);
@@ -2912,6 +2918,7 @@ Candidate names: ${candidateNames.join(" | ")}${reenrichmentBlock}`;
         logWarning("Groq triage fallback", {
           model,
           status: error.status,
+          body: error.body?.slice(0, 300) ?? null,
         }, correlationId);
         continue;
       }

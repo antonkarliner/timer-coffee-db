@@ -139,11 +139,11 @@ Deno.test("groqReasoningOverride disables reasoning for Qwen 3 models", () => {
 });
 
 Deno.test("groqReasoningOverride omits the parameter for non-Qwen models", () => {
-  // llama-3.3-70b-versatile is the second entry in roaster-enrichment-worker's
+  // openai/gpt-oss-120b is the second entry in roaster-enrichment-worker's
   // GROQ_TRIAGE_MODELS cascade. It does not accept reasoning_effort, so the
   // override must spread to nothing rather than sending an unsupported field.
   assertEquals(
-    groqReasoningOverride("llama-3.3-70b-versatile"),
+    groqReasoningOverride("openai/gpt-oss-120b"),
     {},
     "Non-Qwen Groq models must not receive reasoning_effort.",
   );
