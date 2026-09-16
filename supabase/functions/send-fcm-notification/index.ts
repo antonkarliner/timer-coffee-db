@@ -1369,9 +1369,28 @@ async function logDeliveryResults(notificationId, userId, logs) {
     });
   });
   try {
-    await Promise.all(promises);
+    // supabase-js resolves a failed rpc as { error } instead of rejecting, so a
+    // rejected promise is not how an rpc failure arrives here — the catch below
+    // only sees transport-level faults. Inspecting `error` on each settled result
+    // is the only way these become visible. Every broadcast delivery log was lost
+    // silently for months because nothing did (plan 035 §4.2).
+    const results = await Promise.all(promises);
+    const failures = results.filter((result)=>result?.error);
+    if (failures.length) {
+      const firstError = failures[0].error;
+      logError("Failed to persist notification delivery logs", new Error(firstError?.message ?? String(firstError)), ErrorCategory.DATABASE, ErrorSeverity.MEDIUM, {
+        notificationId,
+        attempted: logs.length,
+        failed: failures.length,
+        firstErrorCode: firstError?.code ?? null,
+        firstErrorMessage: firstError?.message ?? null
+      });
+    }
   } catch (error) {
-    console.error("Failed to log delivery results securely", error);
+    logError("Failed to log delivery results securely", error instanceof Error ? error : new Error(String(error)), ErrorCategory.DATABASE, ErrorSeverity.MEDIUM, {
+      notificationId,
+      attempted: logs.length
+    });
   }
 }
 async function invokeTokenCleanup() {
