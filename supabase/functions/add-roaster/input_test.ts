@@ -47,6 +47,50 @@ Deno.test("accepts address as an alias for address_text", () => {
   assertEquals(result.value.p_address_text, "1 Coffee Way");
 });
 
+Deno.test("normalizes an absent, null, or empty cluster_id to null", () => {
+  for (
+    const body of [
+      { roaster_name: "Test" },
+      { roaster_name: "Test", cluster_id: null },
+      { roaster_name: "Test", cluster_id: "" },
+    ]
+  ) {
+    const result = parseAddRoasterInput(body);
+    if (!result.ok) throw new Error(result.error);
+    assertEquals(result.clusterId, null);
+  }
+});
+
+Deno.test("accepts a valid cluster_id separately from RPC arguments", () => {
+  const clusterId = "123e4567-e89b-12d3-a456-426614174000";
+  const result = parseAddRoasterInput({
+    roaster_name: "Test",
+    cluster_id: clusterId,
+  });
+  if (!result.ok) throw new Error(result.error);
+  assertEquals(result.clusterId, clusterId);
+  assertEquals("p_cluster_id" in result.value, false);
+});
+
+Deno.test("rejects a malformed cluster_id", () => {
+  assertEquals(
+    parseAddRoasterInput({ roaster_name: "Test", cluster_id: "not-a-uuid" }),
+    {
+      ok: false,
+      status: 400,
+      error: "cluster_id must be a valid UUID",
+    },
+  );
+});
+
+Deno.test("rejects a non-string cluster_id", () => {
+  assertEquals(parseAddRoasterInput({ roaster_name: "Test", cluster_id: 42 }), {
+    ok: false,
+    status: 400,
+    error: "cluster_id must be a string or null",
+  });
+});
+
 Deno.test("normalizes aliases from JSON arrays and comma strings", () => {
   for (
     const [aliases, expected] of [

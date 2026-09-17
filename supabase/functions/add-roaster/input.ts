@@ -17,8 +17,12 @@ export type AddRoasterInputResult =
     ok: true;
     value: AddRoasterRpcArguments;
     routing: RoasterUrlRouting;
+    clusterId: string | null;
   }
   | { ok: false; status: number; error: string };
+
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export function normalizeAliases(
   value: string | null | undefined,
@@ -91,6 +95,28 @@ export function parseAddRoasterInput(
     };
   }
 
+  const rawClusterId = body.cluster_id;
+  if (
+    rawClusterId !== undefined && rawClusterId !== null &&
+    typeof rawClusterId !== "string"
+  ) {
+    return {
+      ok: false,
+      status: 400,
+      error: "cluster_id must be a string or null",
+    };
+  }
+  const clusterId = typeof rawClusterId === "string"
+    ? trimToNull(rawClusterId)
+    : null;
+  if (clusterId !== null && !UUID_PATTERN.test(clusterId)) {
+    return {
+      ok: false,
+      status: 400,
+      error: "cluster_id must be a valid UUID",
+    };
+  }
+
   const routing = routeRoasterUrls(
     body.roaster_website_url,
     body.instagram_url,
@@ -126,5 +152,6 @@ export function parseAddRoasterInput(
       p_instagram_url: trimToNull(routing.instagram_url),
     },
     routing,
+    clusterId,
   };
 }

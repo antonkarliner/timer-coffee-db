@@ -94,6 +94,33 @@ Deno.serve(async (req) => {
     }, 500);
   }
 
+  if (parsed.clusterId !== null) {
+    try {
+      const { data: stampedCount, error: resolutionError } = await supabase
+        .schema("service")
+        .rpc("apply_contribution_resolution", {
+          p_cluster_id: parsed.clusterId,
+        });
+
+      if (resolutionError) {
+        console.error("Failed to apply contribution resolution", {
+          cluster_id: parsed.clusterId,
+          error: resolutionError,
+        });
+      } else {
+        console.log("Applied contribution resolution", {
+          cluster_id: parsed.clusterId,
+          contributions_stamped: stampedCount,
+        });
+      }
+    } catch (error) {
+      console.error("Failed to apply contribution resolution", {
+        cluster_id: parsed.clusterId,
+        error,
+      });
+    }
+  }
+
   return json({
     roaster: {
       id: persisted.roaster_id,
