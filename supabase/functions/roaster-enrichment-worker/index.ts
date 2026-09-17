@@ -1010,18 +1010,13 @@ function sanitizeParsedPage(page) {
   };
 }
 async function lockNextJob(correlationId) {
-  const now = new Date().toISOString();
-  logInfo("Checking for queued enrichment jobs", {
-    run_after_lte: now,
-  }, correlationId);
-  const { data: job, error } = await supabase.schema("service").from(
-    "roaster_enrichment_jobs",
-  ).select("*").eq("state", "queued").lte("run_after", now).order("id", {
-    ascending: true,
-  }).limit(1).maybeSingle();
+  const { data: jobs, error } = await supabase.schema("service").rpc(
+    "claim_roaster_enrichment_job",
+    { p_locked_by: JOB_LOCKED_BY },
+  );
   if (error) {
     logError(
-      "Failed to fetch queued enrichment job",
+      "Failed to claim enrichment job",
       toError(error),
       ErrorCategory.DATABASE,
       ErrorSeverity.HIGH,
@@ -1030,33 +1025,9 @@ async function lockNextJob(correlationId) {
     );
     throw error;
   }
-  if (!job) {
-    logInfo("No queued enrichment jobs found", {}, correlationId);
-    return null;
-  }
-  const { data: updated, error: updateError } = await supabase.schema("service")
-    .from("roaster_enrichment_jobs").update({
-      state: "running",
-      locked_at: new Date().toISOString(),
-      locked_by: JOB_LOCKED_BY,
-    }).eq("id", job.id).eq("state", "queued").select("*").maybeSingle();
-  if (updateError) {
-    logError(
-      "Failed to lock enrichment job",
-      toError(updateError),
-      ErrorCategory.DATABASE,
-      ErrorSeverity.HIGH,
-      {
-        job_id: job.id,
-      },
-      correlationId,
-    );
-    throw updateError;
-  }
+  const updated = jobs?.[0];
   if (!updated) {
-    logWarning("Enrichment job already locked by another worker", {
-      job_id: job.id,
-    }, correlationId);
+    logInfo("No eligible enrichment jobs found", {}, correlationId);
     return null;
   }
   logInfo("Enrichment job locked", {
@@ -2277,11 +2248,14 @@ async function processFindMatchesStage(job, correlationId) {
     final_confidence,
     status,
   } = stageData;
-  // Find potential roaster matches
+  // Find potential roaster matches. find-matches runs after extract and
+  // validate, so the resolved official website is already in stage_data —
+  // pass it through as the strongest available duplicate signal.
   const potentialMatches = await findPotentialMatches(
     cluster,
     triage,
     correlationId,
+    final_proposed?.roaster_website_url ?? null,
   );
   logInfo("Potential matches found", {
     job_id: job.id,
@@ -3407,19 +3381,30 @@ function computeRetryDelayMinutes(attempts) {
   const index = Math.max(0, attempts - 1);
   return RETRY_BACKOFF_MINUTES[index] ?? null;
 }
-async function findPotentialMatches(cluster, triage, correlationId) {
+async function findPotentialMatches(
+  cluster,
+  triage,
+  correlationId,
+  websiteUrl: string | null = null,
+) {
   logInfo("Finding potential roaster matches for admin review", {
     cluster_id: cluster.id,
     normalized_name: cluster.normalized_name,
     display_name: triage.display_name,
+    has_website: !!websiteUrl,
   }, correlationId);
   try {
     // Add timeout to RPC call using Promise.race
+    // search_website_url is the enrichment-resolved official URL. Name
+    // matching alone cannot connect a cluster like "Southern Weather" (a
+    // coffee blend a user entered as the roaster) to Onyx Coffee Lab, but
+    // both resolve to onyxcoffeelab.com.
     const rpcPromise = supabase.rpc("find_potential_roaster_matches", {
       search_normalized_name: cluster.normalized_name,
       search_display_name: triage.display_name || cluster.display_name || "",
       max_results: 3,
       min_confidence: 0.65,
+      search_website_url: websiteUrl,
     });
     const timeoutPromise = new Promise((_, reject) =>
       setTimeout(() => reject(new Error("RPC timeout")), RPC_TIMEOUT_MS)

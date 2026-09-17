@@ -2,16 +2,43 @@ export const SEARCH_POLICY_SOURCE = "worker_cluster_search_v2";
 export const SEARCH_RESULT_LIMIT = 10;
 export const CANDIDATE_URL_LIMIT = 6;
 
-const AGGREGATOR_DOMAINS = [
+/**
+ * Domains that may appear as discovery *leads* but must never be fetched as
+ * evidence.
+ *
+ * These split into two groups that behave the same way here: social/UGC
+ * (facebook, reddit, threads) and directory/broker pages (yelp, mapquest,
+ * rocketreach). Both are useful for locating a roaster — a reddit thread
+ * titled "coffee roasters in and around Adelaide" is often the only thing
+ * that pins down a city — and both are unacceptable as proof of identity,
+ * domain, or address, because anyone can write them.
+ *
+ * So their titles and snippets stay in `search_evidence` (the extract and
+ * validate prompts already treat search metadata as "discovery leads, not
+ * proof"), while `candidate_urls` excludes them so the fetch/parse budget is
+ * spent only on pages that can actually establish a field.
+ */
+const LEAD_ONLY_DOMAINS = [
+  // Social / user-generated
   "facebook.com",
   "instagram.com",
   "twitter.com",
   "x.com",
   "linkedin.com",
+  "reddit.com",
+  "threads.com",
+  "threads.net",
+  "youtube.com",
+  // Directories, brokers, and review aggregators
   "yelp.com",
   "tripadvisor.com",
   "google.com",
   "foursquare.com",
+  "mapquest.com",
+  "rocketreach.co",
+  "every.coffee",
+  "directorioempresarialmexico.com",
+  // Coffee editorial — reliable reading, but still not the roaster's own site
   "sprudge.com",
   "coffeereview.com",
 ];
@@ -42,6 +69,11 @@ export interface DiscoveryResult {
   query_kind: SearchQuery["kind"] | "user_contribution";
   rank: number;
   evidence_score: number;
+  /**
+   * True when the URL may be used as a discovery lead but must not be fetched
+   * as evidence. Absent on user-contribution entries.
+   */
+  lead_only?: boolean;
   source: typeof SEARCH_POLICY_SOURCE | "user_contribution";
 }
 
@@ -77,9 +109,14 @@ export function discoveryDomain(url: string): string {
   }
 }
 
+/**
+ * True when `url` may only be used as a discovery lead, never fetched as
+ * evidence. Kept exported under the old name so existing callers and tests
+ * keep working.
+ */
 export function isAggregatorUrl(url: string): boolean {
   const domain = discoveryDomain(url);
-  return AGGREGATOR_DOMAINS.some((blocked) =>
+  return LEAD_ONLY_DOMAINS.some((blocked) =>
     domain === blocked || domain.endsWith(`.${blocked}`)
   );
 }
@@ -96,29 +133,95 @@ function meaningfulBeanContext(candidate: Record<string, unknown>): string {
     .join(" ");
 }
 
+/**
+ * Substrings that already mark a cluster name as coffee-related, in the
+ * languages that actually show up in the candidate table.
+ *
+ * Used only to decide whether appending a generic anchor to the official
+ * query is worth the words. A miss costs two redundant words in one search
+ * query and nothing else — it can never change an extracted field — so this
+ * is a cheap heuristic, not a semantic judgement about the name.
+ */
+const COFFEE_NAME_TOKENS = [
+  "coffee",
+  "caffe",
+  "caffè",
+  "cafe",
+  "café",
+  "kaffe",
+  "kaffee",
+  "koffie",
+  "kava",
+  "kawa",
+  "kopi",
+  "roast",
+  "palarnia",
+  "tostador",
+  "tueste",
+  "torref",
+  "rosteri",
+  "brygg",
+  "咖啡",
+  "コーヒー",
+  "커피",
+];
+
+function nameCarriesCoffeeSignal(name: string): boolean {
+  const haystack = name.toLocaleLowerCase();
+  return COFFEE_NAME_TOKENS.some((token) => haystack.includes(token));
+}
+
 export function buildSearchQueries(
   clusterName: string,
   candidates: Record<string, unknown>[],
 ): SearchQuery[] {
   const name = compact(clusterName);
   if (!name) return [];
+
+  // The old template was `"<name>" coffee roaster official`, which reliably
+  // surfaced roasting-*equipment* vendors (IKAWA, Diedrich, ROEST, San
+  // Franciscan). Two reasons, both fixed here:
+  //
+  //   * "coffee roaster" singular is the name of the machine; "coffee
+  //     roasters" plural is how the businesses name themselves.
+  //   * "official" matches every manufacturer's "official site" boilerplate
+  //     while adding nothing for a keyword engine.
+  //
+  // The anchor is also dropped entirely when the name already says coffee,
+  // so `"POGO Coffee Roasters"` searches for itself instead of competing
+  // with two generic words.
+  const officialQuery = nameCarriesCoffeeSignal(name)
+    ? `\"${name}\"`
+    : `\"${name}\" coffee roasters`;
   const queries: SearchQuery[] = [{
-    query: `\"${name}\" coffee roaster official`,
+    query: officialQuery,
     kind: "roaster_official",
     bean_context: null,
   }];
+
   const seen = new Set<string>();
   for (const candidate of candidates) {
     const context = meaningfulBeanContext(candidate);
     const key = context.toLocaleLowerCase();
     if (!context || seen.has(key)) continue;
     seen.add(key);
+    // The bean context used to be quoted as an exact phrase. That made the
+    // query unsatisfiable for any bean whose name is not written the way the
+    // roaster's site writes it — which is most non-English beans, and is why
+    // clusters like "Фильтр Эфиопия Ненсебо" returned zero bean evidence and
+    // were sent to review for lacking it. The roaster name stays quoted
+    // because it is the identity anchor; the bean terms are now loose.
     queries.push({
-      query: `\"${name}\" \"${context}\" coffee`,
+      query: `\"${name}\" ${context}`,
       kind: "roaster_bean",
       bean_context: context,
     });
-    if (queries.length >= 4) break;
+    // Three queries instead of four. Each query contributes at most 5 raw
+    // results against a SEARCH_RESULT_LIMIT of 10, so the fourth mostly added
+    // ranking competition rather than kept results — and cutting it returns
+    // ~25% of the daily Google CSE free-tier budget to the 1.7k-cluster
+    // backlog.
+    if (queries.length >= 3) break;
   }
   return queries;
 }
@@ -127,13 +230,18 @@ function scoreResult(
   kind: SearchQuery["kind"],
   rank: number,
   domain: string,
+  leadOnly: boolean,
 ): number {
   const queryBoost = kind === "roaster_bean" ? 35 : 20;
   const rankScore = Math.max(0, 12 - rank * 2);
   const roasterHint = /coffee|cafe|café|roast|kaffee|koffie|caffe/.test(domain)
     ? 5
     : 0;
-  return queryBoost + rankScore + roasterHint;
+  // Lead-only domains now stay in the evidence record, so they have to rank
+  // below anything fetchable or a page of Yelp listings could crowd the real
+  // roaster out of the SEARCH_RESULT_LIMIT slots.
+  const leadPenalty = leadOnly ? 25 : 0;
+  return queryBoost + rankScore + roasterHint - leadPenalty;
 }
 
 export async function discoverCandidateSources(options: {
@@ -163,9 +271,12 @@ export async function discoverCandidateSources(options: {
     }
     rawResults.slice(0, 5).forEach((result, index) => {
       const url = normalizeDiscoveryUrl(result.link ?? result.url);
-      if (!url || isAggregatorUrl(url)) return;
+      if (!url) return;
       const domain = discoveryDomain(url);
       if (!domain) return;
+      // Lead-only results are kept here for their title and snippet, and
+      // filtered out of candidate_urls below.
+      const leadOnly = isAggregatorUrl(url);
       ranked.push({
         title: compact(result.title) || null,
         url,
@@ -174,7 +285,8 @@ export async function discoverCandidateSources(options: {
         query: query.query,
         query_kind: query.kind,
         rank: index + 1,
-        evidence_score: scoreResult(query.kind, index + 1, domain),
+        evidence_score: scoreResult(query.kind, index + 1, domain, leadOnly),
+        lead_only: leadOnly,
         source: SEARCH_POLICY_SOURCE,
       });
     });
@@ -199,6 +311,8 @@ export async function discoverCandidateSources(options: {
     seenDomains.add(discoveryDomain(contributed));
   }
   for (const result of results) {
+    // Leads inform the prompt but never spend a fetch.
+    if (result.lead_only) continue;
     if (seenDomains.has(result.domain)) continue;
     candidateUrls.push(result.url);
     seenDomains.add(result.domain);
