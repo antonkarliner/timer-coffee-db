@@ -1,6 +1,7 @@
 import {
   GROQ_DEFAULT_MODEL,
   groqReasoningOverride,
+  JEV_MODEL,
   OPENAI_MODELS,
   OPENAI_SPECIALIZED_MODELS,
   resolveOpenAiModelSettings,
@@ -151,5 +152,17 @@ Deno.test("groqReasoningOverride omits the parameter for non-Qwen models", () =>
     groqReasoningOverride("openai/gpt-oss-20b"),
     {},
     "gpt-oss accepts only low/medium/high, never 'none'.",
+  );
+});
+
+Deno.test("JEV_MODEL resolves the TYPESAFE_MODEL override with the reviewed default", () => {
+  // The TypeSafe AI decision model is not an OpenAI tier; it is read from the
+  // environment at module load with the same trim-then-default style as the
+  // other providers, so pin both the env var name and the default here.
+  const override = Deno.env.get("TYPESAFE_MODEL")?.trim();
+  assertEquals(
+    JEV_MODEL,
+    override || "jev-latest",
+    "JEV_MODEL must track the trimmed TYPESAFE_MODEL override and default to jev-latest.",
   );
 });

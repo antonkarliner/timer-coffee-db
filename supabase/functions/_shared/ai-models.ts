@@ -146,3 +146,15 @@ export const VERCEL_GATEWAY_DEFAULT_MODEL = "google/gemma-4-31b-it";
 export const ZAI_BASE_URL = Deno.env.get("Z_AI_BASE_URL") ??
   "https://api.z.ai/api/coding/paas/v4";
 export const ZAI_DEFAULT_MODEL = "glm-5.3-flash";
+
+// TypeSafe AI "Jev" — a decision model, not a generative one: callers send
+// shared state plus typed questions (noul/choice/score) and receive typed
+// answers with calibrated probabilities. It never emits free text, so it
+// replaces classification-shaped decisions that would otherwise cost a
+// generative call and does not belong in OPENAI_MODELS. Consumed through
+// _shared/jev-client.ts.
+export const JEV_MODEL = readModelOverride(
+  (name) => Deno.env.get(name),
+  "TYPESAFE_MODEL",
+  "jev-latest",
+);
