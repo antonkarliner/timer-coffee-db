@@ -86,3 +86,6 @@ supabase/seed.sql.backup
 
 # delegate-glm scratch worktrees and their run logs (reached 41MB on 2026-09-16)
 .claude/worktrees/
+
+# Roaster candidate review batches (local working data)
+scripts/roaster-review/
