@@ -193,6 +193,11 @@ verify_jwt = true
 # supports non-JWT `sb_secret_...` service-role keys.
 verify_jwt = false
 
+[functions.notify-blog-subscribers]
+# Sanity cannot supply a Supabase JWT. The function authenticates the raw
+# request with Sanity's HMAC signature before reading subscriber data.
+verify_jwt = false
+
 [functions.roaster-postprocess-worker]
 # Invoked by the pg_cron dispatcher via pg_net, which sends the service key
 # either as `Authorization: Bearer <legacy JWT>` or in the `apikey` header
