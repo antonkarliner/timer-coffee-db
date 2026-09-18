@@ -153,6 +153,10 @@ interface DbStubConfig {
   /** Raw RPC rows per call, in order; missing entries -> null (empty). */
   rpcResults?: Array<Array<Record<string, unknown>> | null>;
   rpcThrows?: Error;
+  /** Scalar resolve_coffee_roaster_id result; undefined -> null (no match). */
+  resolverResult?: unknown;
+  resolverError?: { message: string } | null;
+  resolverThrows?: Error;
   metaRows?: Array<Record<string, unknown>>;
   insertError?: { message: string } | null;
   insertRejects?: Error;
@@ -162,6 +166,7 @@ interface DbStubConfig {
 
 function makeDbStub(config: DbStubConfig = {}) {
   const rpcCalls: Array<Record<string, unknown>> = [];
+  const resolverCalls: Array<Record<string, unknown>> = [];
   const insertedRows: Array<Record<string, unknown>> = [];
   const metaQueries: Array<(string | number)[]> = [];
   const flagQueries: string[][] = [];
@@ -223,7 +228,22 @@ function makeDbStub(config: DbStubConfig = {}) {
         insert: insertHandler,
       };
     },
-    rpc(_fn: string, args: Record<string, unknown>) {
+    rpc(fn: string, args: Record<string, unknown>) {
+      // The resolver runs concurrently with retrieval, so RPCs must dispatch
+      // on function name, not call order.
+      if (fn === "resolve_coffee_roaster_id") {
+        resolverCalls.push(args);
+        if (config.resolverThrows) return Promise.reject(config.resolverThrows);
+        if (config.resolverError) {
+          return Promise.resolve({ data: null, error: config.resolverError });
+        }
+        return Promise.resolve({
+          data: config.resolverResult === undefined
+            ? null
+            : config.resolverResult,
+          error: null,
+        });
+      }
       if (config.rpcThrows) return Promise.reject(config.rpcThrows);
       rpcCalls.push(args);
       const result = config.rpcResults
@@ -233,7 +253,14 @@ function makeDbStub(config: DbStubConfig = {}) {
       return Promise.resolve({ data: result, error: null });
     },
   };
-  return { db, rpcCalls, insertedRows, metaQueries, flagQueries };
+  return {
+    db,
+    rpcCalls,
+    resolverCalls,
+    insertedRows,
+    metaQueries,
+    flagQueries,
+  };
 }
 
 interface JevStub {
@@ -716,6 +743,11 @@ rlTest(
       0,
       "the skip path must not touch the database",
     );
+    assertEquals(
+      db.resolverCalls.length,
+      0,
+      "the skip path must not call the deterministic resolver",
+    );
     assertEquals(jev.calls.length, 0, "the skip path must not call Jev");
     assertEquals(
       db.insertedRows.length,
@@ -733,6 +765,11 @@ rlTest("runRoasterLink mode off does nothing at all", async () => {
     null,
   );
   assertEquals(db.rpcCalls.length, 0, "off mode must not call the RPC");
+  assertEquals(
+    db.resolverCalls.length,
+    0,
+    "off mode must not call the deterministic resolver",
+  );
   assertEquals(jev.calls.length, 0, "off mode must not call Jev");
   assertEquals(db.insertedRows.length, 0, "off mode must not write eval rows");
 });
@@ -1023,6 +1060,138 @@ rlTest(
       call.opts?.timeoutMs,
       3000,
       "shadow mode may use the generous Jev timeout",
+    );
+  },
+);
+
+// ---------------------------------------------------------------------------
+// runRoasterLink — deterministic resolver (eval-row telemetry only)
+// ---------------------------------------------------------------------------
+
+rlTest(
+  "runRoasterLink records the deterministic resolver's id in the eval row",
+  async () => {
+    const db = makeDbStub({
+      rpcResults: [PHOENIX_RPC_ROWS],
+      metaRows: PHOENIX_META,
+      resolverResult: 42,
+    });
+    const jev = makeJevStub(CONFIDENT_ANSWER);
+    await captureConsoleInfo(() =>
+      runRoasterLink(makeDeps(db.db, jev), LABEL_RESULT, { mode: "shadow" })
+    );
+    assertEquals(
+      db.resolverCalls,
+      [{ p_roaster_name: "Phoenix Coffee Roasters" }],
+      "the raw roaster string goes to resolve_coffee_roaster_id",
+    );
+    assertEquals(db.insertedRows.length, 1, "one eval row");
+    assertEquals(
+      db.insertedRows[0].deterministic_roaster_id,
+      42,
+      "the resolver's answer is recorded alongside the Jev decision",
+    );
+    assertEquals(db.insertedRows[0].outcome, "linked");
+    assertEquals(db.insertedRows[0].linked_roaster_id, 42);
+  },
+);
+
+rlTest(
+  "runRoasterLink still writes the same eval row when the resolver fails",
+  async () => {
+    const failures: DbStubConfig[] = [
+      { resolverError: { message: "resolver boom" } },
+      { resolverThrows: new Error("resolver exploded") },
+    ];
+    for (const failure of failures) {
+      const db = makeDbStub({
+        rpcResults: [PHOENIX_RPC_ROWS],
+        metaRows: PHOENIX_META,
+        ...failure,
+      });
+      const jev = makeJevStub(CONFIDENT_ANSWER);
+      const { result } = await captureConsoleInfo(() =>
+        runRoasterLink(makeDeps(db.db, jev), LABEL_RESULT, { mode: "shadow" })
+      );
+      assertEquals(result, null, "a resolver failure must not throw");
+      assertEquals(db.insertedRows.length, 1, "the row is still written");
+      assertEquals(
+        db.insertedRows[0].outcome,
+        "linked",
+        "the outcome is unchanged",
+      );
+      assertEquals(
+        db.insertedRows[0].deterministic_roaster_id,
+        null,
+        "a resolver failure is recorded as null",
+      );
+      assertEquals(
+        db.insertedRows[0].linked_roaster_id,
+        42,
+        "the Jev decision is unaffected",
+      );
+    }
+  },
+);
+
+rlTest(
+  "runRoasterLink does not call the resolver when the run is skipped",
+  async () => {
+    const db = makeDbStub({ resolverResult: 42 });
+    const jev = makeJevStub(CONFIDENT_ANSWER);
+    for (
+      const result of [
+        { roaster: "   " },
+        {},
+        { error: "No coffee labels detected" },
+      ]
+    ) {
+      await runRoasterLink(makeDeps(db.db, jev), result, {
+        mode: "shadow",
+        correlationId: "req-8",
+      });
+    }
+    assertEquals(
+      db.resolverCalls.length,
+      0,
+      "the resolver must not run for a skipped run",
+    );
+    assertEquals(db.insertedRows.length, 0, "no eval rows either");
+  },
+);
+
+rlTest(
+  "runRoasterLink coerces a numeric-string resolver result and nulls junk",
+  async () => {
+    const jev = makeJevStub(CONFIDENT_ANSWER);
+    const stringDb = makeDbStub({
+      rpcResults: [PHOENIX_RPC_ROWS],
+      metaRows: PHOENIX_META,
+      resolverResult: "42",
+    });
+    await captureConsoleInfo(() =>
+      runRoasterLink(makeDeps(stringDb.db, jev), LABEL_RESULT, {
+        mode: "shadow",
+      })
+    );
+    assertEquals(
+      stringDb.insertedRows[0].deterministic_roaster_id,
+      42,
+      "a bigint arriving as a numeric string is stored as a number",
+    );
+
+    const junkDb = makeDbStub({
+      rpcResults: [PHOENIX_RPC_ROWS],
+      metaRows: PHOENIX_META,
+      resolverResult: "not-a-number",
+    });
+    await captureConsoleInfo(() =>
+      runRoasterLink(makeDeps(junkDb.db, jev), LABEL_RESULT, { mode: "shadow" })
+    );
+    assertEquals(
+      junkDb.insertedRows[0].deterministic_roaster_id,
+      null,
+      "a non-numeric resolver result is recorded as null",
     );
   },
 );

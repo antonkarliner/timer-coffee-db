@@ -142,6 +142,13 @@ export interface JevEvalRoasterLinkRow {
   outcome: RoasterLinkEvalOutcome;
   raw_roaster: string;
   roaster_brand_name: string | null;
+  /**
+   * public.resolve_coffee_roaster_id(raw_roaster) at decision time: what the
+   * existing deterministic matcher makes of the same string, so shadow data
+   * can separate scans it already handles from scans it cannot. null when the
+   * matcher could not resolve the string (or the lookup failed / never ran).
+   */
+  deterministic_roaster_id: number | null;
   /** Exactly what was sent to Jev; null when Jev never ran. */
   jev_state: Record<string, string> | null;
   candidate_ids: number[] | null;
@@ -453,6 +460,43 @@ async function retrieveCandidates(
 }
 
 /**
+ * The production deterministic resolver, for the eval row only: shadow
+ * telemetry comparing the Jev decision against what
+ * public.resolve_coffee_roaster_id already makes of the raw string. Never
+ * throws: an RPC error or exception logs and resolves to null, so it can
+ * never affect the linking decision.
+ */
+async function resolveDeterministicRoasterId(
+  db: RoasterLinkDb,
+  rawRoaster: string,
+): Promise<number | null> {
+  try {
+    const { data, error } = await db.rpc("resolve_coffee_roaster_id", {
+      p_roaster_name: rawRoaster,
+    });
+    if (error) {
+      logError(
+        "roaster_link: deterministic resolver failed",
+        undefined,
+        ErrorCategory.DATABASE,
+        ErrorSeverity.LOW,
+        { reason: error.message },
+      );
+      return null;
+    }
+    return toFiniteNumber(data);
+  } catch (error) {
+    logError(
+      "roaster_link: deterministic resolver threw",
+      error instanceof Error ? error : undefined,
+      ErrorCategory.DATABASE,
+      ErrorSeverity.LOW,
+    );
+    return null;
+  }
+}
+
+/**
  * Fetch city/country/aliases for the candidate ids in ONE select. Failure
  * degrades to name-only criteria (candidate rows always carry the catalog
  * name), never an abort of the whole pipeline.
@@ -575,6 +619,14 @@ export async function runRoasterLink(
         : Number.POSITIVE_INFINITY));
   let evalRowAttempted = false;
 
+  // Deterministic resolver, for the eval row only: its RPC is issued here,
+  // concurrently with candidate retrieval, so it adds no latency. Never
+  // throws; awaited only when an eval row is about to be written.
+  const deterministicRoasterIdPending = resolveDeterministicRoasterId(
+    deps.db,
+    rawRoaster,
+  );
+
   try {
     // --- Retrieval: raw roaster, plus brand name when it differs. ---
     const searches: Array<{ displayName: string; searchNormalized: string }> = [
@@ -616,6 +668,8 @@ export async function runRoasterLink(
 
     const candidates = mergeCandidates(lists, MAX_CANDIDATES);
     const latencyMs = () => Date.now() - startedAt;
+    // Awaited only after retrieval, alongside which it has been running.
+    const deterministicRoasterId = await deterministicRoasterIdPending;
 
     if (candidates.length === 0) {
       // Zero candidates: skip Jev entirely but still record the outcome.
@@ -634,6 +688,7 @@ export async function runRoasterLink(
         outcome,
         raw_roaster: rawRoaster,
         roaster_brand_name: brandName,
+        deterministic_roaster_id: deterministicRoasterId,
         jev_state: null, // Jev never ran
         candidate_ids: [],
         trigram_top_id: null,
@@ -711,6 +766,7 @@ export async function runRoasterLink(
       outcome,
       raw_roaster: rawRoaster,
       roaster_brand_name: brandName,
+      deterministic_roaster_id: deterministicRoasterId,
       jev_state: answer === null ? null : state,
       candidate_ids: candidates.map((c) => c.roasterId),
       trigram_top_id: candidates[0].roasterId,
@@ -755,6 +811,7 @@ export async function runRoasterLink(
         outcome: "error",
         raw_roaster: rawRoaster,
         roaster_brand_name: brandName,
+        deterministic_roaster_id: await deterministicRoasterIdPending,
         jev_state: null,
         candidate_ids: null,
         trigram_top_id: null,
