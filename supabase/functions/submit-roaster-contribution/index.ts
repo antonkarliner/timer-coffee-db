@@ -120,7 +120,7 @@ Deno.serve(async (req) => {
     // Bean→candidate lag: the cluster does not exist yet. The app retries later.
     return json({ status: "no_cluster" }, 200, cors);
   }
-  if (clusterStatus !== "pending") {
+  if (clusterStatus !== "pending" && clusterStatus !== "held") {
     return json(
       { status: "not_pending", cluster_status: clusterStatus },
       200,
@@ -189,31 +189,14 @@ Deno.serve(async (req) => {
     return json({ error: upsertErr.message }, 500, cors);
   }
 
-  // 6) Ensure an enrichment pass is queued so the worker re-runs with the new
-  //    website signal. Skip if one is already queued/running for this cluster.
-  const { data: activeJobs, error: jobQueryErr } = await supabase
-    .schema("service")
-    .from("roaster_enrichment_jobs")
-    .select("id")
-    .eq("cluster_id", clusterId)
-    .in("state", ["queued", "running"])
-    .limit(1);
-
-  if (jobQueryErr) {
-    console.error("enrichment job lookup failed:", jobQueryErr);
-  } else if (!activeJobs || activeJobs.length === 0) {
-    const { error: jobInsertErr } = await supabase
-      .schema("service")
-      .from("roaster_enrichment_jobs")
-      .insert({
-        cluster_id: clusterId,
-        state: "queued",
-        stage: "triage",
-        run_after: nowIso,
-      });
-    if (jobInsertErr) {
-      console.error("enrichment job enqueue failed:", jobInsertErr);
-    }
+  // The DB locks the cluster before enqueueing. A hold remains in effect even
+  // when it was applied after our target lookup; the contribution is preserved.
+  const { error: enqueueError } = await supabase.schema("service").rpc(
+    "enqueue_roaster_enrichment",
+    { p_cluster_id: clusterId },
+  );
+  if (enqueueError) {
+    console.error("enrichment job enqueue failed:", enqueueError);
   }
 
   return json(
