@@ -289,7 +289,7 @@ serve(async (req)=>{
       throw new Error(`${provider} returned an invalid JSON response`);
     }
   }
-  // --- Vercel AI Gateway processing (primary) ---
+  // --- Vercel AI Gateway processing (fallback after Z.ai) ---
   // OpenAI-compatible wire format, so this mirrors the Cerebras path below.
   const processWithVercelGateway = async (base64Images, systemPrompt, _responseSchema: ProviderResponseSchema)=>{
     const userContent = [
@@ -781,7 +781,15 @@ serve(async (req)=>{
     // gemma-4-31b is dropped from the shared tier on 2026-09-03 for
     // qwen-3.8-27b. processWithCerebras is kept below: if the account is ever
     // funded, re-adding a `{ key: 'cerebras', ... }` entry here restores it.
-    // The Vercel gateway serves the same Gemma 4 31B on a $5/month free credit.
+    //
+    // The Vercel gateway tier's model is VERCEL_GATEWAY_DEFAULT_MODEL in
+    // _shared/ai-models.ts. From 2026-09-15 to 2026-09-18 it was dead (the
+    // previous model lost free-tier eligibility, 403 on every call), which
+    // cost a 0.7-1.8s round trip on every Z.ai fallback and a spurious
+    // roast_date_recheck_failed on every re-check, since it is the first
+    // re-check candidate after a Z.ai parse. If it goes dark again, a steady
+    // vercel_gateway_http_error 403 is the signal: re-probe, or drop this
+    // entry.
     const providerChain = [
       { key: 'zai', configured: !!zaiApiKey, run: processWithZai },
       { key: 'vercel', configured: !!aiGatewayApiKey, run: processWithVercelGateway },

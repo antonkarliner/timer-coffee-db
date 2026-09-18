@@ -105,8 +105,13 @@ const PROVIDERS: Record<string, Provider> = {
 // fails with 400 json_validate_failed) but does NOT stop the tokens being
 // generated — hence the raised completion budget.
 const MODELS: [string, string, string, Record<string, unknown>, string?][] = [
-  // Reference: what production runs today.
-  ["vercel gemma (PROD)", "vercel", "google/gemma-4-31b-it", {}],
+  // Reference: the gateway model production used before today.
+  ["vercel gemma-31b (PROD until 2026-09-15)", "vercel", "google/gemma-4-31b-it", {}],
+  // Replaced gemma-4-31b-it after it started answering 403
+  // no_providers_available on 2026-09-15. MoE with ~4B active parameters, so
+  // expect it to trail 31B on small print; upstreams per the catalog on
+  // 2026-09-18: gmicloud, novita, parasail, vertex.
+  ["vercel gemma-26b-a4b (PROD)", "vercel", "google/gemma-4-26b-a4b-it", {}],
   // GLM-5.3-flash think:off across the three prompt variants above — same
   // model/config, only the translate-instruction placement changes, to see
   // whether prompt placement (not model choice) is what fixes non-English
@@ -503,8 +508,10 @@ async function probe(
 // enough usable samples to say anything about it.
 const onlyArg = Deno.args.find((a) => a.startsWith("--only="));
 const only = onlyArg ? onlyArg.slice("--only=".length) : null;
+// Comma-separated to pit specific variants against each other in one run.
 const RUNNABLE = MODELS.filter(([label, prov]) =>
-  PROVIDERS[prov].key && (!only || label.includes(only))
+  PROVIDERS[prov].key &&
+  (!only || only.split(",").some((o) => label.includes(o)))
 );
 if (RUNNABLE.length === 0) {
   console.error(`--only=${only} matched no variant with an available key.`);

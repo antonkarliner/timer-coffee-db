@@ -127,12 +127,21 @@ export const CEREBRAS_DEFAULT_MODEL = "gemma-4-31b";
 // that refresh every 30 days across a subset of the catalog; buying credits
 // ends that allocation permanently, so do not top up to "test" something.
 //
-// gemma-4-31b-it is the same Gemma 4 31B the coffee-label prompts were tuned
-// for on Cerebras, and it is free-tier eligible (verified 2026-08-21). At the
-// measured label-parse shape (~3.8k in / ~300 out) the whole monthly volume
-// costs roughly $0.42 against the $5 credit.
+// google/gemma-4-31b-it served this tier from 2026-08-21 until it lost
+// free-tier eligibility on 2026-09-15 (403 RestrictedModelsError, reported
+// with type no_providers_available: "Free tier users do not have access to
+// this model").
+//
+// gemma-4-26b-a4b-it replaced it on 2026-09-18 (free-tier eligible, served
+// via vertex). Probed on 6 real bag photos x 3 rounds against the Z.ai GLM
+// primary: roast dates 6/6 correct including a handwritten DD.MM.YY, never
+// invented a date for a blank field, field accuracy comparable to GLM with
+// different small misses. But 6 of 18 calls hit 429 at 20s spacing even after
+// retries, so the free allowance is thin — acceptable for a fallback tier
+// that sees a handful of calls a day, not for a primary. Eligibility changes
+// without notice: re-verify with scripts/label-model-probe.ts.
 export const VERCEL_GATEWAY_BASE_URL = "https://ai-gateway.vercel.sh/v1";
-export const VERCEL_GATEWAY_DEFAULT_MODEL = "google/gemma-4-31b-it";
+export const VERCEL_GATEWAY_DEFAULT_MODEL = "google/gemma-4-26b-a4b-it";
 
 // Z.ai (GLM) — OpenAI-compatible endpoint. Measured against 150 real
 // parse-coffee-label user labels: GLM-5.3-flash beat the Vercel-gateway
