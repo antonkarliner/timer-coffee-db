@@ -6,6 +6,8 @@
  *   - stale source-revision guard (never overwrite a newer logo);
  *   - image-job concurrency cap (mirror_logo + extract_color COMBINED);
  *   - attach_beans pool with its own higher concurrency;
+ *   - generate_embedding pool with the same higher concurrency (a cheap
+ *     network call, no ImageMagick working set);
  *   - per-job try/catch — one throwing job never takes down the invocation;
  *   - every claimed job is finished exactly once;
  *   - summary tally { claimed, succeeded, failed, retried, skipped }.
@@ -17,6 +19,7 @@ export const JOB_KINDS = [
   "mirror_logo",
   "extract_color",
   "attach_beans",
+  "generate_embedding",
 ] as const;
 export type JobKind = (typeof JOB_KINDS)[number];
 
@@ -32,6 +35,14 @@ export const IMAGE_JOB_CONCURRENCY = 2;
 /** attach_beans only invokes a cheap DB RPC — safe to run 5 at a time. */
 export const ATTACH_JOB_CONCURRENCY = 5;
 
+/**
+ * generate_embedding sits with attach_beans rather than the image cap: it is
+ * a single OpenAI HTTP call with no ImageMagick working set, so its memory
+ * profile is negligible and the real limit is provider rate limiting, not
+ * peak memory.
+ */
+export const EMBEDDING_JOB_CONCURRENCY = 5;
+
 /** A row of service.roaster_postprocess_jobs as returned by claim_roaster_jobs. */
 export interface PostprocessJob {
   id: number;
@@ -46,6 +57,8 @@ export interface PostprocessJob {
 export interface RoasterSnapshot {
   id: number;
   roaster_name: string | null;
+  /** Raw alias list — the generate_embedding input is built from this. */
+  aliases: string | null;
   normalized_name: string | null;
   normalized_aliases: string | null;
   roaster_logo_url: string | null;
@@ -73,6 +86,10 @@ export interface RunnerDeps {
     job: PostprocessJob,
     snapshot: RoasterSnapshot,
   ): Promise<void>;
+  processGenerateEmbedding(
+    job: PostprocessJob,
+    snapshot: RoasterSnapshot,
+  ): Promise<void>;
   finishJob(job: PostprocessJob, outcome: FinishOutcome): Promise<void>;
 }
 
@@ -97,9 +114,12 @@ export interface RunSummary {
  * Current identity of the input a job of `kind` would process.
  * MUST stay byte-identical to the source_revision semantics in the
  * `service.roaster_postprocess_jobs` contract:
- *   mirror_logo   -> coffee_roasters.roaster_logo_url
- *   extract_color -> coffee_roasters.roaster_logo_mirror_url
- *   attach_beans  -> coalesce(normalized_name,'') || '|' || coalesce(normalized_aliases,'')
+ *   mirror_logo        -> coffee_roasters.roaster_logo_url
+ *   extract_color      -> coffee_roasters.roaster_logo_mirror_url
+ *   attach_beans       -> coalesce(normalized_name,'') || '|' || coalesce(normalized_aliases,'')
+ *   generate_embedding -> coalesce(roaster_name,'') || '|' || coalesce(aliases,'')
+ * (generate_embedding uses the RAW columns, not the normalized ones, because
+ * the embedded text is built from the raw columns.)
  */
 export function currentSourceRevision(
   kind: JobKind,
@@ -114,6 +134,8 @@ export function currentSourceRevision(
       return `${snapshot.normalized_name ?? ""}|${
         snapshot.normalized_aliases ?? ""
       }`;
+    case "generate_embedding":
+      return `${snapshot.roaster_name ?? ""}|${snapshot.aliases ?? ""}`;
   }
 }
 
@@ -136,12 +158,14 @@ export async function runBatch(
 
   const imageJobs = jobs.filter((job) => isImageJob(job.kind));
   const attachJobs = jobs.filter((job) => job.kind === "attach_beans");
+  const embeddingJobs = jobs.filter((job) => job.kind === "generate_embedding");
 
-  // The two pools run concurrently; the caps are per-pool so an attach burst
-  // can never add to the image pipeline's peak memory.
+  // The three pools run concurrently; the caps are per-pool so an attach or
+  // embedding burst can never add to the image pipeline's peak memory.
   await Promise.all([
     runPool(deps, summary, imageJobs, IMAGE_JOB_CONCURRENCY),
     runPool(deps, summary, attachJobs, ATTACH_JOB_CONCURRENCY),
+    runPool(deps, summary, embeddingJobs, EMBEDDING_JOB_CONCURRENCY),
   ]);
   return summary;
 }
@@ -222,6 +246,9 @@ async function processOne(
         break;
       case "attach_beans":
         await deps.processAttachBeans(job, snapshot);
+        break;
+      case "generate_embedding":
+        await deps.processGenerateEmbedding(job, snapshot);
         break;
     }
 

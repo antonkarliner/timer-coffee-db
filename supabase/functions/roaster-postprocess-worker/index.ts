@@ -7,9 +7,10 @@
  * path that produced silent HTTP 503/546 failures with no retry.
  *
  * Job kinds:
- *   attach_beans  -> RPC public.attach_pending_global_beans_for_roaster
- *   mirror_logo   -> _shared/roaster-logo-mirror-core.ts (mirror pipeline)
- *   extract_color -> _shared/roaster-color-core.ts (dominant colour)
+ *   attach_beans       -> RPC public.attach_pending_global_beans_for_roaster
+ *   mirror_logo        -> _shared/roaster-logo-mirror-core.ts (mirror pipeline)
+ *   extract_color      -> _shared/roaster-color-core.ts (dominant colour)
+ *   generate_embedding -> _shared/roaster-embedding-core.ts (name embedding)
  *
  * Every failure is classified (retryable vs terminal) into the durable job
  * ledger, so a failed logo job is database-visible and retried with
@@ -17,6 +18,7 @@
  */
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.42.5";
+import { OPENAI_SPECIALIZED_MODELS } from "../_shared/ai-models.ts";
 import { getCorsHeaders } from "../_shared/cors.ts";
 import { ensureImageMagickReady } from "../_shared/magick-init.ts";
 import { getEnvVar } from "../_shared/env-validation.ts";
@@ -44,6 +46,7 @@ import {
   decodeColorWithImageMagick,
   extractRoasterDominantColor,
 } from "../_shared/roaster-color-core.ts";
+import { generateRoasterNameEmbedding } from "../_shared/roaster-embedding-core.ts";
 import { DbError } from "../_shared/roaster-postprocess-errors.ts";
 import { classifyFailure, errorToMessage } from "./failure-classification.ts";
 import {
@@ -208,7 +211,7 @@ function buildRunnerDeps(
       const { data, error } = await publicClient
         .from("coffee_roasters")
         .select(
-          "id, roaster_name, normalized_name, normalized_aliases, roaster_logo_url, roaster_logo_mirror_url",
+          "id, roaster_name, aliases, normalized_name, normalized_aliases, roaster_logo_url, roaster_logo_mirror_url",
         )
         .eq("id", roasterId)
         .maybeSingle();
@@ -257,6 +260,35 @@ function buildRunnerDeps(
           `attach_pending_global_beans_for_roaster failed: ${error.message}`,
         );
       }
+    },
+    processGenerateEmbedding: async (job, snapshot) => {
+      await generateRoasterNameEmbedding({
+        // Read at job time, NOT at module scope: this worker also runs
+        // mirror_logo, extract_color and attach_beans, and a module-scope
+        // throw on a missing key would take the entire pipeline down. A
+        // missing key fails only this embedding job (EmbeddingConfigError).
+        openAiApiKey: Deno.env.get("OPENAI_API_KEY"),
+        model: OPENAI_SPECIALIZED_MODELS.EMBEDDING,
+        fetchImpl: fetch,
+        updateRoasterEmbedding: async (roasterId, embedding) => {
+          const { error } = await publicClient
+            .from("coffee_roasters")
+            .update({
+              name_embedding: embedding,
+              embedding_updated_at: new Date().toISOString(),
+            })
+            .eq("id", roasterId);
+          if (error) {
+            throw new DbError(
+              `Failed to set name_embedding: ${error.message}`,
+            );
+          }
+        },
+      }, {
+        roasterId: job.roaster_id,
+        roasterName: snapshot.roaster_name,
+        aliases: snapshot.aliases,
+      });
     },
     finishJob: async (job, outcome) => {
       const { error } = await serviceClient.rpc("finish_roaster_job", {

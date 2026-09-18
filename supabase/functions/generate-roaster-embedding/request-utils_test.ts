@@ -1,4 +1,5 @@
-import { buildEmbeddingInput, parseRoasterId } from "./request-utils.ts";
+// buildEmbeddingInput cases moved to ../_shared/roaster-embedding-core_test.ts
+import { parseRoasterId } from "./request-utils.ts";
 
 function assertEquals<T>(actual: T, expected: T, message: string): void {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
@@ -31,27 +32,4 @@ Deno.test("parseRoasterId accepts only positive safe integers", () => {
       `Expected ${String(invalid)} to be rejected.`,
     );
   }
-});
-
-Deno.test("buildEmbeddingInput uses canonical names and normalized aliases", () => {
-  assertEquals(
-    buildEmbeddingInput("  Tim Wendelboe  ", " TW, Tim Wendelboe Oslo, "),
-    "Tim Wendelboe TW Tim Wendelboe Oslo",
-    "Name and aliases should be trimmed and joined.",
-  );
-  assertEquals(
-    buildEmbeddingInput("Swerl", null),
-    "Swerl",
-    "A roaster without aliases should use only its name.",
-  );
-  assertEquals(
-    buildEmbeddingInput("Swerl", " , "),
-    "Swerl",
-    "Empty aliases should be ignored.",
-  );
-  assertEquals(
-    buildEmbeddingInput("   ", "Alias"),
-    null,
-    "A missing canonical name should be rejected.",
-  );
 });

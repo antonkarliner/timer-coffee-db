@@ -4,16 +4,20 @@
  *
  * Retryable   → state 'retry_wait', exponential backoff, retried until
  *               max_attempts (HTTP 408/429/5xx, network, timeout, storage
- *               upload failure, DB failure).
+ *               upload failure, DB failure, embedding_config_missing).
  * Terminal    → state 'failed' immediately (source_too_large,
  *               unsupported_format, html_response, malformed_url,
- *               decode_failed, svg_rasterization_unsupported, HTTP 4xx
+ *               decode_failed, svg_rasterization_unsupported,
+ *               embedding_input_empty, embedding_invalid_response, HTTP 4xx
  *               other than 408/429, roaster_missing).
  */
 
 import { ImageFormatError } from "../_shared/image-variants.ts";
 import {
   DbError,
+  EmbeddingConfigError,
+  EmbeddingInputError,
+  EmbeddingResponseError,
   HttpSourceError,
   ImageDecodeError,
   MalformedSourceError,
@@ -69,6 +73,17 @@ export function classifyFailure(error: unknown): ClassifiedFailure {
   }
   if (error instanceof DbError) {
     return { errorClass: "db_error", terminal: false };
+  }
+  if (error instanceof EmbeddingInputError) {
+    return { errorClass: "embedding_input_empty", terminal: true };
+  }
+  if (error instanceof EmbeddingResponseError) {
+    return { errorClass: "embedding_invalid_response", terminal: true };
+  }
+  if (error instanceof EmbeddingConfigError) {
+    // Missing OPENAI_API_KEY: an operator can provision it without any data
+    // change, so keep the job retryable — max_attempts bounds the loop.
+    return { errorClass: "embedding_config_missing", terminal: false };
   }
   // Deno's fetch rejects with TypeError on network failures (DNS, refused,
   // TLS). Anything else unrecognised is treated as transient too: the ledger

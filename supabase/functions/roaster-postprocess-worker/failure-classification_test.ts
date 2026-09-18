@@ -2,6 +2,9 @@ import { classifyFailure } from "./failure-classification.ts";
 import { ImageFormatError } from "../_shared/image-variants.ts";
 import {
   DbError,
+  EmbeddingConfigError,
+  EmbeddingInputError,
+  EmbeddingResponseError,
   HttpSourceError,
   ImageDecodeError,
   MalformedSourceError,
@@ -129,6 +132,28 @@ Deno.test("failure classification maps every typed error to its stable slug", ()
       "db_error",
       false,
       "DB failure is retryable",
+    ],
+    [
+      new EmbeddingInputError("Roaster 42 has no canonical name to embed"),
+      "embedding_input_empty",
+      true,
+      "nothing to embed is terminal",
+    ],
+    [
+      new EmbeddingResponseError(
+        "Embedding provider returned an invalid payload (expected an array of 384 numbers)",
+      ),
+      "embedding_invalid_response",
+      true,
+      "a non-384-number payload must never be stored, so it is terminal",
+    ],
+    [
+      new EmbeddingConfigError(
+        "OPENAI_API_KEY is not configured; cannot generate roaster embeddings",
+      ),
+      "embedding_config_missing",
+      false,
+      "a missing key is operator-fixable, so it is retryable",
     ],
     [
       new TypeError("error sending request: connection refused"),

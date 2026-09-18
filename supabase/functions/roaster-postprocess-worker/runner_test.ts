@@ -1,6 +1,7 @@
 import {
   ATTACH_JOB_CONCURRENCY,
   currentSourceRevision,
+  EMBEDDING_JOB_CONCURRENCY,
   type FinishOutcome,
   IMAGE_JOB_CONCURRENCY,
   jobLogFields,
@@ -40,6 +41,7 @@ function makeSnapshot(
   return {
     id: 42,
     roaster_name: "Test Roaster",
+    aliases: "Test Alias",
     normalized_name: "test roaster",
     normalized_aliases: "test",
     roaster_logo_url: "https://src/logo.png",
@@ -60,6 +62,7 @@ function stubDeps(
     mirror?: (job: PostprocessJob) => Promise<void>;
     extract?: (job: PostprocessJob) => Promise<void>;
     attach?: (job: PostprocessJob) => Promise<void>;
+    embed?: (job: PostprocessJob) => Promise<void>;
   } = {},
 ): { deps: RunnerDeps; recorded: Recorded } {
   const recorded: Recorded = { processed: [], finishes: [], logs: [] };
@@ -81,6 +84,10 @@ function stubDeps(
     processAttachBeans: async (job) => {
       recorded.processed.push(job);
       await handlers.attach?.(job);
+    },
+    processGenerateEmbedding: async (job) => {
+      recorded.processed.push(job);
+      await handlers.embed?.(job);
     },
     finishJob: async (job, outcome) => {
       recorded.finishes.push({ job, outcome });
@@ -125,6 +132,27 @@ Deno.test("currentSourceRevision follows the contract exactly", () => {
     ),
     "|",
     "null name/aliases coalesce to empty strings",
+  );
+  assertEquals(
+    currentSourceRevision("generate_embedding", snapshot),
+    "Test Roaster|Test Alias",
+    "generate_embedding → coalesce(roaster_name)||'|'||coalesce(aliases) on the RAW columns",
+  );
+  assertEquals(
+    currentSourceRevision(
+      "generate_embedding",
+      makeSnapshot({ roaster_name: "Swerl", aliases: "TW, TW Oslo" }),
+    ),
+    "Swerl|TW, TW Oslo",
+    "generate_embedding keeps the raw alias text verbatim",
+  );
+  assertEquals(
+    currentSourceRevision(
+      "generate_embedding",
+      makeSnapshot({ roaster_name: null, aliases: null }),
+    ),
+    "|",
+    "generate_embedding: null name/aliases coalesce to empty strings",
   );
 });
 
@@ -263,6 +291,91 @@ Deno.test("attach_beans jobs route to their processor and pool", async () => {
   assertEquals(summary.succeeded, 1, "succeeded");
 });
 
+Deno.test("generate_embedding jobs route to their processor and pool", async () => {
+  const { deps, recorded } = stubDeps(new Map([[42, makeSnapshot()]]), {
+    embed: async () => {},
+  });
+  const summary = await runBatch(deps, [
+    makeJob({
+      kind: "generate_embedding",
+      source_revision: "Test Roaster|Test Alias",
+    }),
+  ]);
+  assertEquals(
+    recorded.processed.length,
+    1,
+    "generate_embedding processor ran",
+  );
+  assertEquals(
+    outcomeOf(recorded, 1),
+    { success: true },
+    "finished as success",
+  );
+  assertEquals(summary.succeeded, 1, "counted as succeeded");
+});
+
+Deno.test("a stale generate_embedding source_revision finishes as success with NO embedding work", async () => {
+  // The roaster's name has moved on since the job was enqueued; a newer job
+  // already covers the current input.
+  const { deps, recorded } = stubDeps(
+    new Map([[
+      42,
+      makeSnapshot({ roaster_name: "Renamed Roaster", aliases: "New Alias" }),
+    ]]),
+    {
+      embed: async () => {
+        throw new Error("TRIPWIRE: no external work may run for a stale job");
+      },
+    },
+  );
+  const summary = await runBatch(deps, [
+    makeJob({
+      kind: "generate_embedding",
+      source_revision: "Test Roaster|Test Alias",
+    }),
+  ]);
+  assertEquals(recorded.processed.length, 0, "tripwire not hit");
+  assertEquals(
+    outcomeOf(recorded, 1),
+    { success: true, errorClass: "stale_revision" },
+    "finished as success with the stale_revision marker",
+  );
+  assertEquals(
+    summary,
+    { claimed: 1, succeeded: 0, failed: 0, retried: 0, skipped: 1 },
+    "counted as skipped",
+  );
+});
+
+Deno.test("generate_embedding pool concurrency is capped at 5", async () => {
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const delay = () => new Promise<void>((resolve) => setTimeout(resolve, 3));
+  const { deps } = stubDeps(new Map([[42, makeSnapshot()]]), {
+    embed: async () => {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await delay();
+      inFlight -= 1;
+    },
+  });
+  const jobs = Array.from(
+    { length: 12 },
+    (_, i) =>
+      makeJob({
+        id: i + 1,
+        kind: "generate_embedding",
+        source_revision: "Test Roaster|Test Alias",
+      }),
+  );
+  await runBatch(deps, jobs);
+  assertEquals(
+    maxInFlight,
+    EMBEDDING_JOB_CONCURRENCY,
+    `peak concurrent embedding jobs = cap (${EMBEDDING_JOB_CONCURRENCY})`,
+  );
+});
+
 Deno.test("image-job concurrency is capped at 2 across BOTH image kinds combined", async () => {
   let inFlight = 0;
   let maxInFlight = 0;
@@ -368,6 +481,7 @@ Deno.test("a finishJob failure does not break the batch or double-count", async 
     processMirrorLogo: async () => {},
     processExtractColor: async () => {},
     processAttachBeans: async () => {},
+    processGenerateEmbedding: async () => {},
     finishJob: async () => {
       throw new Error("finish RPC down");
     },

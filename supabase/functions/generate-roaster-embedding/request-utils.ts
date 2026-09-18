@@ -1,3 +1,5 @@
+// buildEmbeddingInput moved verbatim to ../_shared/roaster-embedding-core.ts —
+// the ONE implementation shared with the roaster-postprocess-worker.
 export function parseRoasterId(value: unknown): number | null {
   if (
     typeof value !== "number" ||
@@ -8,24 +10,4 @@ export function parseRoasterId(value: unknown): number | null {
   }
 
   return value;
-}
-
-export function buildEmbeddingInput(
-  roasterName: string,
-  aliases: string | null,
-): string | null {
-  const canonicalName = roasterName.trim();
-  if (!canonicalName) {
-    return null;
-  }
-
-  const normalizedAliases = aliases
-    ?.split(",")
-    .map((alias) => alias.trim())
-    .filter(Boolean)
-    .join(" ");
-
-  return normalizedAliases
-    ? `${canonicalName} ${normalizedAliases}`
-    : canonicalName;
 }

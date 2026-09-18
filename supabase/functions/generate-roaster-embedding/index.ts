@@ -2,8 +2,15 @@ import { serve } from "https://deno.land/std@0.223.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.42.5";
 import { OPENAI_SPECIALIZED_MODELS } from "../_shared/ai-models.ts";
 import { getCorsHeaders } from "../_shared/cors.ts";
+import {
+  DbError,
+  EmbeddingInputError,
+} from "../_shared/roaster-postprocess-errors.ts";
+import {
+  generateRoasterNameEmbedding,
+} from "../_shared/roaster-embedding-core.ts";
 import { authorizeServiceRole } from "../_shared/service-role-auth.ts";
-import { buildEmbeddingInput, parseRoasterId } from "./request-utils.ts";
+import { parseRoasterId } from "./request-utils.ts";
 
 const supabaseUrl = Deno.env.get("SUPABASE_URL");
 const supabaseServiceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
@@ -20,10 +27,6 @@ const supabase = createClient(supabaseUrl, supabaseServiceRoleKey, {
     detectSessionInUrl: false,
   },
 });
-
-interface OpenAiEmbeddingResponse {
-  data?: Array<{ embedding?: unknown }>;
-}
 
 interface RoasterRecord {
   id: number;
@@ -43,45 +46,6 @@ function jsonResponse(
       "Content-Type": "application/json",
     },
   });
-}
-
-/**
- * Generate embedding using OpenAI text-embedding-3-small
- * Returns 384-dimensional vector (truncated from 1536)
- */
-async function generateEmbedding(text: string): Promise<number[]> {
-  const response = await fetch("https://api.openai.com/v1/embeddings", {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${openaiApiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      input: text,
-      model: OPENAI_SPECIALIZED_MODELS.EMBEDDING,
-      dimensions: 384,
-    }),
-  });
-
-  if (!response.ok) {
-    console.error("Embedding provider request failed", {
-      status: response.status,
-    });
-    throw new Error("Embedding provider request failed");
-  }
-
-  const data = await response.json() as OpenAiEmbeddingResponse;
-  const embedding = data.data?.[0]?.embedding;
-  if (
-    !Array.isArray(embedding) ||
-    embedding.length !== 384 ||
-    !embedding.every((value) => typeof value === "number")
-  ) {
-    console.error("Embedding provider returned an invalid payload");
-    throw new Error("Embedding provider returned an invalid payload");
-  }
-
-  return embedding;
 }
 
 serve(async (req) => {
@@ -152,40 +116,33 @@ serve(async (req) => {
     }
 
     const roaster = roasterData as RoasterRecord;
-    const textToEmbed = buildEmbeddingInput(
-      roaster.roaster_name ?? "",
-      roaster.aliases,
-    );
-    if (!textToEmbed) {
-      console.error("Roaster has no canonical name", { roasterId });
-      return jsonResponse(
-        { error: "Roaster has no canonical name." },
-        422,
-        cors,
-      );
-    }
 
     console.log("Generating canonical roaster embedding", { roasterId });
 
-    // Generate embedding
-    const embedding = await generateEmbedding(textToEmbed);
-
-    // Update the roaster record
-    const { error } = await supabase.from("coffee_roasters").update({
-      name_embedding: embedding,
-      embedding_updated_at: new Date().toISOString(),
-    }).eq("id", roasterId);
-
-    if (error) {
-      console.error("Failed to update roaster embedding:", error);
-      return jsonResponse(
-        {
-          error: "Failed to update roaster embedding",
-        },
-        500,
-        cors,
-      );
-    }
+    // Generate the embedding and persist it — the ONE implementation in
+    // _shared/roaster-embedding-core.ts (same vector space as every stored
+    // vector: OPENAI_SPECIALIZED_MODELS.EMBEDDING at dimensions 384 via
+    // OPENAI_API_KEY).
+    const { embedding } = await generateRoasterNameEmbedding({
+      openAiApiKey: openaiApiKey,
+      model: OPENAI_SPECIALIZED_MODELS.EMBEDDING,
+      fetchImpl: fetch,
+      updateRoasterEmbedding: async (id, vector) => {
+        const { error } = await supabase.from("coffee_roasters").update({
+          name_embedding: vector,
+          embedding_updated_at: new Date().toISOString(),
+        }).eq("id", id);
+        if (error) {
+          throw new DbError(
+            `Failed to update roaster embedding: ${error.message}`,
+          );
+        }
+      },
+    }, {
+      roasterId,
+      roasterName: roaster.roaster_name,
+      aliases: roaster.aliases,
+    });
 
     console.log("Successfully generated canonical roaster embedding", {
       roasterId,
@@ -200,6 +157,24 @@ serve(async (req) => {
       cors,
     );
   } catch (error) {
+    if (error instanceof EmbeddingInputError) {
+      console.error("Roaster has no canonical name", { roasterId });
+      return jsonResponse(
+        { error: "Roaster has no canonical name." },
+        422,
+        cors,
+      );
+    }
+    if (error instanceof DbError) {
+      console.error("Failed to update roaster embedding:", error.message);
+      return jsonResponse(
+        {
+          error: "Failed to update roaster embedding",
+        },
+        500,
+        cors,
+      );
+    }
     const message = error instanceof Error ? error.message : String(error);
     console.error("Error generating embedding:", message);
     return jsonResponse(

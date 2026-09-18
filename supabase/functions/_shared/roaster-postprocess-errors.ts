@@ -1,6 +1,6 @@
 /**
  * Typed errors for the durable roaster post-processing pipeline
- * (mirror_logo / extract_color / attach_beans jobs).
+ * (mirror_logo / extract_color / attach_beans / generate_embedding jobs).
  *
  * The worker classifies failures into retryable vs terminal via these types —
  * see `roaster-postprocess-worker/failure-classification.ts`. Every class here
@@ -79,6 +79,40 @@ export class DbError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "DbError";
+  }
+}
+
+/**
+ * OPENAI_API_KEY is absent from the environment. RETRYABLE — provisioning the
+ * key is an operator action that fixes every queued job, and the ledger's
+ * max_attempts caps the retries either way.
+ */
+export class EmbeddingConfigError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "EmbeddingConfigError";
+  }
+}
+
+/**
+ * The roaster has no usable canonical name, so there is nothing to embed.
+ * TERMINAL — no retry can produce text from an empty name.
+ */
+export class EmbeddingInputError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "EmbeddingInputError";
+  }
+}
+
+/**
+ * The provider returned a payload that is not a 384-number array. TERMINAL —
+ * storing anything else would corrupt the shared 384-dim vector space.
+ */
+export class EmbeddingResponseError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "EmbeddingResponseError";
   }
 }
 
