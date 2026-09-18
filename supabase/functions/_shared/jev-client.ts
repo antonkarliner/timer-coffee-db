@@ -562,3 +562,58 @@ export async function jevScore(
   const answer = result?.answers.q;
   return answer && answer.type === "score" ? answer : null;
 }
+
+/** Pre-warms run alongside other work and must never hold up a request. */
+const PREWARM_DEFAULT_TIMEOUT_MS = 3000;
+
+/**
+ * Open a keep-alive connection to the TypeSafe origin so the real Jev call
+ * later in the same request does not pay DNS + TCP + TLS again (measured:
+ * ~654-667 ms from the Supabase edge cold vs ~246 ms warm; plan 034
+ * pre-warm experiment). Callers start it at the top of a request and keep
+ * the promise without awaiting it.
+ *
+ * Never billed, never attributable: a bare GET to the origin derived from
+ * `JEV_ENDPOINT`, without the API key and without a question. Any HTTP
+ * status counts as success — the point is the handshake, not the response —
+ * so a 404/405 from the origin is a fine outcome.
+ *
+ * Returns elapsed milliseconds when any HTTP response arrived, null on
+ * network error or timeout. Never throws.
+ */
+export async function prewarmJevConnection(
+  opts?: { timeoutMs?: number },
+): Promise<number | null> {
+  const startedAt = Date.now();
+  try {
+    const response = await fetchWithTimeout(
+      new URL(JEV_ENDPOINT).origin,
+      // Deliberately no Authorization header and no body: a pre-warm must
+      // never be a billable model call.
+      { method: "GET" },
+      opts?.timeoutMs ?? PREWARM_DEFAULT_TIMEOUT_MS,
+    );
+    // The body must be read to the end. In Deno an unconsumed body keeps the
+    // socket checked out instead of returning it to the keep-alive pool,
+    // which would silently defeat the whole experiment. Cancelling is not a
+    // safe substitute: over HTTP/2 it resets only this stream, but over
+    // HTTP/1.1 it typically closes the connection. api.typesafe.ai answers
+    // HTTP/2 today (a 22-byte 404, checked 2026-09-18), yet reading those
+    // bytes is free and keeps the connection reusable whichever protocol the
+    // runtime negotiates. fetchWithTimeout keeps its deadline alive while the
+    // body is read, so a stalled body cannot hang here.
+    await response.arrayBuffer();
+    return Date.now() - startedAt;
+  } catch (error) {
+    // Low-level logging only: a failed pre-warm is harmless (the real Jev
+    // call just pays the handshake) and must stay invisible to callers.
+    logInfo(
+      "jev_prewarm: connection pre-warm failed",
+      {
+        marker: "jev_prewarm",
+        reason: error instanceof Error ? error.message : String(error),
+      },
+    );
+    return null;
+  }
+}

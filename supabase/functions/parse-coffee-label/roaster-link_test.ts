@@ -1287,3 +1287,140 @@ rlTest(
     assertEquals(db.insertedRows[0].outcome, "jev_failed");
   },
 );
+
+// ---------------------------------------------------------------------------
+// runRoasterLink — prewarm experiment (plan 034)
+// ---------------------------------------------------------------------------
+
+rlTest(
+  "runRoasterLink records the prewarm arm and prewarm_ms without changing the decision",
+  async () => {
+    const db = makeDbStub({
+      rpcResults: [PHOENIX_RPC_ROWS],
+      metaRows: PHOENIX_META,
+    });
+    const jev = makeJevStub(CONFIDENT_ANSWER);
+    await captureConsoleInfo(() =>
+      runRoasterLink(makeDeps(db.db, jev), LABEL_RESULT, {
+        mode: "shadow",
+        correlationId: "req-prewarm-1",
+        prewarm: { arm: "warm", prewarmMs: Promise.resolve(42) },
+      })
+    );
+    assertEquals(db.insertedRows.length, 1, "one eval row");
+    const row = db.insertedRows[0];
+    assertEquals(row.prewarm_arm, "warm", "the drawn arm lands in the row");
+    assertEquals(
+      row.prewarm_ms,
+      42,
+      "the settled pre-warm latency lands in the row",
+    );
+    assertEquals(
+      typeof row.jev_call_ms,
+      "number",
+      "the Jev call itself is timed",
+    );
+    // Telemetry only: the decision must be untouched by the experiment.
+    assertEquals(row.outcome, "linked");
+    assertEquals(row.linked_roaster_id, 42);
+    assertEquals(row.jev_choice, "42");
+    assertEquals(row.jev_p, 0.95);
+  },
+);
+
+rlTest(
+  "runRoasterLink records jev_call_ms null when Jev never ran (no_candidates)",
+  async () => {
+    const db = makeDbStub(); // no rpcResults -> zero candidates
+    const jev = makeJevStub(CONFIDENT_ANSWER);
+    await captureConsoleInfo(() =>
+      runRoasterLink(makeDeps(db.db, jev), LABEL_RESULT, {
+        mode: "shadow",
+        prewarm: { arm: "cold", prewarmMs: null },
+      })
+    );
+    assertEquals(db.insertedRows.length, 1, "one eval row");
+    const row = db.insertedRows[0];
+    assertEquals(row.outcome, "no_candidates");
+    assertEquals(
+      row.jev_call_ms,
+      null,
+      "Jev never ran, so there is no call to time",
+    );
+    assertEquals(jev.calls.length, 0);
+    assertEquals(row.prewarm_arm, "cold");
+    assertEquals(
+      row.prewarm_ms,
+      null,
+      "the cold arm has no pre-warm promise to await",
+    );
+  },
+);
+
+rlTest(
+  "a never-resolving prewarm promise cannot delay the eval row beyond the settle budget",
+  async () => {
+    const db = makeDbStub({
+      rpcResults: [PHOENIX_RPC_ROWS],
+      metaRows: PHOENIX_META,
+    });
+    const jev = makeJevStub(CONFIDENT_ANSWER);
+    const startedAt = Date.now();
+    await captureConsoleInfo(() =>
+      runRoasterLink(makeDeps(db.db, jev), LABEL_RESULT, {
+        mode: "shadow",
+        prewarm: { arm: "warm", prewarmMs: new Promise<never>(() => {}) },
+      })
+    );
+    const waitedMs = Date.now() - startedAt;
+    assert(
+      waitedMs >= 90,
+      `the row must actually wait the settle budget (waited ${waitedMs}ms)`,
+    );
+    assert(
+      waitedMs < 500,
+      `the insert must not wait meaningfully past the 100ms settle budget (waited ${waitedMs}ms)`,
+    );
+    const row = db.insertedRows[0];
+    assertEquals(
+      row.prewarm_ms,
+      null,
+      "an unresolved pre-warm records null, not a made-up number",
+    );
+    assertEquals(
+      typeof row.jev_call_ms,
+      "number",
+      "Jev still ran and was timed",
+    );
+  },
+);
+
+rlTest(
+  "runRoasterLink writes null prewarm columns when no prewarm info is passed",
+  async () => {
+    const db = makeDbStub({
+      rpcResults: [PHOENIX_RPC_ROWS],
+      metaRows: PHOENIX_META,
+    });
+    const jev = makeJevStub(CONFIDENT_ANSWER);
+    await captureConsoleInfo(() =>
+      runRoasterLink(makeDeps(db.db, jev), LABEL_RESULT, {
+        mode: "shadow",
+        correlationId: "req-prewarm-4",
+      })
+    );
+    assertEquals(db.insertedRows.length, 1, "one eval row");
+    const row = db.insertedRows[0];
+    assertEquals(
+      row.prewarm_arm,
+      null,
+      "no prewarm option -> null arm (backwards compatible)",
+    );
+    assertEquals(row.prewarm_ms, null);
+    assertEquals(
+      typeof row.jev_call_ms,
+      "number",
+      "jev_call_ms is recorded regardless of the experiment",
+    );
+  },
+);

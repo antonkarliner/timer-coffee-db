@@ -22,11 +22,13 @@ import {
   ROAST_DATE_RESPONSE_SCHEMA,
   shouldFallbackProviderError,
 } from "./label-utils.ts";
+import { prewarmJevConnection } from "../_shared/jev-client.ts";
 import {
   makeRoasterLinkDeps,
   readRoasterLinkMode,
   type RoasterLinkDb,
   type RoasterLinkMode,
+  type RoasterLinkPrewarm,
   runRoasterLink,
 } from "./roaster-link.ts";
 // --- Provider credentials ---
@@ -292,6 +294,26 @@ serve(async (req)=>{
     locale: typeof locale === 'string' ? locale : null,
     hasUserId: typeof userId === 'string' && userId.length > 0
   });
+  // --- Roaster link pre-warm experiment (plan 034) ---
+  // Resolve the mode now (cached 60s) and, when it is on, draw the
+  // randomized arm and start the TypeSafe connection pre-warm ~5s before
+  // the real Jev call, in parallel with the vision-model call. Shadow draws
+  // 50/50 warm/cold so jev_call_ms is attributable; enforce is always warm;
+  // "off" runs nothing at all. Nothing here is awaited: both promises are
+  // consumed by the end-of-request block below, which is the only reader.
+  const roasterLinkModePromise = getRoasterLinkMode();
+  const roasterLinkPrewarmPromise: Promise<RoasterLinkPrewarm | null> =
+    roasterLinkModePromise.then((mode) => {
+      if (mode === "off") return null;
+      const arm: RoasterLinkPrewarm["arm"] =
+        mode === "enforce" || Math.random() < 0.5 ? "warm" : "cold";
+      if (arm === "cold") return { arm, prewarmMs: null };
+      // Fire-and-forget: must not delay the vision call, and must not be
+      // able to throw into the request. prewarmJevConnection never rejects;
+      // .catch keeps that guarantee local.
+      const prewarmMs = prewarmJevConnection().catch(() => null);
+      return { arm, prewarmMs };
+    }).catch(() => null);
   const getSystemPrompt = (ocrText)=>buildSystemPrompt({
       locale,
       today: formatUtcDate(todayUtc()),
@@ -981,21 +1003,25 @@ serve(async (req)=>{
     // never touches `result`, so the payload stays byte-identical. Enforce
     // mode: awaited (bounded by an 800 ms overall deadline in roaster-link)
     // and is the only mode that may set result.roasterLink. Mode "off":
-    // nothing runs at all.
-    const roasterLinkMode = await getRoasterLinkMode();
+    // nothing runs at all. Both the mode and the pre-warm promise were
+    // started at the top of the request; the flag is not read twice.
+    const roasterLinkMode = await roasterLinkModePromise;
+    const roasterLinkPrewarm = await roasterLinkPrewarmPromise;
     if (roasterLinkMode === "shadow") {
       if (typeof EdgeRuntime !== "undefined") {
         EdgeRuntime.waitUntil(
           runRoasterLink(roasterLinkDeps, result, {
             mode: "shadow",
-            correlationId: requestId
+            correlationId: requestId,
+            prewarm: roasterLinkPrewarm
           })
         );
       }
     } else if (roasterLinkMode === "enforce") {
       result.roasterLink = await runRoasterLink(roasterLinkDeps, result, {
         mode: "enforce",
-        correlationId: requestId
+        correlationId: requestId,
+        prewarm: roasterLinkPrewarm
       });
     }
     return new Response(JSON.stringify(result), {

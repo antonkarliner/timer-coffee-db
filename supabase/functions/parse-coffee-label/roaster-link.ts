@@ -28,6 +28,12 @@
  * - The rest of the parsed label goes into the Jev state — bean name, origin,
  *   region, variety, tasting notes disambiguate.
  *
+ * Prewarm experiment (plan 034): index.ts may open a keep-alive connection to
+ * the TypeSafe origin at the start of the request (arm "warm") or not (arm
+ * "cold", drawn 50/50 in shadow; enforce is always warm). runRoasterLink only
+ * records the arm, the pre-warm latency and the Jev call time in the eval
+ * row; the decision, the threshold and the return value are untouched.
+ *
  * The orchestrator is written for testability: its Supabase client and its
  * Jev function are injected, so tests stub both and run with no network.
  */
@@ -159,6 +165,16 @@ export interface JevEvalRoasterLinkRow {
   jev_confidence: number | null;
   jev_probabilities: Record<string, number> | null;
   linked_roaster_id: number | null;
+  /** Prewarm experiment: the arm this request drew; null when not provided. */
+  prewarm_arm: "warm" | "cold" | null;
+  /**
+   * Prewarm experiment: awaited latency of the in-flight pre-warm promise,
+   * bounded at insert time; null when cold, not provided, unresolved within
+   * the settle budget, or failed.
+   */
+  prewarm_ms: number | null;
+  /** Wall-clock ms of the Jev call ALONE; null when Jev never ran. */
+  jev_call_ms: number | null;
   latency_ms: number;
   true_roaster_id: null;
   labelled_at: null;
@@ -210,6 +226,21 @@ export interface RoasterLinkDeps {
   ) => Promise<JevChoiceAnswer | null>;
 }
 
+/**
+ * Prewarm experiment state handed over from index.ts, which started it at
+ * the top of the request so the connection would be warm well before the
+ * Jev call. Telemetry only — it never affects the decision.
+ */
+export interface RoasterLinkPrewarm {
+  /** Which arm of the randomized experiment this request drew. */
+  arm: "warm" | "cold";
+  /**
+   * The UNAWAITED prewarmJevConnection() promise; null on the cold arm.
+   * Consumed here only to record its latency, bounded by the settle budget.
+   */
+  prewarmMs: Promise<number | null> | null;
+}
+
 export interface RoasterLinkOptions {
   mode: RoasterLinkMode;
   correlationId?: string;
@@ -219,6 +250,12 @@ export interface RoasterLinkOptions {
    * deterministically exhausts the budget before the Jev call.
    */
   deadlineMs?: number;
+  /**
+   * Prewarm experiment (plan 034): the arm this request drew plus the
+   * in-flight pre-warm promise. Optional; absent -> the prewarm_* eval
+   * columns are null.
+   */
+  prewarm?: RoasterLinkPrewarm | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -407,6 +444,45 @@ function toFiniteNumber(value: unknown): number | null {
 
 function asStringOrNull(value: unknown): string | null {
   return typeof value === "string" ? value : null;
+}
+
+/**
+ * The eval row must not be delayed by the pre-warm promise: it is usually
+ * long settled by insert time, but never wait more than this much extra for
+ * it.
+ */
+const PREWARM_SETTLE_BUDGET_MS = 100;
+
+/**
+ * Await the in-flight pre-warm promise, bounded by PREWARM_SETTLE_BUDGET_MS.
+ * Returns its elapsed ms, or null when there is no promise (cold arm / not
+ * provided), it did not settle within the budget, it failed, or it resolved
+ * to something that is not a finite number. Never throws.
+ */
+async function settlePrewarmMs(
+  prewarmMs: Promise<number | null> | null | undefined,
+): Promise<number | null> {
+  if (!prewarmMs) return null;
+  // index.ts attaches .catch to this promise; this extra no-op handler keeps
+  // a rejection after we have stopped waiting from surfacing as an unhandled
+  // rejection.
+  prewarmMs.catch(() => {});
+  let timerId: number | undefined;
+  try {
+    const settled = await Promise.race([
+      prewarmMs,
+      new Promise<null>((resolve) => {
+        timerId = setTimeout(() => resolve(null), PREWARM_SETTLE_BUDGET_MS);
+      }),
+    ]);
+    return typeof settled === "number" && Number.isFinite(settled)
+      ? settled
+      : null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timerId);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -598,6 +674,7 @@ export async function runRoasterLink(
   options: RoasterLinkOptions,
 ): Promise<RoasterLink | null> {
   const { mode, correlationId } = options;
+  const prewarm = options.prewarm ?? null;
   if (mode !== "shadow" && mode !== "enforce") return null;
 
   // Skip checks: pure field inspection, cannot throw. No DB, no network.
@@ -618,6 +695,11 @@ export async function runRoasterLink(
         ? ENFORCE_TOTAL_DEADLINE_MS
         : Number.POSITIVE_INFINITY));
   let evalRowAttempted = false;
+  // Wall-clock of the Jev call ALONE (not retrieval, not the insert); null
+  // when Jev never ran. Declared at function scope so every eval row,
+  // including the error path, can carry it; the try/finally at the call site
+  // records it even when the call throws.
+  let jevCallMs: number | null = null;
 
   // Deterministic resolver, for the eval row only: its RPC is issued here,
   // concurrently with candidate retrieval, so it adds no latency. Never
@@ -698,6 +780,9 @@ export async function runRoasterLink(
         jev_confidence: null,
         jev_probabilities: null,
         linked_roaster_id: null,
+        prewarm_arm: prewarm?.arm ?? null,
+        prewarm_ms: await settlePrewarmMs(prewarm?.prewarmMs),
+        jev_call_ms: jevCallMs, // Jev never ran
         latency_ms: latencyMs(),
         true_roaster_id: null,
         labelled_at: null,
@@ -728,10 +813,15 @@ export async function runRoasterLink(
       // Shadow may take its time (nobody waits); enforce caps the Jev call at
       // the remaining budget so retrieval + metadata + Jev fits the deadline.
       const timeoutMs = mode === "shadow" ? SHADOW_JEV_TIMEOUT_MS : remainingMs;
-      answer = await deps.jevChoose(state, question, {
-        timeoutMs,
-        correlationId,
-      });
+      const jevStartedAt = Date.now();
+      try {
+        answer = await deps.jevChoose(state, question, {
+          timeoutMs,
+          correlationId,
+        });
+      } finally {
+        jevCallMs = Date.now() - jevStartedAt;
+      }
     }
 
     // --- Decide + record. One eval row whatever happened. ---
@@ -776,6 +866,9 @@ export async function runRoasterLink(
       jev_confidence: answer?.confidence ?? null,
       jev_probabilities: answer?.probabilities ?? null,
       linked_roaster_id: decision?.roasterId ?? null,
+      prewarm_arm: prewarm?.arm ?? null,
+      prewarm_ms: await settlePrewarmMs(prewarm?.prewarmMs),
+      jev_call_ms: jevCallMs,
       latency_ms: latencyMs(),
       true_roaster_id: null,
       labelled_at: null,
@@ -821,6 +914,9 @@ export async function runRoasterLink(
         jev_confidence: null,
         jev_probabilities: null,
         linked_roaster_id: null,
+        prewarm_arm: prewarm?.arm ?? null,
+        prewarm_ms: await settlePrewarmMs(prewarm?.prewarmMs),
+        jev_call_ms: jevCallMs,
         latency_ms: Date.now() - startedAt,
         true_roaster_id: null,
         labelled_at: null,

@@ -34,6 +34,7 @@ const {
   jevChoose,
   jevNoul,
   jevScore,
+  prewarmJevConnection,
   withNoneOfTheAbove,
 } = await import("./jev-client.ts");
 
@@ -935,3 +936,132 @@ jevTest("invalid question sets fail client-side without a fetch", async () => {
     fetchStub.restore();
   }
 });
+
+// ---------------------------------------------------------------------------
+// prewarmJevConnection
+// ---------------------------------------------------------------------------
+
+jevTest(
+  "prewarmJevConnection GETs the origin and returns ms on any HTTP status",
+  async () => {
+    const fetchStub = stubFetch(() =>
+      new Response("not found", { status: 404 })
+    );
+    try {
+      const elapsed = await prewarmJevConnection();
+      const ms = assertNotNull(
+        elapsed,
+        "a 404 still proves the handshake happened; any status counts",
+      );
+      assert(ms >= 0, "elapsed must be a non-negative number of ms");
+      assertEquals(fetchStub.calls.length, 1, "exactly one request");
+      assertEquals(
+        fetchStub.calls[0].url,
+        new URL(JEV_ENDPOINT).origin,
+        "the pre-warm must hit the origin derived from JEV_ENDPOINT",
+      );
+      assertEquals(
+        fetchStub.calls[0].init?.method,
+        "GET",
+        "a cheap GET, not the billable POST /v1/systemone",
+      );
+    } finally {
+      fetchStub.restore();
+    }
+  },
+);
+
+jevTest(
+  "prewarmJevConnection returns null on a network error and never throws",
+  async () => {
+    const fetchStub = stubFetch(() => {
+      throw new Error("connection refused");
+    });
+    const console_ = captureConsole();
+    try {
+      const result = await prewarmJevConnection();
+      assertEquals(result, null, "a network failure must resolve to null");
+      assert(
+        console_.infos.some((call) =>
+          String(call[0]).includes("jev_prewarm") &&
+          String(call[0]).includes("failed")
+        ),
+        "the failure must be logged at a low level with the jev_prewarm marker",
+      );
+    } finally {
+      fetchStub.restore();
+      console_.restore();
+    }
+  },
+);
+
+jevTest(
+  "prewarmJevConnection never sends an Authorization header or a question body",
+  async () => {
+    // The key exists here, so the absence of the header is a real property of
+    // the request, not of the environment.
+    Deno.env.set("TYPESAFE_API_KEY", "secret-key-that-must-not-leak");
+    const fetchStub = stubFetch(() => new Response(null, { status: 405 }));
+    try {
+      const result = await prewarmJevConnection();
+      assertNotNull(result, "a 405 is still a successful handshake");
+      const headers = new Headers(
+        fetchStub.calls[0].init?.headers ?? undefined,
+      );
+      assertEquals(
+        headers.has("Authorization"),
+        false,
+        "a pre-warm must never carry the API key",
+      );
+      assertEquals(
+        fetchStub.calls[0].init?.body ?? null,
+        null,
+        "a pre-warm must never carry a body (a question would be billable)",
+      );
+    } finally {
+      fetchStub.restore();
+    }
+  },
+);
+
+jevTest(
+  "prewarmJevConnection reads the response body to the end so the socket returns to the keep-alive pool",
+  async () => {
+    let bodyReadToEnd = false;
+    let bodyCancelled = false;
+    const fetchStub = stubFetch(() => {
+      let sent = false;
+      const body = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (!sent) {
+            sent = true;
+            controller.enqueue(
+              new TextEncoder().encode("404 page not found\n"),
+            );
+            return;
+          }
+          bodyReadToEnd = true;
+          controller.close();
+        },
+        cancel() {
+          bodyCancelled = true;
+        },
+      });
+      return new Response(body, { status: 404 });
+    });
+    try {
+      const result = await prewarmJevConnection();
+      assertNotNull(result, "a 404 with a stream body is a completed request");
+      assert(
+        bodyReadToEnd,
+        "an unconsumed body would keep the socket out of the keep-alive pool and silently defeat the experiment",
+      );
+      assert(
+        !bodyCancelled,
+        "cancelling can close an HTTP/1.1 connection; the body must be drained instead",
+      );
+    } finally {
+      fetchStub.restore();
+    }
+  },
+);
