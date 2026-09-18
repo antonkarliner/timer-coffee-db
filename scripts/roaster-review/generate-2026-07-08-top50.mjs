@@ -1,7 +1,12 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 
-const generatedAt = "2026-07-08";
-const batchId = "2026-07-08-top50";
+const generatedAt = process.env.ROASTER_REVIEW_DATE || "2026-07-08";
+const batchId = process.env.ROASTER_REVIEW_BATCH || "2026-07-08-top50";
+const researchFile = process.env.ROASTER_REVIEW_RESEARCH_FILE || "";
+const freshResearch = researchFile ? JSON.parse(readFileSync(researchFile, "utf8")) : {};
+const cardsFile = process.env.ROASTER_REVIEW_CARDS_FILE || "";
+const fixedCards = cardsFile ? JSON.parse(readFileSync(cardsFile, "utf8")) : [];
+const fixedCardByCluster = new Map(fixedCards.map((item) => [item.cluster_id, item.card]));
 const outFile = `review-previews/roaster-candidate-review-${batchId}.html`;
 const sourceMapFile = `review-previews/roaster-candidate-review-${batchId}-sources.json`;
 const env = readEnv("supabase/.env.local");
@@ -25,7 +30,7 @@ const usStates = new Map(Object.entries({
   VA: "Virginia", WA: "Washington", WV: "West Virginia", WI: "Wisconsin", WY: "Wyoming",
 }));
 
-const activeJobStates = new Set(["queued", "processing", "running", "locked", "in_progress"]);
+const activeJobStates = new Set(["active", "queued", "processing", "running", "locked", "in_progress"]);
 const placeholderNames = new Set(["none", "n/a", "na", "null", "test", "unknown", "roaster", "coffee", "cafe"]);
 
 mkdirSync("review-previews", { recursive: true });
@@ -44,16 +49,20 @@ const contributionClusters = contributionIds.length
   ? await fetchChunked("service", "roaster_candidate_clusters", contributionIds, "id,normalized_name,display_name,sample_names,candidate_count,occurrences,status,confidence,best_match_roaster_id,updated_at", "updated_at.desc", "id")
   : [];
 
-const volumeClusters = await fetchRows("service", "roaster_candidate_clusters", new URLSearchParams({
-  select: "id,normalized_name,display_name,sample_names,candidate_count,occurrences,status,confidence,best_match_roaster_id,updated_at",
-  status: "eq.pending",
-  order: "candidate_count.desc,occurrences.desc,updated_at.desc",
-  limit: "180",
-}));
+const volumeClusters = fixedCards.length
+  ? await fetchChunked("service", "roaster_candidate_clusters", fixedCards.map((item) => item.cluster_id), "id,normalized_name,display_name,sample_names,candidate_count,occurrences,status,confidence,best_match_roaster_id,updated_at", "updated_at.desc", "id")
+  : await fetchRows("service", "roaster_candidate_clusters", new URLSearchParams({
+    select: "id,normalized_name,display_name,sample_names,candidate_count,occurrences,status,confidence,best_match_roaster_id,updated_at",
+    status: "eq.pending",
+    order: "candidate_count.desc,occurrences.desc,updated_at.desc",
+    limit: "180",
+  }));
 const contributionByCluster = groupBy(contributionRows, "cluster_id");
-const clusters = mergeClusters(contributionClusters, volumeClusters)
+const clusters = (fixedCards.length ? volumeClusters : mergeClusters(contributionClusters, volumeClusters))
   .filter((cluster) => cluster.status === "pending")
-  .sort((a, b) => clusterPriority(a, b, contributionByCluster));
+  .sort((a, b) => fixedCards.length
+    ? fixedCardByCluster.get(a.id) - fixedCardByCluster.get(b.id)
+    : clusterPriority(a, b, contributionByCluster));
 
 const clusterIds = clusters.map((row) => row.id);
 const [jobs, results] = await Promise.all([
@@ -68,7 +77,7 @@ const eligible = clusters
     const job = latestJob.get(cluster.id);
     return !job || !activeJobStates.has(String(job.state || "").toLowerCase());
   })
-  .slice(0, 50);
+  .slice(0, fixedCards.length || 50);
 
 const selectedIds = eligible.map((row) => row.id);
 const [candidates, roasters] = await Promise.all([
@@ -87,7 +96,7 @@ const cards = eligible.map((cluster, index) => {
   const job = latestJob.get(cluster.id);
   const rawRows = candidatesByCluster.get(cluster.id) || [];
   const contributions = contributionByCluster.get(cluster.id) || [];
-  const card = buildCard(index + 1, cluster, result, job, rawRows, roasters, contributions);
+  const card = buildCard(fixedCardByCluster.get(cluster.id) || index + 1, cluster, result, job, rawRows, roasters, contributions);
   sourceMap[cluster.id] = card.sources;
   return card;
 });
@@ -110,12 +119,21 @@ console.log(outFile);
 function buildCard(cardNo, cluster, result, job, rawRows, roasters, contributions) {
   const proposed = result?.proposed || {};
   const title = proposed.roaster_name || cluster.display_name || cluster.normalized_name;
-  const payload = normalizePayload(proposed);
+  const fresh = freshResearch[cluster.id] || {};
+  const payload = backfillPayload({ ...normalizePayload(proposed), ...(fresh.payload || {}) }, cluster, rawRows, contributions);
   const beanNames = unique(rawRows.map((row) => row.coffee_bean_name).filter(Boolean)).slice(0, 5);
   const domains = collectDomains(result, rawRows).slice(0, 10);
-  const sources = collectSources(result, payload, contributions);
+  const sources = collectSources(result, payload, contributions, fresh.sources || []);
   const duplicateResult = duplicateCheck(cluster, payload, roasters);
-  const quality = assessQuality(cluster, result, job, rawRows, payload, duplicateResult);
+  const generatedQuality = assessQuality(cluster, result, job, rawRows, payload, duplicateResult);
+  const quality = fresh.recommendation ? {
+    ...generatedQuality,
+    recommendation: fresh.recommendation,
+    confidence: fresh.confidence || generatedQuality.confidence,
+    note: fresh.note || generatedQuality.note,
+    re_enrich_reason: fresh.re_enrich_reason || "",
+    re_enrich_notes: fresh.re_enrich_notes || "",
+  } : generatedQuality;
   const representativeRows = rawRows.slice(0, 5).map((row) => ({
     id: row.id,
     roaster: row.roaster,
@@ -126,6 +144,7 @@ function buildCard(cardNo, cluster, result, job, rawRows, roasters, contribution
   const evidence = [
     contributions.length ? `User-submitted: ${contributions.map(contributionText).join("; ")}` : "",
     beanNames.length ? `Bean-name cross-search: ${beanNames.join(", ")}` : "Bean-name cross-search: no usable bean names in raw rows",
+    fresh.query ? `Fresh focused search (${generatedAt}): ${fresh.query}. ${fresh.result || "No exact result found."}` : "",
     domains.length ? `Query/result domains checked: ${domains.join(", ")}` : "Query/result domains checked: no stored search-result domains",
     rawRows.length ? `Representative raw rows: ${representativeRows.map((row) => `#${row.id} ${row.roaster} / ${row.coffee_bean_name}`).join("; ")}` : "Representative raw rows: none returned",
   ].filter(Boolean);
@@ -160,6 +179,9 @@ function buildCard(cardNo, cluster, result, job, rawRows, roasters, contribution
     representative_rows: representativeRows,
     sources,
     duplicate: duplicateResult.note,
+    target_roaster_id: duplicateResult.match?.id || null,
+    target_roaster_name: duplicateResult.match?.roaster_name || "",
+    alias_to_add: quality.recommendation === "approve alias" ? usefulAlias(cluster.display_name, duplicateResult.match) : "",
     notes,
     re_enrich_reason: quality.re_enrich_reason || "",
     re_enrich_notes: quality.re_enrich_notes || "",
@@ -176,6 +198,10 @@ function assessQuality(cluster, result, job, rawRows, payload, duplicateResult) 
   const validationNeedsReview = result?.signals?.validation?.needs_review === true;
   const conflicts = result?.signals?.extraction?.conflicts || [];
   const resultStatus = result?.status || "missing";
+
+  if (duplicateResult.kind === "identity_conflict" || duplicateResult.kind === "name_only") {
+    return hold("ambiguous_identity", duplicateResult.re_enrich_notes, duplicateResult.note);
+  }
 
   if (placeholderNames.has(normalizedCluster) || rawRows.every((row) => placeholderNames.has(normalizeName(row.roaster)))) {
     return {
@@ -266,20 +292,49 @@ function normalizePayload(proposed) {
   };
 }
 
+function backfillPayload(payload, cluster, rawRows, contributions) {
+  const contribution = contributions[0] || {};
+  const rawAddresses = unique(rawRows.map((row) => locationText(row.location)).filter(Boolean));
+  const city = payload.city || stringOrEmpty(contribution.city);
+  const country = payload.country || stringOrEmpty(contribution.country);
+  const rawAddress = rawAddresses.length === 1 && addressMatchesLocation(rawAddresses[0], city, country)
+    ? rawAddresses[0]
+    : "";
+  return {
+    ...payload,
+    roaster_name: payload.roaster_name || stringOrEmpty(cluster.display_name || cluster.normalized_name),
+    roaster_website_url: payload.roaster_website_url || cleanUrl(contribution.website_url),
+    city,
+    country,
+    address_text: payload.address_text || rawAddress,
+  };
+}
+
+function addressMatchesLocation(address, city, country) {
+  const addressKey = normalizeName(address);
+  const cityKey = normalizeName(city);
+  const countryKey = normalizeName(country);
+  if (!addressKey) return false;
+  if (cityKey) return addressKey.includes(cityKey);
+  if (countryKey) return addressKey.includes(countryKey);
+  return false;
+}
+
 function duplicateCheck(cluster, payload, roasters) {
   const nameKey = normalizeName(payload.roaster_name || cluster.display_name);
   const clusterKey = normalizeName(cluster.display_name || cluster.normalized_name);
   const payloadDomain = registrableDomain(payload.roaster_website_url);
   const matches = [];
+  const weakMatches = [];
 
   for (const roaster of roasters) {
     const roasterName = normalizeName(roaster.roaster_name);
     const aliases = aliasList(roaster.aliases).map(normalizeName);
     const domain = registrableDomain(roaster.roaster_website_url);
     if (roasterName && (roasterName === nameKey || roasterName === clusterKey)) {
-      matches.push({ kind: "name", roaster });
+      (identityAgreement(payload, roaster) ? matches : weakMatches).push({ kind: "name", roaster });
     } else if (aliases.includes(nameKey) || aliases.includes(clusterKey)) {
-      matches.push({ kind: "alias", roaster });
+      (identityAgreement(payload, roaster) ? matches : weakMatches).push({ kind: "alias", roaster });
     } else if (payloadDomain && domain && payloadDomain === domain && nameLikelyRelated(nameKey, roasterName)) {
       matches.push({ kind: "domain+name", roaster });
     }
@@ -291,6 +346,20 @@ function duplicateCheck(cluster, payload, roasters) {
       kind: "exact_existing",
       match: first.roaster,
       note: `Existing match considered: id ${first.roaster.id} ${first.roaster.roaster_name} (${first.kind}). Final verdict: do not create a duplicate.`,
+    };
+  }
+
+
+  if (weakMatches.length > 0) {
+    const first = weakMatches[0];
+    const hardConflict = identityConflict(payload, first.roaster);
+    return {
+      kind: hardConflict ? "identity_conflict" : "name_only",
+      match: first.roaster,
+      note: hardConflict
+        ? `Same-name/alias row id ${first.roaster.id} ${first.roaster.roaster_name} conflicts on website or country; alias is unsafe.`
+        : `Same-name/alias row id ${first.roaster.id} ${first.roaster.roaster_name} lacks a matching domain or city/country; alias is not proven.`,
+      re_enrich_notes: `Do not alias to roaster ${first.roaster.id} on name alone. Verify a matching official domain or city/country and resolve any geographic conflict first.`,
     };
   }
 
@@ -306,6 +375,27 @@ function duplicateCheck(cluster, payload, roasters) {
   }
 
   return { kind: "none", match: null, note: "No exact name, alias, or strong website-domain duplicate found in current coffee_roasters." };
+}
+
+function identityAgreement(payload, roaster) {
+  if (identityConflict(payload, roaster)) return false;
+  const payloadDomain = registrableDomain(payload.roaster_website_url);
+  const roasterDomain = registrableDomain(roaster.roaster_website_url);
+  if (payloadDomain && roasterDomain && payloadDomain === roasterDomain) return true;
+  const payloadCity = normalizeName(payload.city);
+  const roasterCity = normalizeName(roaster.city);
+  const payloadCountry = normalizeName(payload.country);
+  const roasterCountry = normalizeName(roaster.country);
+  return Boolean(payloadCity && roasterCity && payloadCountry && roasterCountry && payloadCity === roasterCity && payloadCountry === roasterCountry);
+}
+
+function identityConflict(payload, roaster) {
+  const payloadDomain = registrableDomain(payload.roaster_website_url);
+  const roasterDomain = registrableDomain(roaster.roaster_website_url);
+  if (payloadDomain && roasterDomain && payloadDomain !== roasterDomain) return true;
+  const payloadCountry = normalizeName(payload.country);
+  const roasterCountry = normalizeName(roaster.country);
+  return Boolean(payloadCountry && roasterCountry && payloadCountry !== roasterCountry);
 }
 
 function findBatchDuplicates(cards) {
@@ -382,7 +472,7 @@ function groupBy(rows, key) {
   return map;
 }
 
-function collectSources(result, payload, contributions = []) {
+function collectSources(result, payload, contributions = [], freshSources = []) {
   const out = [];
   const add = (url, kind = "source") => {
     const cleaned = cleanUrl(url);
@@ -396,6 +486,7 @@ function collectSources(result, payload, contributions = []) {
     add(contribution.instagram_url, "user-submitted instagram");
   }
   for (const source of result?.sources || []) add(source.url, "enrichment");
+  for (const source of freshSources) add(source.url, source.kind || "fresh bean-name research");
   return out;
 }
 
@@ -646,7 +737,7 @@ button:hover{background:#f0e8da}
 <body>
 <header>
 <h1>Roaster Candidate Review</h1>
-<div>Generated ${generatedAt}. Batch: top 50 pending eligible clusters by candidate_count/occurrences. Clusters with active queued/running enrichment were skipped. No writes have been made.</div>
+<div>Generated ${generatedAt}. Batch: ${cards.length} pending eligible clusters${fixedCards.length ? ` from fixed cards ${fixedCards[0]?.card}–${fixedCards.at(-1)?.card}` : ", newest user contributions first, then candidate_count/occurrences"}. Clusters with active queued/running enrichment were skipped. Preview generation made no database writes.</div>
 <div class="summary">${Object.entries(counts).map(([k, v]) => `<span class="pill">${esc(k)}: ${v}</span>`).join("")}</div>
 </header>
 <main>
@@ -741,9 +832,9 @@ function renderCard(card) {
   const logo = card.payload.roaster_logo_url || "";
   const links = card.sources.map((source) => ({ href: source.url, label: `${source.kind}: ${linkLabel(source.url)}` }));
   const payload = card.recommendation === "complete existing"
-    ? { ...card.payload, action: "complete_existing", row_changes: "none" }
+    ? { target_roaster_id: card.target_roaster_id, target_roaster_name: card.target_roaster_name, action: "complete_existing", row_changes: "none" }
     : card.recommendation === "approve alias"
-      ? { ...card.payload, action: "add_alias_then_processed_as_alias" }
+      ? { target_roaster_id: card.target_roaster_id, target_roaster_name: card.target_roaster_name, alias_to_add: card.alias_to_add, action: "add_alias_then_processed_as_alias" }
       : card.payload;
   return `<section class="card" data-card="${card.card}" data-cluster-id="${esc(card.cluster_id)}" data-title="${esc(card.title)}" data-recommendation="${esc(card.recommendation)}">
   <div class="top">
