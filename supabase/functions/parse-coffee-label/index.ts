@@ -22,6 +22,13 @@ import {
   ROAST_DATE_RESPONSE_SCHEMA,
   shouldFallbackProviderError,
 } from "./label-utils.ts";
+import {
+  makeRoasterLinkDeps,
+  readRoasterLinkMode,
+  type RoasterLinkDb,
+  type RoasterLinkMode,
+  runRoasterLink,
+} from "./roaster-link.ts";
 // --- Provider credentials ---
 const aiGatewayApiKey = Deno.env.get('AI_GATEWAY_API_KEY');
 const cerebrasApiKey = Deno.env.get('CEREBRAS_API_KEY');
@@ -38,6 +45,32 @@ if (!supabaseUrl || !supabaseServiceRoleKey) {
   Deno.exit(1);
 }
 const supabase = createClient(supabaseUrl, supabaseServiceRoleKey);
+// --- Roaster link (plan 034 §2.2): Jev-based catalog roaster matching ---
+// Both flags default to off, in which case nothing runs and the response is
+// byte-identical to a deployment without this block. The resolved mode is
+// cached for 60s so scans do not hit service.feature_flags on every request;
+// a failed flag read resolves to "off" (fail closed) and is cached too.
+const ROASTER_LINK_MODE_TTL_MS = 60_000;
+let roasterLinkModeCache: {
+  mode: RoasterLinkMode;
+  expiresAt: number;
+} | null = null;
+const roasterLinkDeps = makeRoasterLinkDeps(
+  supabase as unknown as RoasterLinkDb,
+);
+// Supabase Edge Runtime global; absent in plain Deno (tests, local runs),
+// hence the typeof guard at the shadow-mode call site.
+declare const EdgeRuntime: { waitUntil(promise: Promise<unknown>): void };
+async function getRoasterLinkMode(): Promise<RoasterLinkMode> {
+  const cached = roasterLinkModeCache;
+  if (cached && cached.expiresAt > Date.now()) return cached.mode;
+  const mode = await readRoasterLinkMode(roasterLinkDeps.db);
+  roasterLinkModeCache = {
+    mode,
+    expiresAt: Date.now() + ROASTER_LINK_MODE_TTL_MS,
+  };
+  return mode;
+}
 function getErrorMessage(error) {
   if (error instanceof Error) return error.message;
   if (typeof error === 'string') return error;
@@ -943,6 +976,28 @@ serve(async (req)=>{
         tokens_used: tokensToUse
       }
     ]);
+    // --- Roaster link (plan 034 §2.2) ---
+    // Shadow mode: fire-and-forget after this response is serialized; it
+    // never touches `result`, so the payload stays byte-identical. Enforce
+    // mode: awaited (bounded by an 800 ms overall deadline in roaster-link)
+    // and is the only mode that may set result.roasterLink. Mode "off":
+    // nothing runs at all.
+    const roasterLinkMode = await getRoasterLinkMode();
+    if (roasterLinkMode === "shadow") {
+      if (typeof EdgeRuntime !== "undefined") {
+        EdgeRuntime.waitUntil(
+          runRoasterLink(roasterLinkDeps, result, {
+            mode: "shadow",
+            correlationId: requestId
+          })
+        );
+      }
+    } else if (roasterLinkMode === "enforce") {
+      result.roasterLink = await runRoasterLink(roasterLinkDeps, result, {
+        mode: "enforce",
+        correlationId: requestId
+      });
+    }
     return new Response(JSON.stringify(result), {
       headers: {
         ...cors,

@@ -194,6 +194,13 @@ const ENV_CONFIGS: EnvVarConfig[] = [
     description: 'Batch size for scheduled notifications',
     defaultValue: '100',
     validator: (value) => !isNaN(Number(value)) && Number(value) > 0
+  },
+
+  // TypeSafe AI (Jev decision model)
+  {
+    name: 'TYPESAFE_API_KEY',
+    required: false,
+    description: 'TypeSafe AI API key for the Jev decision-model client; consumers fall back to their non-Jev path when unset'
   }
 ];
 

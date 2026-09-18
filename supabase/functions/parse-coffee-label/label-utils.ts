@@ -19,6 +19,14 @@ type LabelFieldType = "string" | "number";
 // never carries harvest-date data.
 const LABEL_FIELDS: Record<string, LabelFieldType> = {
   roaster: "string",
+  // The roaster's distinctive brand proper noun, without the generic
+  // roastery/coffee word in whatever language the bag prints it ("Phoenix
+  // Coffee Roasters GmbH" -> "Phoenix"). Feeds catalog linking downstream,
+  // where localized generic suffixes ("Kaffeerösterei", "Pražírna kávy")
+  // otherwise cost up to 22 points of match accuracy. Optional and nullable:
+  // the model returns null when it cannot separate brand from generic word,
+  // and normalizeResult() defaults it to null when a provider omits the key.
+  roasterBrandName: "string",
   name: "string",
   origin: "string",
   farm: "string",
@@ -212,6 +220,11 @@ const TITLE_CASE_FIELDS = new Set([
   "variety",
   "region",
   "tastingNotes",
+  // roasterBrandName is deliberately NOT listed: the prompt asks the model to
+  // keep the brand's original script and spelling because the string is
+  // matched against the catalog verbatim, and title-casing would corrupt
+  // all-caps acronym brands ("KBNK" -> "Kbnk"). It still gets null-token
+  // normalization like every other string field.
 ]);
 
 function hasLetters(value: string): boolean {
@@ -266,6 +279,9 @@ function isNullToken(trimmed: string): boolean {
  * present in `LABEL_FIELDS`. `harvestDate` is deliberately excluded from
  * `LABEL_FIELDS` (see note above it) so a schema echo with a
  * normalizeResult-appended `harvestDate: null` still fails this check.
+ * `roasterBrandName` IS in `LABEL_FIELDS`, so normalizeResult only defaults
+ * it to null on records that already carry another recognized field — never
+ * on a schema echo, which must keep failing this check.
  */
 export function isPlausibleLabelResult(result: unknown): boolean {
   if (!result || typeof result !== "object" || Array.isArray(result)) {
@@ -335,6 +351,28 @@ export function normalizeResult(parsedContent: unknown): unknown {
   // response (which has no keys other than roastDate).
   if (!isErrorEnvelope && Object.keys(record).length > 1) {
     record.harvestDate = null;
+  }
+
+  // roasterBrandName is a newer, optional extraction field: the json_object
+  // providers and the roast-date recheck schema can omit it. Default it to
+  // null on real extraction results so downstream consumers can rely on the
+  // key being present. This block must stay AFTER the harvestDate block
+  // above: a single-key roastDate-only recheck response gains
+  // roasterBrandName here, and if it gained the key first, the recheck shape
+  // would have >1 keys and wrongly trip the harvestDate force-add.
+  //
+  // The recognized-field guard matters: only default when the record already
+  // carries a recognized label field, so a schema echo (no recognized
+  // fields) does not gain one and slip past isPlausibleLabelResult — the
+  // same reasoning that keeps harvestDate out of LABEL_FIELDS entirely.
+  if (
+    !isErrorEnvelope &&
+    !Object.prototype.hasOwnProperty.call(record, "roasterBrandName") &&
+    Object.keys(record).some((key) =>
+      Object.prototype.hasOwnProperty.call(LABEL_FIELDS, key)
+    )
+  ) {
+    record.roasterBrandName = null;
   }
 
   return record;

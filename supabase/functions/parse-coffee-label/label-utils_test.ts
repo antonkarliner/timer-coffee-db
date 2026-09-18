@@ -234,6 +234,135 @@ Deno.test("normalizeResult does not add harvestDate to a roastDate-only recheck 
 });
 
 // ---------------------------------------------------------------------------
+// normalizeResult — roasterBrandName
+// ---------------------------------------------------------------------------
+
+Deno.test("normalizeResult preserves a populated roasterBrandName", () => {
+  const result = normalizeResult({
+    roaster: "PHOENIX COFFEE ROASTERS GMBH",
+    roasterBrandName: "Phoenix",
+  }) as Record<string, unknown>;
+
+  assertEquals(
+    result.roaster,
+    "Phoenix Coffee Roasters Gmbh",
+    "roaster keeps its existing title-casing behavior",
+  );
+  assertEquals(
+    result.roasterBrandName,
+    "Phoenix",
+    "a populated roasterBrandName should pass through normalization",
+  );
+});
+
+Deno.test("normalizeResult does not title-case roasterBrandName", () => {
+  // The brand name is matched against the catalog verbatim and the prompt
+  // says to keep original script and spelling — an all-caps acronym brand
+  // must not be rewritten to "Kbnk".
+  const result = normalizeResult({
+    roaster: "KBNK Киев, Украина",
+    roasterBrandName: "KBNK",
+  }) as Record<string, unknown>;
+
+  assertEquals(
+    result.roasterBrandName,
+    "KBNK",
+    "all-caps acronym brands must keep their original spelling",
+  );
+});
+
+Deno.test("normalizeResult null-token-normalizes roasterBrandName like other string fields", () => {
+  const result = normalizeResult({
+    roaster: "Acme",
+    roasterBrandName: "Unknown",
+  }) as Record<string, unknown>;
+
+  assertEquals(
+    result.roasterBrandName,
+    null,
+    '"Unknown" in roasterBrandName should normalize to null',
+  );
+});
+
+Deno.test("normalizeResult defaults roasterBrandName to null when the model omits it", () => {
+  const result = normalizeResult({
+    roaster: "Adrenaline Kaffeerösterei",
+    name: "Filter Blend",
+  }) as Record<string, unknown>;
+
+  assert(
+    Object.prototype.hasOwnProperty.call(result, "roasterBrandName"),
+    "the key should be present so downstream consumers can rely on it",
+  );
+  assertEquals(
+    result.roasterBrandName,
+    null,
+    "an omitted roasterBrandName should default to null",
+  );
+});
+
+Deno.test("normalizeResult keeps an explicitly null roasterBrandName null", () => {
+  const result = normalizeResult({
+    roaster: "Acme",
+    roasterBrandName: null,
+  }) as Record<string, unknown>;
+
+  assertEquals(result.roasterBrandName, null, "explicit null stays null");
+  assert(
+    Object.prototype.hasOwnProperty.call(result, "roasterBrandName"),
+    "an explicit null must not be deleted",
+  );
+});
+
+Deno.test("normalizeResult does not add roasterBrandName to the error envelope", () => {
+  const result = normalizeResult({
+    error: "No coffee labels detected",
+  }) as Record<string, unknown>;
+
+  assert(
+    !Object.prototype.hasOwnProperty.call(result, "roasterBrandName"),
+    "error envelope must not gain a roasterBrandName key",
+  );
+});
+
+Deno.test("normalizeResult does not default roasterBrandName onto a schema echo", () => {
+  const schemaEcho = {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    type: "object",
+    properties: {},
+  };
+  const normalized = normalizeResult(schemaEcho) as Record<string, unknown>;
+
+  assert(
+    !Object.prototype.hasOwnProperty.call(normalized, "roasterBrandName"),
+    "a schema echo has no recognized label fields, so it must not gain one via the default",
+  );
+  assertEquals(
+    isPlausibleLabelResult(normalized),
+    false,
+    "the roasterBrandName default must not let a schema echo slip past isPlausibleLabelResult",
+  );
+});
+
+Deno.test("normalizeResult with roasterBrandName still cleans up a null error property", () => {
+  const result = normalizeResult({
+    roaster: "Café Huitzil",
+    roasterBrandName: "Café Huitzil",
+    error: null,
+  }) as Record<string, unknown>;
+
+  assert(
+    !Object.prototype.hasOwnProperty.call(result, "error"),
+    "a null error property should still be deleted when roasterBrandName is present",
+  );
+  assertEquals(
+    result.roasterBrandName,
+    "Café Huitzil",
+    "roasterBrandName should be unaffected by the error cleanup",
+  );
+});
+
+// ---------------------------------------------------------------------------
 // normalizeResult — schema-driven error:null cleanup
 // ---------------------------------------------------------------------------
 
@@ -417,6 +546,19 @@ Deno.test("isPlausibleLabelResult accepts a normal extraction result", () => {
     }),
     true,
     "a result with recognized label fields is plausible",
+  );
+});
+
+Deno.test("isPlausibleLabelResult still accepts a result without roasterBrandName", () => {
+  assertEquals(
+    isPlausibleLabelResult({ roaster: "Adrenaline Kaffeerösterei" }),
+    true,
+    "the new field must not become required for plausibility",
+  );
+  assertEquals(
+    isPlausibleLabelResult({ roastDate: "2026-07-01" }),
+    true,
+    "a roastDate-only result without roasterBrandName stays plausible too",
   );
 });
 
