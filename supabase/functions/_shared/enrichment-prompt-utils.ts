@@ -189,7 +189,7 @@ function shrinkPage(
 
 /**
  * Bound the size of the `{urls, pages, candidate_context}` evidence bundle
- * embedded in the DeepSeek summary prompt. Never drops urls or
+ * embedded in the evidence summary prompt. Never drops urls or
  * candidate_context, never throws on weird input (null pages, non-object
  * pages pass through untouched by the per-page shrink step, though they
  * still count toward the total-budget page-dropping pass).

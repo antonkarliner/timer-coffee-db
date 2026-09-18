@@ -70,7 +70,7 @@ supabase/.temp/
 memory-bank/
 
 # Internal planning notes
-plans/
+plans
 
 # Local development
 .env.local
@@ -80,3 +80,9 @@ plans/
 supabase/seed.sql.backup
 .stfolder/syncthing-folder-180021.txt
 /review-previews
+
+# Agent rules are symlinked in from the private plans repo
+.claude/rules/
+
+# delegate-glm scratch worktrees and their run logs (reached 41MB on 2026-09-16)
+.claude/worktrees/
