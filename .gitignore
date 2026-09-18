@@ -89,3 +89,4 @@ supabase/seed.sql.backup
 
 # Roaster candidate review batches (local working data)
 scripts/roaster-review/
+scripts/roasters-to-add-preview.html
