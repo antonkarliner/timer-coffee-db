@@ -2,13 +2,14 @@ import { serve } from "https://deno.land/std@0.223.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.42.5";
 import { getCorsHeaders } from "../_shared/cors.ts";
 import { createModerationClient } from "../_shared/moderation.ts";
+import { jevAsk, prewarmJevConnection } from "../_shared/jev-client.ts";
+import { getEnvBoolean, getEnvNumber } from "../_shared/env-validation.ts";
 import { resolveVerifiedUser } from "./auth.ts";
 const FUNCTION_NAME = "submit_yearly_wish";
 const MAX_REQUESTS = 3;
 const WINDOW_SECONDS = 60;
 const openaiApiKey = Deno.env.get("OPENAI_API_KEY_NON_PERSONAL");
 const groqApiKey = Deno.env.get("GROQ_API_KEY");
-const cerebrasApiKey = Deno.env.get("CEREBRAS_API_KEY");
 const geminiServiceAccountKeyJson = Deno.env.get("GOOGLE_APPLICATION_CREDENTIALS_JSON");
 const geminiProjectId = Deno.env.get("GEMINI_PROJECT_ID") ?? "";
 const geminiRegion = Deno.env.get("GEMINI_REGION") ?? "";
@@ -18,8 +19,8 @@ if (!openaiApiKey) {
   console.error("OPENAI_API_KEY_NON_PERSONAL is not set in environment variables.");
   Deno.exit(1);
 }
-if (!groqApiKey && !cerebrasApiKey && !geminiServiceAccountKeyJson) {
-  console.error("No secondary moderation provider is configured. Set GROQ_API_KEY, CEREBRAS_API_KEY, or Gemini credentials.");
+if (!groqApiKey && !geminiServiceAccountKeyJson) {
+  console.error("No secondary moderation provider is configured. Set GROQ_API_KEY or Gemini credentials.");
   Deno.exit(1);
 }
 if (!supabaseUrl) {
@@ -36,13 +37,18 @@ const supabaseAdmin = createClient(supabaseUrl, supabaseServiceRoleKey, {
     detectSessionInUrl: false
   }
 });
+// Jev is the primary text classifier; the Groq/omni chain is its offline
+// fallback. See _shared/moderation.ts for the held-out evidence.
+const jevEnabled = getEnvBoolean("MODERATION_JEV_ENABLED", true);
 const moderator = createModerationClient({
   openaiApiKey: openaiApiKey,
   groqApiKey: groqApiKey,
-  cerebrasApiKey: cerebrasApiKey,
   geminiServiceAccountKeyJson: geminiServiceAccountKeyJson,
   geminiProjectId: geminiProjectId,
-  geminiRegion: geminiRegion
+  geminiRegion: geminiRegion,
+  jevAsk,
+  jevEnabled,
+  jevTimeoutMs: getEnvNumber("MODERATION_JEV_TIMEOUT_MS", 800)
 });
 function jsonResponse(body: unknown, status: number, cors: HeadersInit) {
   return new Response(JSON.stringify(body), {
@@ -72,6 +78,11 @@ serve(async (req)=>{
       error: "Bad Request",
       message: "Content-Type must be application/json"
     }, 400, cors);
+  }
+  // Warm the TypeSafe connection while auth and rate limiting run; see the
+  // same call in content-moderation. Never awaited, never rejects.
+  if (jevEnabled) {
+    prewarmJevConnection().catch(()=>null);
   }
   const authResult = await resolveVerifiedUser(
     req.headers.get("Authorization"),
@@ -173,7 +184,10 @@ serve(async (req)=>{
       textLength: trimmedText.length,
       locale
     });
-    const moderationResult = await moderator.moderateText(trimmedText);
+    const moderationResult = await moderator.moderateText(trimmedText, {
+      surface: "wish",
+      correlationId: `submit-yearly-wish:${userId}`
+    });
     const status = moderationResult.safe ? "approved" : "rejected";
     const moderationReason = moderationResult.safe ? null : moderationResult.reason ?? "Rejected by moderation";
     if (!moderationResult.safe) {

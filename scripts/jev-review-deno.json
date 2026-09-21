@@ -1,0 +1,5 @@
+{
+  "imports": {
+    "../supabase/functions/_shared/monitoring.ts": "./jev-review-logger.ts"
+  }
+}

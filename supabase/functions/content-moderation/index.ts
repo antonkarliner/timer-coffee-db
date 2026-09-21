@@ -2,7 +2,13 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2.42.5";
 import { serve } from "https://deno.land/std@0.223.0/http/server.ts";
 import { getCorsHeaders } from "../_shared/cors.ts";
 import { OPENAI_SPECIALIZED_MODELS } from "../_shared/ai-models.ts";
-import { createModerationClient } from "../_shared/moderation.ts";
+import {
+  createModerationClient,
+  MODERATION_SURFACE_LABEL,
+  type ModerationSurface,
+} from "../_shared/moderation.ts";
+import { jevAsk, prewarmJevConnection } from "../_shared/jev-client.ts";
+import { getEnvBoolean, getEnvNumber } from "../_shared/env-validation.ts";
 import { resolveVerifiedUser } from "./auth.ts";
 // --- Rate Limiting Configuration ---
 const FUNCTION_NAME = "content-moderation";
@@ -11,7 +17,6 @@ const WINDOW_SECONDS = 60;
 // --- Environment Variables ---
 const openaiApiKey = Deno.env.get("OPENAI_API_KEY_NON_PERSONAL");
 const groqApiKey = Deno.env.get("GROQ_API_KEY");
-const cerebrasApiKey = Deno.env.get("CEREBRAS_API_KEY");
 const geminiServiceAccountKeyJson = Deno.env.get("GOOGLE_APPLICATION_CREDENTIALS_JSON");
 const geminiProjectId = Deno.env.get("GEMINI_PROJECT_ID") ?? "";
 const geminiRegion = Deno.env.get("GEMINI_REGION") ?? "";
@@ -21,8 +26,8 @@ if (!openaiApiKey) {
   console.error("OPENAI_API_KEY_NON_PERSONAL is not set.");
   Deno.exit(1);
 }
-if (!groqApiKey && !cerebrasApiKey && !geminiServiceAccountKeyJson) {
-  console.error("No secondary moderation provider is configured. Set GROQ_API_KEY, CEREBRAS_API_KEY, or Gemini credentials.");
+if (!groqApiKey && !geminiServiceAccountKeyJson) {
+  console.error("No secondary moderation provider is configured. Set GROQ_API_KEY or Gemini credentials.");
   Deno.exit(1);
 }
 if (!supabaseUrl) {
@@ -33,14 +38,31 @@ if (!supabaseServiceRoleKey) {
   console.error("SUPABASE_SERVICE_ROLE_KEY is not set.");
   Deno.exit(1);
 }
+// Jev is the primary text classifier; the Groq/omni chain is its offline
+// fallback. See _shared/moderation.ts for the held-out evidence. Both knobs
+// are secrets so a cutover can be reverted without a code change.
+const jevEnabled = getEnvBoolean("MODERATION_JEV_ENABLED", true);
 const moderator = createModerationClient({
   openaiApiKey,
   groqApiKey,
-  cerebrasApiKey,
   geminiServiceAccountKeyJson,
   geminiProjectId,
-  geminiRegion
+  geminiRegion,
+  jevAsk,
+  jevEnabled,
+  jevTimeoutMs: getEnvNumber("MODERATION_JEV_TIMEOUT_MS", 800)
 });
+
+// Derived from the label map so the accepted values cannot drift from the
+// ones the Jev rubric was evaluated against. An unknown or absent value is
+// not an error: moderation.ts falls back to a generic `where_it_appears`
+// label. The app sends this from lib/config/moderation_surfaces.dart.
+const KNOWN_SURFACES = new Set<string>(Object.keys(MODERATION_SURFACE_LABEL));
+function parseSurface(value: unknown): ModerationSurface | undefined {
+  return typeof value === "string" && KNOWN_SURFACES.has(value)
+    ? value as ModerationSurface
+    : undefined;
+}
 const supabaseAdmin = createClient(supabaseUrl, supabaseServiceRoleKey, {
   auth: {
     persistSession: false,
@@ -112,6 +134,14 @@ serve(async (req)=>{
       status: 400,
       headers: cors
     });
+  }
+  // Open the TypeSafe connection while auth and rate limiting run, so the
+  // Jev call does not pay DNS+TCP+TLS inside its 800 ms budget (measured
+  // ~654 ms cold vs ~246 ms warm from the edge). Never awaited, never
+  // rejects, never billed; the catch only keeps it from becoming an
+  // unhandled rejection when the request ends first.
+  if (jevEnabled) {
+    prewarmJevConnection().catch(()=>null);
   }
   // --- Verified user identity ---
   const authResult = await resolveVerifiedUser(
@@ -198,6 +228,7 @@ serve(async (req)=>{
     });
   }
   const { text, imageBase64 } = requestPayload;
+  const surface = parseSurface(requestPayload.surface);
   if (!text && !imageBase64) {
     return new Response("Bad Request: Missing 'text' or 'imageBase64' in request body.", {
       status: 400,
@@ -212,13 +243,17 @@ serve(async (req)=>{
   }
   console.log("Received moderation request:", {
     text: text ? text.substring(0, 50) + "..." : undefined,
-    imageBase64: imageBase64 ? "Present" : undefined
+    imageBase64: imageBase64 ? "Present" : undefined,
+    surface: surface ?? "unspecified"
   });
   // --- Moderation ---
   try {
     let result;
     if (text) {
-      result = await moderator.moderateText(text);
+      result = await moderator.moderateText(text, {
+        surface,
+        correlationId: `content-moderation:${userId}`
+      });
     } else {
       result = await moderateImage(imageBase64);
     }
