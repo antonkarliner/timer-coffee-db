@@ -176,6 +176,14 @@ verify_jwt = false
 [functions.admin-recipe-collections]
 verify_jwt = true
 
+# The caller is resolved from the JWT inside the function; see plan 039.
+[functions.update-id-after-signin]
+verify_jwt = true
+
+# The caller is resolved from the JWT inside the function; see plan 039.
+[functions.clean-before-deletion]
+verify_jwt = true
+
 [functions.schedule-launch-popup]
 verify_jwt = true
 
