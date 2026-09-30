@@ -324,3 +324,54 @@ Deno.test("Google paginates, downloads only matching country files, and falls ba
     globalThis.fetch = previous;
   }
 });
+
+Deno.test("Google storage failures expose only stage, status and allowlisted reasons", async () => {
+  const original = globalThis.fetch;
+  try {
+    globalThis.fetch = (() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            error: {
+              message: "private account and credential details",
+              errors: [{ reason: "forbidden" }],
+            },
+          }),
+          { status: 403 },
+        ),
+      )) as typeof fetch;
+    try {
+      await collectGoogleReport(
+        "test-bucket",
+        "com.coffee.timer",
+        "private-token",
+        date,
+      );
+      throw new Error("Expected storage rejection");
+    } catch (error) {
+      equal((error as Error).message, "google_list_http_403_forbidden");
+    }
+    globalThis.fetch = (() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            error: { errors: [{ reason: "private-account-identifier" }] },
+          }),
+          { status: 403 },
+        ),
+      )) as typeof fetch;
+    try {
+      await collectGoogleReport(
+        "test-bucket",
+        "com.coffee.timer",
+        "private-token",
+        date,
+      );
+      throw new Error("Expected storage rejection");
+    } catch (error) {
+      equal((error as Error).message, "google_list_http_403");
+    }
+  } finally {
+    globalThis.fetch = original;
+  }
+});

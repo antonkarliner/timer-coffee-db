@@ -100,6 +100,12 @@ Deno.test("public ratings response preserves caching over shared no-store header
     );
     equal(cached.status, 304);
     equal(await cached.text(), "");
+    const weak = await handler(request("GET", {
+      "If-None-Match": `"other", W/${response.headers.get("ETag")!}`,
+    }));
+    equal(weak.status, 304);
+    const wildcard = await handler(request("HEAD", { "If-None-Match": "*" }));
+    equal(wildcard.status, 304);
     const head = await handler(request("HEAD"));
     equal(head.status, 200);
     equal(await head.text(), "");

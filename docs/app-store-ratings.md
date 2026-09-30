@@ -68,13 +68,16 @@ Source creation does not deploy or apply anything. Use the Supabase CLI:
 supabase migration list
 supabase db push --dry-run
 # Check that ONLY the intended ratings migration is pending before applying.
-supabase db push
 supabase functions deploy sync-app-store-ratings
 supabase functions deploy sync-google-play-ratings
 supabase functions deploy get-app-store-ratings
+supabase db push
 ```
 
-Deploy the functions before the first scheduled window. Do not repair migration
+Deploy the functions before applying migrations: the bootstrap migration queues
+one initial refresh through the same Vault/pg_net dispatcher used by cron. Check
+the eventual responses in `net._http_response`. Deploy before the first scheduled
+window. Do not repair migration
 history or include unrelated pending migrations automatically.
 
 Invoke the collectors server-side using the existing cron token (never put it in
@@ -148,3 +151,28 @@ Official contracts:
 - [Google report format, access and lag](https://support.google.com/googleplay/android-developer/answer/6135870?hl=en)
 - [Google rating definitions](https://support.google.com/googleplay/android-developer/answer/138230?hl=en)
 - [Supabase scheduling and Vault](https://supabase.com/docs/guides/functions/schedule-functions)
+
+## Production verification, 2026-09-30
+
+The three functions and pipeline migration were deployed using the CLI. A full
+Apple sweep collected all 175 storefronts (174 available, 59 with ratings) and
+published an approximate weighted average of 4.913693114446529 from 533 ratings.
+Unauthenticated collector calls returned 401; the public GET and HEAD returned
+200 with the expected cache policy. A live gateway weakened the ETag during
+compression, so conditional GET now uses weak comparison and handles tag lists
+and the wildcard validator.
+
+Google OAuth authentication succeeded, but bucket listing returned
+`google_list_http_403_forbidden`. The configured bucket digest matches the URI
+copied directly from Play Console. No Google snapshot was published. Verify that
+the JSON's `client_email` matches the service account granted account-wide bulk
+report access before retrying. Successful access still needs an explicit overall
+rating row to produce a worldwide snapshot.
+
+The follow-up bootstrap migration exercised the actual Vault/pg_net cron path:
+Apple returned 200/complete, and Google reached its authenticated collector but
+returned 502 with the same upstream storage permission error. Both cron jobs are
+active. Live conditional GET (weak ETag and a tag list) and conditional HEAD
+(wildcard) returned 304 after the gateway fix; plain HEAD returned 200 with an
+empty body, writes returned 405, and the landing origin's CORS header matched.
+A repeat Apple collector invocation returned complete without collecting again.

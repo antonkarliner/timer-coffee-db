@@ -1,6 +1,5 @@
 import {
   CollectionError,
-  fetchChecked,
   isSourceDate,
   type Observation,
   type Snapshot,
@@ -9,6 +8,50 @@ import {
 const STORAGE_SCOPE = "https://www.googleapis.com/auth/devstorage.read_only";
 const TOKEN_URL = "https://oauth2.googleapis.com/token";
 const MAX_REPORT_BYTES = 8 * 1024 * 1024;
+
+// Return only allowlisted diagnostic reasons, never Google's raw error text,
+// which can include account identifiers or request details.
+async function fetchGoogle(
+  url: string | URL,
+  init: RequestInit,
+  stage: "oauth" | "list" | "download",
+  timeout = 10_000,
+): Promise<Response> {
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      ...init,
+      signal: AbortSignal.timeout(timeout),
+      redirect: "error",
+    });
+  } catch {
+    throw new CollectionError(`google_${stage}_request_failed`);
+  }
+  if (response.ok) return response;
+  let reason = "";
+  try {
+    const body = await response.json();
+    const reasons = [
+      ...(body.error?.errors ?? []),
+      ...(body.error?.details ?? []),
+    ].map((item: { reason?: string }) => item.reason);
+    const known = [
+      "forbidden",
+      "insufficientPermissions",
+      "accessNotConfigured",
+      "SERVICE_DISABLED",
+      "IAM_PERMISSION_DENIED",
+      "notFound",
+    ];
+    const match = reasons.find((value: unknown) =>
+      typeof value === "string" && known.includes(value)
+    );
+    if (match) {
+      reason = `_${match.replace(/([a-z])([A-Z])/g, "$1_$2").toLowerCase()}`;
+    }
+  } catch { /* A non-JSON error still has a safe status and stage. */ }
+  throw new CollectionError(`google_${stage}_http_${response.status}${reason}`);
+}
 
 function base64url(bytes: Uint8Array): string {
   return btoa(Array.from(bytes, (byte) => String.fromCharCode(byte)).join(""))
@@ -67,14 +110,14 @@ export async function getGoogleStorageToken(json: string): Promise<string> {
   } catch {
     throw new CollectionError("google_invalid_credentials");
   }
-  const response = await fetchChecked(TOKEN_URL, {
+  const response = await fetchGoogle(TOKEN_URL, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
       grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
       assertion: `${unsigned}.${base64url(new Uint8Array(signature))}`,
     }),
-  });
+  }, "oauth");
   const token = await response.json();
   if (typeof token.access_token !== "string" || !token.access_token) {
     throw new CollectionError("google_token_missing");
@@ -247,9 +290,9 @@ export async function collectGoogleReport(
       fields: "items(name),nextPageToken",
       ...(pageToken ? { pageToken } : {}),
     }).toString();
-    const response = await fetchChecked(url, {
+    const response = await fetchGoogle(url, {
       headers: { Authorization: `Bearer ${token}` },
-    });
+    }, "list");
     const listing = await response.json();
     for (const item of listing.items ?? []) {
       if (typeof item.name !== "string") {
@@ -270,9 +313,14 @@ export async function collectGoogleReport(
     const url = `https://storage.googleapis.com/storage/v1/b/${
       encodeURIComponent(bucket)
     }/o/${encodeURIComponent(name)}?alt=media`;
-    const response = await fetchChecked(url, {
-      headers: { Authorization: `Bearer ${token}` },
-    }, 20_000);
+    const response = await fetchGoogle(
+      url,
+      {
+        headers: { Authorization: `Bearer ${token}` },
+      },
+      "download",
+      20_000,
+    );
     const reader = response.body?.getReader();
     if (!reader) throw new CollectionError("google_empty_report");
     const chunks: Uint8Array[] = [];

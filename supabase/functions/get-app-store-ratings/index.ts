@@ -49,7 +49,14 @@ export async function handler(req: Request): Promise<Response> {
         "Expires": "",
       }
       : { "Cache-Control": "no-store" };
-    if (req.headers.get("If-None-Match") === etag && ratings.length) {
+    // GET/HEAD use weak comparison; gateways may weaken an ETag when compressing.
+    const matches = req.headers.get("If-None-Match")?.split(",").some(
+      (value) => {
+        const tag = value.trim();
+        return tag === "*" || tag.replace(/^W\//, "") === etag;
+      },
+    );
+    if (matches && ratings.length) {
       return jsonResponse(req, undefined, 304, headers);
     }
     return jsonResponse(
