@@ -15,6 +15,18 @@ export async function handler(req: Request): Promise<Response> {
   const gate = collectorGate(req);
   if (gate) return gate;
   try {
+    if (new URL(req.url).searchParams.get("diagnostics") === "identity") {
+      // Privileged, uncached metadata only; no key, token, or DB mutation.
+      const account = JSON.parse(requiredEnv("GOOGLE_PLAY_SERVICE_ACCOUNT"));
+      const email = account?.client_email;
+      if (
+        typeof email !== "string" || email.length > 320 ||
+        !/^[^@\s]+@[^@\s]+\.gserviceaccount\.com$/.test(email)
+      ) {
+        throw new CollectionError("google_invalid_credentials");
+      }
+      return jsonResponse(req, { serviceAccountEmail: email });
+    }
     const packageName = requiredEnv("GOOGLE_PLAY_PACKAGE_NAME");
     const bucket = requiredEnv("GOOGLE_PLAY_REPORTS_BUCKET");
     const credentials = requiredEnv("GOOGLE_PLAY_SERVICE_ACCOUNT");

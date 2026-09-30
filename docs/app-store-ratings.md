@@ -185,4 +185,12 @@ that direct object access is denied too. Compare the JSON secret's `client_email
 with the exact Play Console user granted global bulk-report read access. The
 service account whose permission was inspected in the console was
 `version-check@timer-coffee-play-store.iam.gserviceaccount.com`; the deployed
-secret's account identity has not been independently verified.
+secret's account identity was subsequently verified through the authenticated
+email-only diagnostic and matches that account.
+
+If the local service-account JSON is unavailable, an authenticated POST to
+`sync-google-play-ratings?diagnostics=identity` returns only `serviceAccountEmail`.
+The existing collector authorization runs first, the response is uncached, and
+this action makes no database writes or Google requests. Keys and tokens are
+never returned or logged. Production verification returned 401 without auth and
+200 with only the expected service-account email using the service credential.

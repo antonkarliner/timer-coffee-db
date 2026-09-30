@@ -15,6 +15,9 @@ for (
 ) Deno.env.set(name, value);
 const { handler } = await import("../../get-app-store-ratings/index.ts");
 const { collectorGate } = await import("./http.ts");
+const { handler: google } = await import(
+  "../../sync-google-play-ratings/index.ts"
+);
 
 function equal(actual: unknown, expected: unknown) {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
@@ -138,5 +141,44 @@ Deno.test("empty and failed snapshots are not cached and endpoint denies writes"
     equal((await handler(request("POST"))).status, 405);
   } finally {
     globalThis.fetch = previous;
+  }
+});
+
+Deno.test("Google identity diagnostics require privileged auth and reveal only an uncached account email", async () => {
+  const previousFetch = globalThis.fetch;
+  const previousCredentials = Deno.env.get("GOOGLE_PLAY_SERVICE_ACCOUNT");
+  globalThis.fetch = (() => {
+    throw new Error("Diagnostics must not contact upstream or DB");
+  }) as typeof fetch;
+  const url =
+    "https://ratings-test.supabase.co/functions/v1/sync-google-play-ratings?diagnostics=identity";
+  try {
+    Deno.env.set(
+      "GOOGLE_PLAY_SERVICE_ACCOUNT",
+      JSON.stringify({
+        client_email: "reports@test-project.iam.gserviceaccount.com",
+        private_key: "synthetic-sensitive-key",
+        private_key_id: "synthetic-sensitive-key-id",
+      }),
+    );
+    const denied = await google(new Request(url, { method: "POST" }));
+    equal(denied.status, 401);
+    equal(await denied.json(), { error: "unauthorized" });
+    const response = await google(
+      new Request(url, {
+        method: "POST",
+        headers: { "X-System-Token": Deno.env.get("CRON_JOB_SECRET")! },
+      }),
+    );
+    equal(response.status, 200);
+    equal(response.headers.get("Cache-Control")?.includes("no-store"), true);
+    equal(await response.json(), {
+      serviceAccountEmail: "reports@test-project.iam.gserviceaccount.com",
+    });
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousCredentials === undefined) {
+      Deno.env.delete("GOOGLE_PLAY_SERVICE_ACCOUNT");
+    } else Deno.env.set("GOOGLE_PLAY_SERVICE_ACCOUNT", previousCredentials);
   }
 });
