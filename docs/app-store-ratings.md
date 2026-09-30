@@ -194,3 +194,8 @@ The existing collector authorization runs first, the response is uncached, and
 this action makes no database writes or Google requests. Keys and tokens are
 never returned or logged. Production verification returned 401 without auth and
 200 with only the expected service-account email using the service credential.
+
+The matching Play Console user was reopened after the deployed identity check.
+The account-level bulk-report read permission is saved and checked; the account
+is active with indefinite access. A missing local JSON file and mismatched
+service-account identity are therefore ruled out as causes of the remaining 403.
