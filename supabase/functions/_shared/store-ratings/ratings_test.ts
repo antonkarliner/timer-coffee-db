@@ -349,7 +349,7 @@ Deno.test("Google storage failures expose only stage, status and allowlisted rea
       );
       throw new Error("Expected storage rejection");
     } catch (error) {
-      equal((error as Error).message, "google_list_http_403_forbidden");
+      equal((error as Error).message, "google_download_http_403_forbidden");
     }
     globalThis.fetch = (() =>
       Promise.resolve(
@@ -369,8 +369,88 @@ Deno.test("Google storage failures expose only stage, status and allowlisted rea
       );
       throw new Error("Expected storage rejection");
     } catch (error) {
-      equal((error as Error).message, "google_list_http_403");
+      equal((error as Error).message, "google_download_http_403");
     }
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+Deno.test("Google can read known reports when listing is forbidden and current month is absent", async () => {
+  const original = globalThis.fetch;
+  const downloads: string[] = [];
+  try {
+    globalThis.fetch = ((url: string | URL) => {
+      const target = new URL(String(url));
+      if (!target.searchParams.has("alt")) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({ error: { errors: [{ reason: "forbidden" }] } }),
+            { status: 403 },
+          ),
+        );
+      }
+      const path = decodeURIComponent(target.pathname);
+      downloads.push(path);
+      if (path.includes("202601")) {
+        return Promise.resolve(new Response("{}", { status: 404 }));
+      }
+      return Promise.resolve(
+        new Response(header + "2025-12-31,com.coffee.timer,US,,4.8"),
+      );
+    }) as typeof fetch;
+    const report = await collectGoogleReport(
+      "test-bucket",
+      "com.coffee.timer",
+      "test-token",
+      "2026-01-01",
+    );
+    equal(report.sourceDate, "2025-12-31");
+    equal(report.snapshot, null);
+    equal(downloads.length, 2);
+    equal(
+      downloads[0].endsWith(
+        "stats/ratings/ratings_com.coffee.timer_202601_country.csv",
+      ),
+      true,
+    );
+    equal(
+      downloads[1].endsWith(
+        "stats/ratings/ratings_com.coffee.timer_202512_country.csv",
+      ),
+      true,
+    );
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+Deno.test("Google does not hide API-disabled listing errors with download fallback", async () => {
+  const original = globalThis.fetch;
+  let calls = 0;
+  try {
+    globalThis.fetch = (() => {
+      calls++;
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            error: { details: [{ reason: "SERVICE_DISABLED" }] },
+          }),
+          { status: 403 },
+        ),
+      );
+    }) as typeof fetch;
+    try {
+      await collectGoogleReport(
+        "test-bucket",
+        "com.coffee.timer",
+        "test-token",
+        date,
+      );
+      throw new Error("Expected API error");
+    } catch (error) {
+      equal((error as Error).message, "google_list_http_403_service_disabled");
+    }
+    equal(calls, 1);
   } finally {
     globalThis.fetch = original;
   }

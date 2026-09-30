@@ -20,6 +20,8 @@ page. Missing stores have no fabricated score or count.
 - `sync-google-play-ratings`: runs at 04:45 UTC, obtains a Google OAuth token with
   the `devstorage.read_only` scope, paginates the bucket's rating objects, and
   downloads the newest country CSV (previous month if the newest is empty).
+  If listing is forbidden, it tries only the documented current/previous-month
+  app report paths directly; missing files fall back to the previous month.
   UTF-16 and UTF-8 CSVs are supported. Report date and collection time are separate.
 - Google's documented export contains `Total Average Rating` but no rating
   counts. Country averages cannot produce a weighted worldwide rating. The
@@ -176,3 +178,11 @@ active. Live conditional GET (weak ETag and a tag list) and conditional HEAD
 (wildcard) returned 304 after the gateway fix; plain HEAD returned 200 with an
 empty body, writes returned 405, and the landing origin's CORS header matched.
 A repeat Apple collector invocation returned complete without collecting again.
+
+A subsequent diagnostic test also tried the current month's country report
+without listing the bucket. This returned `google_download_http_403`, confirming
+that direct object access is denied too. Compare the JSON secret's `client_email`
+with the exact Play Console user granted global bulk-report read access. The
+service account whose permission was inspected in the console was
+`version-check@timer-coffee-play-store.iam.gserviceaccount.com`; the deployed
+secret's account identity has not been independently verified.

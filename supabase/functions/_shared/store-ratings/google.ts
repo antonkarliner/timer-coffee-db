@@ -278,49 +278,77 @@ export async function collectGoogleReport(
   const prefix = `stats/ratings/ratings_${packageName}_`;
   const candidates: string[] = [];
   let pageToken: string | undefined;
-  for (let page = 0; page < 10; page++) {
-    const url = new URL(
-      `https://storage.googleapis.com/storage/v1/b/${
-        encodeURIComponent(bucket)
-      }/o`,
-    );
-    url.search = new URLSearchParams({
-      prefix,
-      maxResults: "1000",
-      fields: "items(name),nextPageToken",
-      ...(pageToken ? { pageToken } : {}),
-    }).toString();
-    const response = await fetchGoogle(url, {
-      headers: { Authorization: `Bearer ${token}` },
-    }, "list");
-    const listing = await response.json();
-    for (const item of listing.items ?? []) {
-      if (typeof item.name !== "string") {
-        throw new CollectionError("google_invalid_object_list");
+  try {
+    for (let page = 0; page < 10; page++) {
+      const url = new URL(
+        `https://storage.googleapis.com/storage/v1/b/${
+          encodeURIComponent(bucket)
+        }/o`,
+      );
+      url.search = new URLSearchParams({
+        prefix,
+        maxResults: "1000",
+        fields: "items(name),nextPageToken",
+        ...(pageToken ? { pageToken } : {}),
+      }).toString();
+      const response = await fetchGoogle(url, {
+        headers: { Authorization: `Bearer ${token}` },
+      }, "list");
+      const listing = await response.json();
+      for (const item of listing.items ?? []) {
+        if (typeof item.name !== "string") {
+          throw new CollectionError("google_invalid_object_list");
+        }
+        const suffix = item.name.slice(prefix.length);
+        if (
+          /^\d{6}_country\.csv$/.test(suffix) &&
+          suffix.slice(0, 6) <= today.slice(0, 7).replace("-", "")
+        ) candidates.push(item.name);
       }
-      const suffix = item.name.slice(prefix.length);
-      if (
-        /^\d{6}_country\.csv$/.test(suffix) &&
-        suffix.slice(0, 6) <= today.slice(0, 7).replace("-", "")
-      ) candidates.push(item.name);
+      pageToken = listing.nextPageToken;
+      if (!pageToken) break;
+      if (page === 9) throw new CollectionError("google_object_list_too_large");
     }
-    pageToken = listing.nextPageToken;
-    if (!pageToken) break;
-    if (page === 9) throw new CollectionError("google_object_list_too_large");
+  } catch (error) {
+    // Listing and object reads have separate GCS permissions. Try only the
+    // documented app/month paths if listing is denied; object ACLs still apply.
+    if (
+      !(error instanceof CollectionError) ||
+      !/^google_list_http_403(?:_forbidden|_iam_permission_denied)?$/.test(
+        error.code,
+      )
+    ) throw error;
+    candidates.length = 0;
+    const month = new Date(`${today.slice(0, 7)}-01T00:00:00Z`);
+    for (let offset = 0; offset < 2; offset++) {
+      candidates.push(
+        `${prefix}${
+          month.toISOString().slice(0, 7).replace("-", "")
+        }_country.csv`,
+      );
+      month.setUTCMonth(month.getUTCMonth() - 1);
+    }
   }
   // Try the latest and previous month: Google exports lag at month boundaries.
   for (const name of candidates.sort().reverse().slice(0, 2)) {
     const url = `https://storage.googleapis.com/storage/v1/b/${
       encodeURIComponent(bucket)
     }/o/${encodeURIComponent(name)}?alt=media`;
-    const response = await fetchGoogle(
-      url,
-      {
-        headers: { Authorization: `Bearer ${token}` },
-      },
-      "download",
-      20_000,
-    );
+    let response: Response;
+    try {
+      response = await fetchGoogle(
+        url,
+        { headers: { Authorization: `Bearer ${token}` } },
+        "download",
+        20_000,
+      );
+    } catch (error) {
+      if (
+        error instanceof CollectionError &&
+        /^google_download_http_404(?:_not_found)?$/.test(error.code)
+      ) continue;
+      throw error;
+    }
     const reader = response.body?.getReader();
     if (!reader) throw new CollectionError("google_empty_report");
     const chunks: Uint8Array[] = [];
