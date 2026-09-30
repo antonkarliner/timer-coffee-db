@@ -2,6 +2,7 @@
   "version": "5",
   "specifiers": {
     "jsr:@std/semver@1.0.3": "1.0.3",
+    "npm:@electric-sql/pglite@0.3.14": "0.3.14",
     "npm:@imagemagick/magick-wasm@0.0.30": "0.0.30",
     "npm:@types/node@*": "24.2.0"
   },
@@ -11,6 +12,9 @@
     }
   },
   "npm": {
+    "@electric-sql/pglite@0.3.14": {
+      "integrity": "sha512-3DB258dhqdsArOI1fIt7cb9RpUOgcDg5hXWVgVHAeqVQ/qxtFy605QKs4gx6mFq3jWsSPqDN8TgSEsqC3OfV9Q=="
+    },
     "@imagemagick/magick-wasm@0.0.30": {
       "integrity": "sha512-l5pTepsyrM9O3zMdmDHGbncP2Uf4858nylU5tw6GE7QA/Qh99aEFr4eNkEan3q1PT6mV/1Ev0gOgthuK7/kNFQ=="
     },
