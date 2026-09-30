@@ -173,6 +173,11 @@ s3_secret_key = "env(S3_SECRET_KEY)"
 [functions.roaster-enrichment-worker]
 verify_jwt = false
 
+# Anonymous analytics from every client, native and web; no JWT (deployed that
+# way since it was created). Pinned here so a plain deploy can't turn it on.
+[functions.ingest-analytics]
+verify_jwt = false
+
 [functions.admin-recipe-collections]
 verify_jwt = true
 
