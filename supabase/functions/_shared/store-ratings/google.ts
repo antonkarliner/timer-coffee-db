@@ -30,10 +30,17 @@ async function fetchGoogle(
   if (response.ok) return response;
   let reason = "";
   try {
-    const body = await response.json();
+    const text = (await response.text()).slice(0, 8192);
+    let body;
+    try {
+      body = JSON.parse(text);
+    } catch {
+      body = {};
+    }
+    const details = body.error ?? body;
     const reasons = [
-      ...(body.error?.errors ?? []),
-      ...(body.error?.details ?? []),
+      ...(details?.errors ?? []),
+      ...(details?.details ?? []),
     ].map((item: { reason?: string }) => item.reason);
     const known = [
       "forbidden",
@@ -48,6 +55,19 @@ async function fetchGoogle(
     );
     if (match) {
       reason = `_${match.replace(/([a-z])([A-Z])/g, "$1_$2").toLowerCase()}`;
+    }
+    // Match fixed provider phrases only; never return the raw message.
+    if (/anonymous caller/i.test(text)) reason = "_anonymous_caller";
+    else if (
+      /storage\.objects\.get.{0,100}(denied|access)|does not have storage\.objects\.get/i
+        .test(text)
+    ) reason = "_object_read_denied";
+    else if (
+      /storage\.objects\.list.{0,100}(denied|access)|does not have storage\.objects\.list/i
+        .test(text)
+    ) reason = "_object_list_denied";
+    else if (/insufficient authentication scopes/i.test(text)) {
+      reason = "_insufficient_scopes";
     }
   } catch { /* A non-JSON error still has a safe status and stage. */ }
   throw new CollectionError(`google_${stage}_http_${response.status}${reason}`);
@@ -190,12 +210,16 @@ export function parseGoogleReport(
   text: string,
   packageName: string,
   today: string,
+  reportType: "country" | "overview" = "country",
 ): GoogleReport {
   const [headers, ...rows] = parseCsv(text.replace(/^\uFEFF/, ""));
-  const required = ["Date", "Package Name", "Country", "Total Average Rating"];
+  const required = reportType === "overview"
+    ? ["Date", "Package Name", "Daily Average Rating", "Total Average Rating"]
+    : ["Date", "Package Name", "Country", "Total Average Rating"];
   if (
     !headers || new Set(headers).size !== headers.length ||
-    required.some((name) => !headers.includes(name))
+    required.some((name) => !headers.includes(name)) ||
+    (reportType === "overview" && headers.length !== required.length)
   ) {
     throw new CollectionError("google_unsupported_report_headers");
   }
@@ -221,7 +245,9 @@ export function parseGoogleReport(
   let overall: number | null = null;
   const seen = new Set<string>();
   for (const row of latest) {
-    const country = row[index.Country].trim();
+    const country = reportType === "overview"
+      ? "Overall"
+      : row[index.Country].trim();
     const rawRating = row[index["Total Average Rating"]].trim();
     if (!/^\d+(?:\.\d+)?$/.test(rawRating)) {
       throw new CollectionError("google_invalid_rating");
@@ -260,7 +286,11 @@ export function parseGoogleReport(
       rating_count: null,
       source_date: sourceDate,
       methodology: "google_play_total_average",
-      coverage: { countriesReported: observations.length, overallRow: true },
+      coverage: {
+        countriesReported: observations.length,
+        overallRow: true,
+        reportType,
+      },
     },
   };
 }
@@ -301,7 +331,7 @@ export async function collectGoogleReport(
         }
         const suffix = item.name.slice(prefix.length);
         if (
-          /^\d{6}_country\.csv$/.test(suffix) &&
+          /^\d{6}_(overview|country)\.csv$/.test(suffix) &&
           suffix.slice(0, 6) <= today.slice(0, 7).replace("-", "")
         ) candidates.push(item.name);
       }
@@ -314,23 +344,34 @@ export async function collectGoogleReport(
     // documented app/month paths if listing is denied; object ACLs still apply.
     if (
       !(error instanceof CollectionError) ||
-      !/^google_list_http_403(?:_forbidden|_iam_permission_denied)?$/.test(
-        error.code,
-      )
+      !/^google_list_http_403(?:_forbidden|_iam_permission_denied|_object_list_denied)?$/
+        .test(
+          error.code,
+        )
     ) throw error;
     candidates.length = 0;
     const month = new Date(`${today.slice(0, 7)}-01T00:00:00Z`);
     for (let offset = 0; offset < 2; offset++) {
-      candidates.push(
-        `${prefix}${
-          month.toISOString().slice(0, 7).replace("-", "")
-        }_country.csv`,
-      );
+      for (const dimension of ["overview", "country"]) {
+        candidates.push(
+          `${prefix}${
+            month.toISOString().slice(0, 7).replace("-", "")
+          }_${dimension}.csv`,
+        );
+      }
       month.setUTCMonth(month.getUTCMonth() - 1);
     }
   }
-  // Try the latest and previous month: Google exports lag at month boundaries.
-  for (const name of candidates.sort().reverse().slice(0, 2)) {
+  // Overview exports contain the actual global mean. Prefer the latest two
+  // overview reports; only fall back to country reports when they are absent.
+  // Never infer a global mean from a dimension report that lacks Country.
+  const ordered = ["overview", "country"].flatMap((dimension) =>
+    [...new Set(candidates)].filter((name) =>
+      name.endsWith(`_${dimension}.csv`)
+    )
+      .sort().reverse().slice(0, 2)
+  );
+  for (const name of ordered) {
     const url = `https://storage.googleapis.com/storage/v1/b/${
       encodeURIComponent(bucket)
     }/o/${encodeURIComponent(name)}?alt=media`;
@@ -370,7 +411,12 @@ export async function collectGoogleReport(
       offset += chunk.length;
     }
     try {
-      return parseGoogleReport(decodeReport(bytes), packageName, today);
+      return parseGoogleReport(
+        decodeReport(bytes),
+        packageName,
+        today,
+        name.endsWith("_overview.csv") ? "overview" : "country",
+      );
     } catch (error) {
       if (
         !(error instanceof CollectionError) ||
@@ -378,5 +424,71 @@ export async function collectGoogleReport(
       ) throw error;
     }
   }
-  throw new CollectionError("google_no_country_report");
+  throw new CollectionError("google_no_ratings_report");
+}
+
+// Privileged diagnostic probes. Inspect only status and sanitized error codes;
+// discard successful bodies without returning any report or credentials.
+export async function diagnoseGoogleAccess(
+  bucket: string,
+  packageName: string,
+  token: string,
+  today: string,
+) {
+  if (
+    !/^[a-z0-9][a-z0-9._-]+$/.test(bucket) || bucket.includes("..") ||
+    !/^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+$/.test(packageName)
+  ) throw new CollectionError("google_invalid_configuration");
+  const object = `stats/ratings/ratings_${packageName}_${
+    today.slice(0, 7).replace("-", "")
+  }_overview.csv`;
+  const api = `https://storage.googleapis.com/storage/v1/b/${
+    encodeURIComponent(bucket)
+  }/o`;
+  const probes = [
+    {
+      operation: "list",
+      url: `${api}?maxResults=1&prefix=${encodeURIComponent("stats/ratings/")}`,
+      stage: "list" as const,
+    },
+    {
+      operation: "metadata",
+      url: `${api}/${encodeURIComponent(object)}`,
+      stage: "download" as const,
+    },
+    {
+      operation: "json_media",
+      url: `${api}/${encodeURIComponent(object)}?alt=media`,
+      stage: "download" as const,
+    },
+    {
+      operation: "xml_media",
+      url: `https://storage.googleapis.com/${
+        encodeURIComponent(bucket)
+      }/${object}`,
+      stage: "download" as const,
+    },
+  ];
+  const results = [];
+  for (const probe of probes) {
+    try {
+      const response = await fetchGoogle(probe.url, {
+        headers: { Authorization: `Bearer ${token}` },
+      }, probe.stage);
+      await response.body?.cancel();
+      results.push({
+        operation: probe.operation,
+        status: response.status,
+        result: "ok",
+      });
+    } catch (error) {
+      if (!(error instanceof CollectionError)) throw error;
+      results.push({
+        operation: probe.operation,
+        result: "failed",
+        error: error.code,
+      });
+    }
+  }
+  return results;
 }

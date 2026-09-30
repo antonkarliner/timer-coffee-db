@@ -152,6 +152,33 @@ Deno.test("ratings migration: leases, atomic weighted publication, RLS, and last
       4.9,
     );
 
+    // An overview report can publish its explicit worldwide mean without
+    // country observations or invented rating counts.
+    await db.query(
+      "delete from service.app_store_rating_runs where store='google_play'",
+    );
+    const overviewRun = await claim("google_play", []);
+    equal(
+      (await finish("google_play", overviewRun.lease_token, [], {
+        average_rating: 4.9411,
+        rating_count: null,
+        source_date: date,
+        methodology: "google_play_total_average",
+        coverage: {
+          reportType: "overview",
+          countriesReported: 0,
+          overallRow: true,
+        },
+      })).status,
+      "complete",
+    );
+    equal(
+      (await db.query<{ average: number; count: number | null }>(
+        "select average_rating::float8 as average, rating_count as count from public.app_store_ratings where store='google_play'",
+      )).rows[0],
+      { average: 4.9411, count: null },
+    );
+
     await db.exec("reset role; set role anon");
     equal(
       (await db.query("select * from public.app_store_ratings")).rows.length,

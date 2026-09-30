@@ -19,17 +19,21 @@ page. Missing stores have no fabricated score or count.
   used. The result is approximate because upstream average precision is finite.
 - `sync-google-play-ratings`: runs at 04:45 UTC, obtains a Google OAuth token with
   the `devstorage.read_only` scope, paginates the bucket's rating objects, and
-  downloads the newest country CSV (previous month if the newest is empty).
+  downloads the newest overview CSV (previous month if the newest is empty).
   If listing is forbidden, it tries only the documented current/previous-month
   app report paths directly; missing files fall back to the previous month.
   UTF-16 and UTF-8 CSVs are supported. Report date and collection time are separate.
-- Google's documented export contains `Total Average Rating` but no rating
-  counts. Country averages cannot produce a weighted worldwide rating. The
-  collector publishes only an explicit overall row. If none exists, it records
+- The actual Play Console Overview export contains `Date`, `Package Name`,
+  `Daily Average Rating`, and `Total Average Rating`, with no dimension or rating
+  count. Its total average is the worldwide metric. The collector accepts that
+  exact schema only from `_overview.csv` paths; a dimensionless file is never
+  assumed global without that provenance. It prefers the latest two overview
+  files before trying the latest two country files. Country averages cannot
+  produce a weighted worldwide rating. For a country report the collector
+  publishes only an explicit overall row. If none exists, it records
   country observations privately, marks the run `blocked` with
   `google_no_overall_rating`, and preserves any previous public snapshot. Blank
-  and `Other` segments are never treated as global totals. An actual authenticated
-  report must be inspected before promising a worldwide Google score. This
+  and `Other` segments are never treated as global totals. This
   export's total/lifetime average also differs from Google's recency-weighted,
   country/device-specific public listing score.
 - History of runs and country observations is retained for 90 days. The two
@@ -89,11 +93,10 @@ rapidly retrying an expired lease because upstream limits still apply. Check
 For cron transport, inspect `net._http_response` separately: `net.http_post`
 queues requests and returning a request ID is not proof of successful collection.
 
-Verify the real Google CSV headers and overall-row semantics against Play Console,
-without exporting review content or other private report data. A `blocked`
-country-only result is expected with the documented format and is not proof that
-authentication failed. A global Google score requires an additional trustworthy
-overall metric source if those reports have no overall row.
+Verify the real Google CSV headers against Play Console without exporting review
+content or other private report data. A `blocked` country-only fallback is not
+proof that authentication failed. The verified overview export supplies the
+worldwide score without combining country means; unavailable counts remain null.
 
 ## Public response and caching
 
@@ -168,8 +171,8 @@ Google OAuth authentication succeeded, but bucket listing returned
 `google_list_http_403_forbidden`. The configured bucket digest matches the URI
 copied directly from Play Console. No Google snapshot was published. Verify that
 the JSON's `client_email` matches the service account granted account-wide bulk
-report access before retrying. Successful access still needs an explicit overall
-rating row to produce a worldwide snapshot.
+report access before retrying. The overview-report correction described below
+supplies the worldwide metric once access succeeds.
 
 The follow-up bootstrap migration exercised the actual Vault/pg_net cron path:
 Apple returned 200/complete, and Google reached its authenticated collector but
@@ -199,3 +202,27 @@ The matching Play Console user was reopened after the deployed identity check.
 The account-level bulk-report read permission is saved and checked; the account
 is active with indefinite access. A missing local JSON file and mismatched
 service-account identity are therefore ruled out as causes of the remaining 403.
+
+Authenticated POST `sync-google-play-ratings?diagnostics=access` probes listing,
+object metadata, JSON media, and XML media for the current overview object. It
+returns only status and allowlisted error codes, cancels successful bodies, makes
+no database writes, and uses the same privileged gate and uncached response.
+Production returned object-list and object-read denial codes, rather than an
+anonymous caller or insufficient OAuth scopes. Google explicitly documents that
+[developer-level permission changes can take up to 48 hours to propagate](https://developers.google.com/android-publisher/api-ref/rest/v3/users#developerlevelpermission).
+The read permission was enabled September 30; propagation is the leading
+explanation, not a confirmed resolution.
+
+The owner successfully downloaded the September Overview CSV through Play
+Console. Local inspection confirmed the exact four-column schema above and the
+latest populated global total average **4.9411**, source date **2026-09-26**.
+The collector now prefers this file and its real bytes passed the deployed parser
+locally. The file has no rating count. No manual Google snapshot was inserted;
+automated service-account access must still succeed before publication.
+
+An hourly follow-up is active in the current Codex chat, automation
+`resolve-google-play-ratings-access`. It retests using existing credentials
+without logging them and verifies persistence/public reads when collection works.
+If the same access denial remains after October 2 at 16:00 UTC, it stops repeated
+retries and prepares sanitized evidence for Google support. It does not send
+support messages, create keys, or widen permissions.

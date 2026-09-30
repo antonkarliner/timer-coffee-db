@@ -1,5 +1,6 @@
 import {
   collectGoogleReport,
+  diagnoseGoogleAccess,
   getGoogleStorageToken,
 } from "../_shared/store-ratings/google.ts";
 import { CollectionError, errorCode } from "../_shared/store-ratings/model.ts";
@@ -30,6 +31,16 @@ export async function handler(req: Request): Promise<Response> {
     const packageName = requiredEnv("GOOGLE_PLAY_PACKAGE_NAME");
     const bucket = requiredEnv("GOOGLE_PLAY_REPORTS_BUCKET");
     const credentials = requiredEnv("GOOGLE_PLAY_SERVICE_ACCOUNT");
+    if (new URL(req.url).searchParams.get("diagnostics") === "access") {
+      const token = await getGoogleStorageToken(credentials);
+      const probes = await diagnoseGoogleAccess(
+        bucket,
+        packageName,
+        token,
+        new Date().toISOString().slice(0, 10),
+      );
+      return jsonResponse(req, { probes });
+    }
     const { db, date, lease } = await claimRun("google_play", packageName, []);
     if (!lease.lease_token) return jsonResponse(req, { status: lease.status });
     let failure: string | null = null;

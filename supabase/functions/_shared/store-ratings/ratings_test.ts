@@ -3,6 +3,7 @@ import { parseAppleLookup } from "./apple.ts";
 import {
   collectGoogleReport,
   decodeReport,
+  diagnoseGoogleAccess,
   getGoogleStorageToken,
   parseCsv,
   parseGoogleReport,
@@ -38,6 +39,93 @@ const app = (country: string, average: number, count: number) => ({
 const date = "2026-09-30";
 const header =
   "Date,Package Name,Country,Daily Average Rating,Total Average Rating\r\n";
+const overviewHeader =
+  "Date,Package Name,Daily Average Rating,Total Average Rating\r\n";
+
+Deno.test("Google parses the verified overview schema as global, but requires explicit report provenance", () => {
+  const csv = overviewHeader + "2026-09-26,com.coffee.timer,5.0,4.9411\r\n";
+  const report = parseGoogleReport(csv, "com.coffee.timer", date, "overview");
+  equal(report.snapshot?.average_rating, 4.9411);
+  equal(report.snapshot?.rating_count, null);
+  equal(report.snapshot?.source_date, "2026-09-26");
+  equal(report.observations, []);
+  throws(
+    () => parseGoogleReport(csv, "com.coffee.timer", date),
+    "google_unsupported_report_headers",
+  );
+  throws(
+    () =>
+      parseGoogleReport(
+        header + "2026-09-26,com.coffee.timer,US,,4.9",
+        "com.coffee.timer",
+        date,
+        "overview",
+      ),
+    "google_unsupported_report_headers",
+  );
+  throws(
+    () =>
+      parseGoogleReport(
+        csv + "2026-09-26,com.coffee.timer,,4.8",
+        "com.coffee.timer",
+        date,
+        "overview",
+      ),
+    "google_duplicate_overall",
+  );
+});
+
+Deno.test("Google prefers overview files, including previous-month populated data, over country averages", async () => {
+  const original = globalThis.fetch;
+  const downloads: string[] = [];
+  try {
+    globalThis.fetch = ((url: string | URL) => {
+      const target = new URL(String(url));
+      if (!target.searchParams.has("alt")) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              items: [
+                "202609_country",
+                "202609_overview",
+                "202608_overview",
+                "202609_device",
+              ].map(
+                (suffix) => ({
+                  name: `stats/ratings/ratings_com.coffee.timer_${suffix}.csv`,
+                }),
+              ),
+            }),
+          ),
+        );
+      }
+      const path = decodeURIComponent(target.pathname);
+      downloads.push(path);
+      return Promise.resolve(
+        new Response(
+          overviewHeader +
+            (path.includes("202609")
+              ? "2026-09-01,com.coffee.timer,,"
+              : "2026-08-31,com.coffee.timer,,4.9411"),
+        ),
+      );
+    }) as typeof fetch;
+    const report = await collectGoogleReport(
+      "test-bucket",
+      "com.coffee.timer",
+      "test-token",
+      "2026-09-01",
+    );
+    equal(report.snapshot?.average_rating, 4.9411);
+    equal(report.sourceDate, "2026-08-31");
+    equal(downloads.map((path) => path.split("_").at(-1)), [
+      "overview.csv",
+      "overview.csv",
+    ]);
+  } finally {
+    globalThis.fetch = original;
+  }
+});
 
 Deno.test("Apple preserves numeric precision and uses rating counts, not text reviews", () => {
   const observation = parseAppleLookup(
@@ -392,7 +480,7 @@ Deno.test("Google can read known reports when listing is forbidden and current m
       }
       const path = decodeURIComponent(target.pathname);
       downloads.push(path);
-      if (path.includes("202601")) {
+      if (path.includes("202601") || path.endsWith("_overview.csv")) {
         return Promise.resolve(new Response("{}", { status: 404 }));
       }
       return Promise.resolve(
@@ -407,15 +495,15 @@ Deno.test("Google can read known reports when listing is forbidden and current m
     );
     equal(report.sourceDate, "2025-12-31");
     equal(report.snapshot, null);
-    equal(downloads.length, 2);
+    equal(downloads.length, 4);
     equal(
-      downloads[0].endsWith(
+      downloads[2].endsWith(
         "stats/ratings/ratings_com.coffee.timer_202601_country.csv",
       ),
       true,
     );
     equal(
-      downloads[1].endsWith(
+      downloads[3].endsWith(
         "stats/ratings/ratings_com.coffee.timer_202512_country.csv",
       ),
       true,
@@ -451,6 +539,51 @@ Deno.test("Google does not hide API-disabled listing errors with download fallba
       equal((error as Error).message, "google_list_http_403_service_disabled");
     }
     equal(calls, 1);
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+Deno.test("Google access probes distinguish provider object denial, anonymous calls and successful downloads without disclosing raw messages", async () => {
+  const original = globalThis.fetch;
+  let calls = 0;
+  try {
+    globalThis.fetch = (() => {
+      calls++;
+      const messages = [
+        "private@example.com does not have storage.objects.list access to the object",
+        "private@example.com does not have storage.objects.get access to the object",
+        "Anonymous caller does not have storage.objects.get access",
+      ];
+      if (calls === 4) {
+        return Promise.resolve(new Response("private report data"));
+      }
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            error: {
+              message: messages[calls - 1],
+              errors: [{ reason: "forbidden" }],
+            },
+          }),
+          { status: 403 },
+        ),
+      );
+    }) as typeof fetch;
+    const probes = await diagnoseGoogleAccess(
+      "test-bucket",
+      "com.coffee.timer",
+      "secret-token",
+      date,
+    );
+    equal(probes.map((p) => p.result), ["failed", "failed", "failed", "ok"]);
+    equal(probes.slice(0, 3).map((p) => p.error), [
+      "google_list_http_403_object_list_denied",
+      "google_download_http_403_object_read_denied",
+      "google_download_http_403_anonymous_caller",
+    ]);
+    equal(JSON.stringify(probes).includes("private"), false);
+    equal(calls, 4);
   } finally {
     globalThis.fetch = original;
   }
