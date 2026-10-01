@@ -434,13 +434,16 @@ export async function diagnoseGoogleAccess(
   packageName: string,
   token: string,
   today: string,
+  period: "current" | "previous" = "current",
 ) {
   if (
     !/^[a-z0-9][a-z0-9._-]+$/.test(bucket) || bucket.includes("..") ||
     !/^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+$/.test(packageName)
   ) throw new CollectionError("google_invalid_configuration");
+  const month = new Date(`${today.slice(0, 7)}-01T00:00:00Z`);
+  if (period === "previous") month.setUTCMonth(month.getUTCMonth() - 1);
   const object = `stats/ratings/ratings_${packageName}_${
-    today.slice(0, 7).replace("-", "")
+    month.toISOString().slice(0, 7).replace("-", "")
   }_overview.csv`;
   const api = `https://storage.googleapis.com/storage/v1/b/${
     encodeURIComponent(bucket)

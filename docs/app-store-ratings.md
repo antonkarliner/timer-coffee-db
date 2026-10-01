@@ -226,3 +226,40 @@ without logging them and verifies persistence/public reads when collection works
 If the same access denial remains after October 2 at 16:00 UTC, it stops repeated
 retries and prepares sanitized evidence for Google support. It does not send
 support messages, create keys, or widen permissions.
+
+## Additional access investigation, 2026-10-01
+
+The Play Console user export confirms the deployed account has `ACCESS_GRANTED`,
+no expiration, and `CAN_VIEW_NON_FINANCIAL_DATA_GLOBAL` (plus global quality
+read). This independently verifies the saved permission instead of relying on
+the UI checkbox alone. The service-account project's Enabled APIs dashboard
+lists Cloud Storage API, Google Cloud Storage JSON API, and Android Publisher API.
+
+The exact September object at
+`gs://pubsite_prod_5112670129445645819/stats/ratings/ratings_com.coffee.timer_202609_overview.csv`
+downloaded successfully through the signed-in owner's direct Cloud Storage URL.
+It has the verified schema, source date 2026-09-26 and total average 4.9411.
+Therefore the bucket name, September object path, and file existence are verified.
+The documentation's `_rev_` example must not replace this actual bucket name.
+
+To isolate month-boundary failures, authenticated POST
+`sync-google-play-ratings?diagnostics=access&period=previous` probes the previous
+month's Overview object; only `current` and `previous` are accepted. An anonymous
+request returns 401. The previous-month probe returned object-read denial through
+metadata, JSON media and XML media, while listing also remained denied. October
+report availability is therefore not the explanation for this existing-object
+failure. All successful bodies are discarded and no credential is exposed.
+
+Two matching public library reports have follow-up resolutions:
+- [Python report](https://github.com/googleapis/google-cloud-python/issues/17521#issuecomment-4799433911):
+  the reporter says the permission became effective after 24 hours.
+- [Node report](https://github.com/googleapis/nodejs-storage/issues/2688#issuecomment-3683141871):
+  a contributor resolved access using explicit service-account credentials and
+  `devstorage.read_only`. Our collector already uses that exact scope and key.
+
+These are firsthand reports, not proof of a confirmed Google platform incident.
+The remaining leading explanation is propagation or a failed Play-to-Storage
+permission synchronization. The current evidence does not justify extra project
+IAM roles, financial permissions, an API key, or a new service-account key.
+If the 48-hour window expires, ask Google Play support to check report-bucket
+authorization synchronization for this exact principal and known-existing object.

@@ -32,14 +32,19 @@ export async function handler(req: Request): Promise<Response> {
     const bucket = requiredEnv("GOOGLE_PLAY_REPORTS_BUCKET");
     const credentials = requiredEnv("GOOGLE_PLAY_SERVICE_ACCOUNT");
     if (new URL(req.url).searchParams.get("diagnostics") === "access") {
+      const period = new URL(req.url).searchParams.get("period") ?? "current";
+      if (period !== "current" && period !== "previous") {
+        throw new CollectionError("google_invalid_diagnostic_period");
+      }
       const token = await getGoogleStorageToken(credentials);
       const probes = await diagnoseGoogleAccess(
         bucket,
         packageName,
         token,
         new Date().toISOString().slice(0, 10),
+        period,
       );
-      return jsonResponse(req, { probes });
+      return jsonResponse(req, { period, probes });
     }
     const { db, date, lease } = await claimRun("google_play", packageName, []);
     if (!lease.lease_token) return jsonResponse(req, { status: lease.status });

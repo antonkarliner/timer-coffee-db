@@ -544,6 +544,38 @@ Deno.test("Google does not hide API-disabled listing errors with download fallba
   }
 });
 
+Deno.test("Google previous-month probes use known prior reports across year boundaries", async () => {
+  const original = globalThis.fetch;
+  const paths: string[] = [];
+  try {
+    globalThis.fetch = ((url: string | URL) => {
+      const target = new URL(String(url));
+      if (target.pathname.includes("overview")) {
+        paths.push(decodeURIComponent(target.pathname));
+      }
+      return Promise.resolve(new Response("private report body"));
+    }) as typeof fetch;
+    const probes = await diagnoseGoogleAccess(
+      "test-bucket",
+      "com.coffee.timer",
+      "test-token",
+      "2026-01-01",
+      "previous",
+    );
+    equal(probes.every((p) => p.result === "ok"), true);
+    equal(paths.length, 3);
+    equal(
+      paths.every((p) =>
+        p.endsWith("ratings_com.coffee.timer_202512_overview.csv")
+      ),
+      true,
+    );
+    equal(JSON.stringify(probes).includes("private"), false);
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
 Deno.test("Google access probes distinguish provider object denial, anonymous calls and successful downloads without disclosing raw messages", async () => {
   const original = globalThis.fetch;
   let calls = 0;
