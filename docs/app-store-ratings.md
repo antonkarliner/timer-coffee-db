@@ -220,7 +220,7 @@ The collector now prefers this file and its real bytes passed the deployed parse
 locally. The file has no rating count. No manual Google snapshot was inserted;
 automated service-account access must still succeed before publication.
 
-An hourly follow-up is active in the current Codex chat, automation
+An hourly follow-up was configured in the current Codex chat, automation
 `resolve-google-play-ratings-access`. It retests using existing credentials
 without logging them and verifies persistence/public reads when collection works.
 If the same access denial remains after October 2 at 16:00 UTC, it stops repeated
@@ -263,3 +263,22 @@ permission synchronization. The current evidence does not justify extra project
 IAM roles, financial permissions, an API key, or a new service-account key.
 If the 48-hour window expires, ask Google Play support to check report-bucket
 authorization synchronization for this exact principal and known-existing object.
+
+## Access restored and verified, 2026-10-02
+
+The authorized collector succeeded at 09:12 UTC without additional credentials,
+permissions, or code changes. It persisted the worldwide Overview total average
+**4.9444**, source date **2026-09-29**, with `rating_count = null`. Coverage records
+`overallRow: true`, `reportType: overview`, and `countriesReported: 0`; this is the
+global report value, not an average of country ratings. The result is consistent
+with delayed permission propagation, though Google's internal cause is unconfirmed.
+
+Independent database inspection and the public `get-app-store-ratings` endpoint
+both returned this snapshot. The public endpoint returned HTTP 200, both stores,
+no missing stores, an ETag, and the configured cache policy. Google does not supply
+a count in this report, so clients must omit its count. This metric is Google's
+total average and can differ from the score displayed on a particular storefront.
+
+The hourly access-resolution automation was deleted after verification. Both
+existing database schedules remain active, including Google collection at 04:45
+UTC daily. No manual snapshot insertion or Google support request was needed.
