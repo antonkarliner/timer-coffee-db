@@ -1,3 +1,4 @@
+import { authorizeServiceRole } from "../_shared/service-role-auth.ts";
 import { serve } from "https://deno.land/std@0.223.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.42.5";
 import { z } from "https://deno.land/x/zod@v3.23.8/mod.ts";
@@ -475,7 +476,9 @@ serve(async (req)=>{
         }, correlationId);
         return createRateLimitResponse(dailyLimit);
       }
-    } else {
+    } else if (!authorizeServiceRole(req.headers.get("authorization"), serviceRoleKey).authorized) {
+      // Only an exact match to the configured secret bypasses the anonymous IP limit.
+      // Merely having a JWT or claiming service_role is insufficient.
       // Apply IP-based rate limiting for broadcast notifications (userId = null)
       const clientIP = getClientIP(req);
       const ipRateLimit = await checkIpRateLimit(clientIP);
@@ -755,6 +758,7 @@ serve(async (req)=>{
               priority: parsed.priority
             }, {
               correlationId,
+              notificationId: notificationRecord.id,
               locale,
               linkSummary: summarizeLinkFields(rawDeepLink, dataPayload)
             });
@@ -885,6 +889,7 @@ serve(async (req)=>{
           priority: parsed.priority
         }, {
           correlationId,
+          notificationId: notificationRecord.id,
           locale: parsed.locale,
           linkSummary: summarizeLinkFields(rawDeepLink, dataPayload)
         });
@@ -1220,6 +1225,16 @@ async function sendMulticast(tokens, payload, logContext) {
   const failureReasons = {};
   const messageIds = [];
   const logs = [];
+  const saveProgress = async () => {
+    if (!logContext?.notificationId) return;
+    const { error } = await supabase.from("notifications").update({
+      tokens_successful: successCount,
+      tokens_failed: failureCount
+    }).eq("id", logContext.notificationId);
+    if (error) logError("Failed to save partial FCM progress", new Error(error.message), ErrorCategory.DATABASE, ErrorSeverity.MEDIUM, {
+      notificationId: logContext.notificationId, successCount, failureCount
+    }, logContext.correlationId);
+  };
   let chunkIndex = 0;
   for (const chunk of chunks){
     const chunkId = `${chunkIndex + 1}/${chunks.length}`;
@@ -1278,6 +1293,8 @@ async function sendMulticast(tokens, payload, logContext) {
           errorMessage: reason
         })));
       failureCount += chunk.length;
+      await saveProgress();
+      chunkIndex += 1;
       continue;
     }
     response.responses.forEach((res, index)=>{
@@ -1313,6 +1330,7 @@ async function sendMulticast(tokens, payload, logContext) {
         });
       }
     });
+    await saveProgress();
     logInfo("FCM chunk completed", {
       correlationId: logContext?.correlationId,
       locale: logContext?.locale,

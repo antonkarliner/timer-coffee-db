@@ -85,6 +85,38 @@ POST /v1/scheduled
 }
 ```
 
+Scheduled requests accept `audience` (`user` by default, or `broadcast`), `platform`
+(`all` by default, or `ios`, `android`, `web`), optional `user_id`, and optional
+`target_user_ids` (UUID array). Only admins may schedule a broadcast or address a
+user other than themselves. Broadcast `user_id` must be null or omitted;
+`target_user_ids` is allowed only for broadcasts. Non-admins cannot supply it.
+For user schedules, omitted `user_id` defaults to the caller. The server records
+`created_by` from the authenticated caller; it cannot be set by the request.
+Broadcasts require explicit `title` and `body`; template-only broadcast jobs fail.
+URL fields in `data` receive the same validation as immediate broadcasts.
+
+```json
+{
+  "audience": "broadcast",
+  "platform": "ios",
+  "target_user_ids": ["00000000-0000-4000-8000-000000000001"],
+  "title": "Coffee time",
+  "body": "Your next cup awaits",
+  "schedule_at": "2026-10-04T12:00:00Z",
+  "locale": "en",
+  "translate": true
+}
+```
+
+Use an operator-controlled UUID in `target_user_ids` for any live test. Admins
+list, update, and cancel all schedules; other users can manage only their own.
+List responses include `audience`, `platform`, `target_user_ids`, and `created_by`.
+Updates accept the same recipient fields with the same permissions. Changing to
+`user` clears the broadcast target list; a null `target_user_ids` clears it on a
+broadcast. A broadcast is never automatically retried: any successful locale
+marks it sent, with locale failures recorded in `failure_reason`. Only one
+broadcast job is processed per worker invocation.
+
 #### List Scheduled Notifications
 ```http
 GET /v1/scheduled?limit=50&status=pending
@@ -420,3 +452,45 @@ For API support and questions:
 - Review error messages for troubleshooting
 - Monitor analytics for performance insights
 - Contact support for production issues
+## Push audience targeting (plan 041 §5)
+
+Immediate broadcasts and scheduled create/update accept `audience_filter`:
+
+```json
+{"locales":["de","pt"],"countries":["DE","AT"],"regions":["EU"],"platforms":["ios"]}
+```
+
+Null/absent means everyone. Null/empty dimension arrays are unrestricted. Locale,
+platform and geography restrictions combine with AND. Countries and regions form
+one union. The existing `platform` and `target_user_ids` restrictions also apply.
+Invalid filters return 400. Scheduled filters require admin access and broadcast
+audience. Lists return the saved filter; recurrence retains it. Changing a job to
+user audience clears an inherited filter (an explicit non-null filter is rejected).
+
+Broadcast `dry_run: true` returns `audience_filter` and, for non-null filters,
+`matched_token_count`, without translating or sending. Null filters preserve the
+existing token query and locale RPC path.
+
+`GET /v1/admin/broadcast-reach` follows the existing admin-only read-route pattern.
+Query parameters: `platform` (default `all`), `audience_filter` (URL-encoded JSON),
+`target_user_ids` (URL-encoded JSON UUID array). Returns `{ "data": { "total": 0,
+"by_locale": {}, "unknown_country_excluded": 0, "unknown_timezone": 0,
+"total_active": 0 } }`. Counts are device tokens, not unique users. `total_active`
+is all active tokens before restrictions; null locale is grouped as `unknown`.
+Unknown-country exclusions match every non-geographic restriction but lack the
+country or region needed to decide geographic eligibility.
+
+The portal can also call `public.estimate_broadcast_reach` directly using its admin
+JWT, with `p_audience_filter`, `p_platform`, and `p_target_user_ids`. The RPC itself
+checks `public.is_admin()`; authenticated non-admins are denied.
+
+Token columns `country`, `timezone`, `locale_source` are written by the app. Invalid
+values become null rather than failing token upserts. Country is uppercased;
+timezone is checked against PostgreSQL timezone names when inserted/changed;
+locale source accepts `explicit` or `system`. Token grants/RLS are unchanged.
+GeoIP reads `public.country_regions` using a server-side service-role key, caches
+it for one hour, and warns/returns `WW` on mapping database failures.
+
+Before relying on language/country reach, verify app plan 076 adoption and the
+locale distribution. This change does not implement local-time delivery (§6).
+Operator checks: [push targeting verification](../../../docs/push-audience-targeting-verification.md).

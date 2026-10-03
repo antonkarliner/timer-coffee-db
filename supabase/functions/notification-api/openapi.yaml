@@ -15,6 +15,51 @@ servers:
     description: Production server
 
 paths:
+  /v1/admin/broadcast-reach:
+    get:
+      tags: [Admin Management]
+      summary: Estimate broadcast reach (admin only)
+      description: Read-only; counts active device tokens, not unique users. No pushes are sent.
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: audience_filter
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AudienceFilter'
+        - in: query
+          name: platform
+          schema:
+            type: string
+            enum: [all, ios, android, web]
+            default: all
+        - in: query
+          name: target_user_ids
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: string
+                  format: uuid
+      responses:
+        '200':
+          description: Reach estimate
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/BroadcastReach'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
   /tokens:
     post:
       tags:
@@ -124,7 +169,7 @@ paths:
       tags:
         - Scheduled Notifications
       summary: Create scheduled notification
-      description: Create a new scheduled notification
+      description: Create a schedule. Non-admins may address only themselves; admins may schedule broadcasts or another user.
       security:
         - bearerAuth: []
       requestBody:
@@ -144,6 +189,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '429':
           $ref: '#/components/responses/RateLimited'
         '500':
@@ -153,7 +200,7 @@ paths:
       tags:
         - Scheduled Notifications
       summary: List scheduled notifications
-      description: List user's scheduled notifications with pagination
+      description: Admins list all scheduled notifications; other users list only their own recipients, with pagination
       security:
         - bearerAuth: []
       parameters:
@@ -920,6 +967,44 @@ components:
       required:
         - schedule_at
       properties:
+        audience_filter:
+          $ref: '#/components/schemas/AudienceFilter'
+        deliver_local_date:
+          type: string
+          format: date
+          nullable: true
+          description: Local-time delivery date (YYYY-MM-DD). Admin-only, broadcast audience only; set together with deliver_local_time. Recurrence must be none.
+        deliver_local_time:
+          type: string
+          pattern: '^\d{2}:\d{2}$'
+          nullable: true
+          description: Local wall-clock time (HH:MM) at which each token's timezone bucket is sent.
+        local_time_fallback:
+          type: string
+          enum: [utc, exclude]
+          default: utc
+          description: Tokens without a timezone are sent at schedule_at (utc) or excluded.
+        audience:
+          type: string
+          enum: [user, broadcast]
+          default: user
+          description: Recipient kind. Broadcast requires admin access and null or omitted user_id.
+        platform:
+          type: string
+          enum: [all, ios, android, web]
+          default: all
+          description: Device platform for broadcasts.
+        target_user_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: Admin-only broadcast target list; null means all eligible users. Not allowed for user audience.
+        user_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: Defaults to the caller for user audience. Only admins may target another user. Broadcast uses null.
         template_id:
           type: string
           format: uuid
@@ -979,6 +1064,49 @@ components:
     ScheduledNotification:
       type: object
       properties:
+        audience_filter:
+          $ref: '#/components/schemas/AudienceFilter'
+        deliver_local_date:
+          type: string
+          format: date
+          nullable: true
+          description: Local-time delivery date (YYYY-MM-DD). Admin-only, broadcast audience only; set together with deliver_local_time. Recurrence must be none.
+        deliver_local_time:
+          type: string
+          pattern: '^\d{2}:\d{2}$'
+          nullable: true
+          description: Local wall-clock time (HH:MM) at which each token's timezone bucket is sent.
+        local_time_fallback:
+          type: string
+          enum: [utc, exclude]
+          default: utc
+          description: Tokens without a timezone are sent at schedule_at (utc) or excluded.
+        bucket_summary:
+          type: object
+          additionalProperties:
+            type: integer
+          description: For local-time jobs only, count of timezone buckets by status (sending, sent, failed, skipped).
+        audience:
+          type: string
+          enum: [user, broadcast]
+          description: Recipient kind. Broadcast requires admin access and null or omitted user_id.
+        platform:
+          type: string
+          enum: [all, ios, android, web]
+          description: Device platform for broadcasts.
+        target_user_ids:
+          type: array
+          nullable: true
+          items:
+            type: string
+            format: uuid
+          description: Admin-only broadcast target list; null means all eligible users. Not allowed for user audience.
+        created_by:
+          type: string
+          format: uuid
+          nullable: true
+          readOnly: true
+          description: Authenticated caller who created the schedule.
         id:
           type: string
           format: uuid
@@ -986,6 +1114,7 @@ components:
         user_id:
           type: string
           format: uuid
+          nullable: true
           description: User ID
         template_id:
           type: string
@@ -1055,6 +1184,43 @@ components:
     UpdateScheduledNotificationRequest:
       type: object
       properties:
+        audience_filter:
+          $ref: '#/components/schemas/AudienceFilter'
+        deliver_local_date:
+          type: string
+          format: date
+          nullable: true
+          description: Local-time delivery date (YYYY-MM-DD). Admin-only, broadcast audience only; set together with deliver_local_time. Recurrence must be none.
+        deliver_local_time:
+          type: string
+          pattern: '^\d{2}:\d{2}$'
+          nullable: true
+          description: Local wall-clock time (HH:MM) at which each token's timezone bucket is sent.
+        local_time_fallback:
+          type: string
+          enum: [utc, exclude]
+          default: utc
+          description: Tokens without a timezone are sent at schedule_at (utc) or excluded.
+        audience:
+          type: string
+          enum: [user, broadcast]
+          description: Recipient kind. Broadcast requires admin access and null or omitted user_id.
+        platform:
+          type: string
+          enum: [all, ios, android, web]
+          description: Device platform for broadcasts.
+        target_user_ids:
+          type: array
+          nullable: true
+          items:
+            type: string
+            format: uuid
+          description: Admin-only broadcast target list; null means all eligible users. Not allowed for user audience.
+        user_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: Defaults to the caller for user audience. Only admins may target another user. Broadcast uses null.
         template_id:
           type: string
           format: uuid
@@ -1112,6 +1278,7 @@ components:
       enum:
         - pending
         - processing
+        - delivering
         - sent
         - failed
         - cancelled
@@ -1304,12 +1471,68 @@ components:
           format: date-time
           description: Last update timestamp
 
+    AudienceFilter:
+      type: object
+      nullable: true
+      additionalProperties: false
+      description: Null means everyone. AND across locale/platform/geography, OR within arrays; countries and regions form a union. Null or empty arrays are unrestricted. Unknown geography is excluded when restricted. Scheduled filters are admin-only and require broadcast audience.
+      properties:
+        locales:
+          type: array
+          nullable: true
+          items:
+            type: string
+            minLength: 2
+            maxLength: 10
+            pattern: '^[a-z]{2,10}(-[a-z0-9]+)*$'
+        countries:
+          type: array
+          nullable: true
+          items:
+            type: string
+            pattern: '^[A-Z]{2}$'
+        regions:
+          type: array
+          nullable: true
+          items:
+            type: string
+            pattern: '^[A-Z]{2,10}$'
+        platforms:
+          type: array
+          nullable: true
+          items:
+            type: string
+            enum: [ios, android, web]
+
+    BroadcastReach:
+      type: object
+      properties:
+        total:
+          type: integer
+          description: Matched active device tokens.
+        by_locale:
+          type: object
+          additionalProperties:
+            type: integer
+          description: Matched token counts; null locale uses the unknown key.
+        unknown_country_excluded:
+          type: integer
+          description: Tokens matching platform, users and other audience dimensions, excluded solely for missing country or an unmapped region when regions are restricted.
+        unknown_timezone:
+          type: integer
+          description: Matched tokens with null timezone.
+        total_active:
+          type: integer
+          description: All active tokens before platform, users or audience restrictions.
+
     BroadcastRequest:
       type: object
       required:
         - title
         - body
       properties:
+        audience_filter:
+          $ref: '#/components/schemas/AudienceFilter'
         title:
           type: string
           minLength: 1
@@ -1351,6 +1574,11 @@ components:
     BroadcastResponse:
       type: object
       properties:
+        audience_filter:
+          $ref: '#/components/schemas/AudienceFilter'
+        matched_token_count:
+          type: integer
+          description: Included in dry-run responses when audience_filter is non-null.
         message:
           type: string
           description: Response message

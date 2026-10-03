@@ -1,5 +1,6 @@
 import { serve } from "https://deno.land/std@0.223.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.42.5";
+import { validateAudienceFilter } from "../_shared/audience-filter.ts";
 import { getCorsHeaders } from "../_shared/cors.ts";
 import { createSecureResponse } from "../_shared/security-headers.ts";
 import {
@@ -41,6 +42,12 @@ type RequestBody = {
   platform?: string;
   publication_time?: string;
   title?: string;
+  audience_filter?: unknown;
+  visible_from?: string | null;
+  hook_type?: string | null;
+  campaign_ends_at?: string | null;
+  goal_amount_usd?: number | null;
+  progress_amount_usd?: number | null;
 };
 
 function jsonResponse(
@@ -184,60 +191,55 @@ serve(async (req) => {
   }
   const titleValue: string | null = trimmedTitle || null;
 
-  let runAt: Date | null = null;
-  if (publication_time !== undefined && publication_time !== null && publication_time !== "") {
-    const parsed = new Date(publication_time);
-    if (isNaN(parsed.valueOf())) {
-      return jsonResponse({ error: "Invalid publication_time" }, 400, cors);
-    }
-    runAt = parsed;
+  const audience = validateAudienceFilter(body.audience_filter);
+  if (!audience.ok) {
+    return jsonResponse({ error: audience.error }, 400, cors);
   }
 
-  if (runAt && runAt.getTime() > Date.now()) {
-    logInfo("Scheduling launch popup", {
-      request_id: requestId,
-      phase: "enqueue_popup",
-      locale: localeValue,
-      platform: platformValue,
-      publication_time: runAt.toISOString(),
-    }, requestId);
-
-    const { data, error } = await supabase.rpc("enqueue_popup", {
-      _content: trimmedContent,
-      _locale: "en",
-      _platform: platformValue,
-      _run_at: runAt.toISOString(),
-      _title: titleValue,
-    });
-
-    if (error) {
-      logError(
-        "Admin launch-popup enqueue_popup RPC failed",
-        new Error("enqueue_popup RPC failed."),
-        ErrorCategory.DATABASE,
-        ErrorSeverity.HIGH,
-        { request_id: requestId, phase: "enqueue_popup" },
-        requestId,
-      );
-      return jsonResponse(
-        { error: error.message, details: error.details },
-        500,
-        cors,
-      );
+  // visible_from takes precedence; publication_time remains a compatibility alias.
+  const visibilityInput = body.visible_from ?? publication_time;
+  const timestamps: Record<string, string | null> = {};
+  for (const [field, input] of Object.entries({
+    visible_from: visibilityInput,
+    campaign_ends_at: body.campaign_ends_at,
+  })) {
+    if (input === undefined || input === null || input === "") {
+      timestamps[field] = null;
+      continue;
     }
-
-    return jsonResponse(
-      { success: true, scheduled: true, msg_id: data },
-      200,
-      cors,
-    );
+    // Require a timezone-bearing ISO datetime, rather than Date's loose parser.
+    if (
+      typeof input !== "string" ||
+      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(input) ||
+      !Number.isFinite(Date.parse(input)) ||
+      new Date(`${input.slice(0, 10)}T00:00:00Z`).toISOString().slice(0, 10) !==
+        input.slice(0, 10)
+    ) {
+      return jsonResponse({ error: `Invalid ${field}` }, 400, cors);
+    }
+    timestamps[field] = new Date(input).toISOString();
   }
 
-  logInfo("Creating immediate launch popup", {
+  const hookTypes = [
+    "license_renewal", "coffee_day", "black_friday", "feature_object", "yearly_recap",
+  ];
+  if (body.hook_type != null && !hookTypes.includes(body.hook_type)) {
+    return jsonResponse({ error: "Invalid hook_type" }, 400, cors);
+  }
+  for (const field of ["goal_amount_usd", "progress_amount_usd"] as const) {
+    if (body[field] != null &&
+      (typeof body[field] !== "number" || !Number.isFinite(body[field]))) {
+      return jsonResponse({ error: `Invalid ${field}` }, 400, cors);
+    }
+  }
+  const scheduled = timestamps.visible_from !== null &&
+    Date.parse(timestamps.visible_from) > Date.now();
+  logInfo("Creating launch popup", {
     request_id: requestId,
     phase: "insert_popup",
     locale: localeValue,
     platform: platformValue,
+    visible_from: timestamps.visible_from,
   }, requestId);
 
   const { data: row, error } = await supabase
@@ -247,6 +249,12 @@ serve(async (req) => {
       locale: "en",
       platform: platformValue,
       title: titleValue,
+      audience_filter: audience.value,
+      visible_from: timestamps.visible_from,
+      hook_type: body.hook_type ?? null,
+      campaign_ends_at: timestamps.campaign_ends_at,
+      goal_amount_usd: body.goal_amount_usd ?? null,
+      progress_amount_usd: body.progress_amount_usd ?? null,
     })
     .select("id")
     .single();
@@ -270,7 +278,7 @@ serve(async (req) => {
   return jsonResponse(
     {
       success: true,
-      scheduled: false,
+      scheduled,
       sourcePopupId: row.id,
       translationsQueued: true,
     },

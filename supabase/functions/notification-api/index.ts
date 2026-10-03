@@ -1,3 +1,6 @@
+import { localScheduleError, defaultLocalScheduleAt } from "../_shared/local-time-schedule.ts";
+import { validateAudienceFilter } from "../_shared/audience-filter.ts";
+import { canManageScheduledRecipient } from "../_shared/scheduled-notification-policy.ts";
 import { serve } from "https://deno.land/std@0.223.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.42.5";
 import { z } from "https://deno.land/x/zod@v3.23.8/mod.ts";
@@ -5,6 +8,7 @@ import { getCorsHeaders } from "../_shared/cors.ts";
 import { createSecureResponse } from "../_shared/security-headers.ts";
 import { checkUserRateLimit, createRateLimitResponse } from "../_shared/rate-limiter.ts";
 import { validateAndLogEnvironment, ENVIRONMENT_CONFIG } from "../_shared/env-validation.ts";
+import { sendBroadcast, mapPlatformToTargetDeviceTypes } from "../_shared/broadcast-notification.ts";
 import { translateNotificationBatch } from "../_shared/translation-service.ts";
 import { monitoring, generateCorrelationId, createPerformanceTracker, completePerformanceTracking, logApiRequest, logApiResponse, logError, logInfo, logWarning, ErrorCategory, ErrorSeverity, getSystemHealth } from "../_shared/monitoring.ts";
 // Error normalizer function to handle unknown objects
@@ -49,31 +53,6 @@ function logVerboseDebug(operation, context) {
     }
   };
   console.debug(`[DEBUG] ${operation}:`, debugDetails);
-}
-// Platform mapping utility function
-function mapPlatformToTargetDeviceTypes(platform) {
-  const platformMap = {
-    "all": [
-      "android",
-      "ios",
-      "web"
-    ],
-    "ios": [
-      "ios"
-    ],
-    "android": [
-      "android"
-    ],
-    "web": [
-      "web"
-    ]
-  };
-  const normalizedPlatform = platform.toLowerCase().trim();
-  const mappedDevices = platformMap[normalizedPlatform];
-  if (!mappedDevices) {
-    throw new Error(`Invalid platform value: "${platform}". Valid values are: all, ios, android, web`);
-  }
-  return mappedDevices;
 }
 function validateNotificationUrl(url, linkType) {
   if (typeof url !== "string") {
@@ -249,6 +228,29 @@ serve(async (req)=>{
       return await exportAnalytics(authContext, url, cors);
     }
     // Admin Management Endpoints
+    if (pathname === "/v1/admin/broadcast-reach" && method === "GET") {
+      if (!authContext.isAdmin) return forbidden(cors);
+      let input: unknown;
+      try {
+        input = {
+          audience_filter: url.searchParams.has("audience_filter") ? JSON.parse(url.searchParams.get("audience_filter")!) : null,
+          platform: url.searchParams.get("platform") ?? "all",
+          target_user_ids: url.searchParams.has("target_user_ids") ? JSON.parse(url.searchParams.get("target_user_ids")!) : null
+        };
+      } catch {
+        return createSecureResponse(JSON.stringify({ error: "Invalid JSON query parameter" }), { status: 400, headers: { ...cors, "Content-Type": "application/json" } });
+      }
+      const validation = reachEstimateSchema.safeParse(input);
+      if (!validation.success) return createSecureResponse(JSON.stringify({ error: validation.error.message }), { status: 400, headers: { ...cors, "Content-Type": "application/json" } });
+      const parsed = validation.data;
+      const { data, error } = await supabase.schema("public").rpc("estimate_broadcast_reach", {
+        p_audience_filter: parsed.audience_filter ?? null,
+        p_platform: parsed.platform,
+        p_target_user_ids: parsed.target_user_ids
+      });
+      if (error) throw error;
+      return createSecureResponse(JSON.stringify({ data }), { headers: { ...cors, "Content-Type": "application/json" } });
+    }
     if (pathname === "/v1/admin/users" && method === "GET") {
       return await listUsers(authContext, url, cors);
     }
@@ -359,8 +361,25 @@ const tokenSchema = z.object({
   app_version: z.string().max(50).optional(),
   metadata: z.record(z.unknown()).optional().default({})
 });
+const audienceFilterSchema = z.unknown().transform((input, ctx) => {
+  const validated = validateAudienceFilter(input);
+  if (!validated.ok) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: validated.error });
+    return z.NEVER;
+  }
+  return validated.value;
+}).optional();
 // Scheduled Notification Schemas
 const scheduledNotificationSchema = z.object({
+  deliver_local_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullable().optional(),
+  deliver_local_time: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/).nullable().optional(),
+  local_time_fallback: z.enum(["utc", "exclude"]).optional(),
+
+  audience_filter: audienceFilterSchema,
+  audience: z.enum(["user", "broadcast"]).optional().default("user"),
+  platform: z.enum(["all", "ios", "android", "web"]).optional().default("all"),
+  target_user_ids: z.array(z.string().uuid()).optional(),
+  user_id: z.string().uuid().nullable().optional(),
   template_id: z.string().uuid().optional(),
   template_name: z.string().max(100).optional(),
   template_data: z.record(z.unknown()).optional().default({}),
@@ -373,7 +392,7 @@ const scheduledNotificationSchema = z.object({
     "high"
   ]).optional().default("normal"),
   category: z.string().max(50).optional().default("general"),
-  schedule_at: z.string().datetime().transform((val)=>new Date(val)),
+  schedule_at: z.string().datetime().transform((val)=>new Date(val)).optional(),
   recurrence: z.enum([
     "none",
     "daily",
@@ -387,6 +406,15 @@ const scheduledNotificationSchema = z.object({
   translate: z.boolean().optional().default(false)
 });
 const updateScheduledNotificationSchema = z.object({
+  deliver_local_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullable().optional(),
+  deliver_local_time: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/).nullable().optional(),
+  local_time_fallback: z.enum(["utc", "exclude"]).optional(),
+
+  audience_filter: audienceFilterSchema,
+  audience: z.enum(["user", "broadcast"]).optional(),
+  platform: z.enum(["all", "ios", "android", "web"]).optional(),
+  target_user_ids: z.array(z.string().uuid()).nullable().optional(),
+  user_id: z.string().uuid().nullable().optional(),
   template_id: z.string().uuid().optional(),
   template_name: z.string().max(100).optional(),
   template_data: z.record(z.unknown()).optional().default({}),
@@ -443,8 +471,14 @@ const analyticsQuerySchema = z.object({
     "json"
   ]).optional()
 });
+const reachEstimateSchema = z.object({
+  audience_filter: audienceFilterSchema,
+  platform: z.enum(["all", "ios", "android", "web"]),
+  target_user_ids: z.array(z.string().uuid()).nullable()
+});
 // Broadcast Notification Schema
 const broadcastNotificationSchema = z.object({
+  audience_filter: audienceFilterSchema,
   title: z.string().min(1).max(200).transform((val)=>val.trim().replace(/[<>]/g, "")),
   body: z.string().min(1).max(1000).transform((val)=>val.trim().replace(/[<>]/g, "")),
   data: z.record(z.unknown()).optional().default({}),
@@ -894,18 +928,33 @@ async function deleteToken(auth, tokenId, cors) {
     headers: responseHeaders
   });
 }
+function sanitizeNotificationDataUrls(data: Record<string, unknown> | undefined) {
+  if (!data) return;
+  for (const key of Object.keys(data)) {
+    if ((key.endsWith("_url") || key === "deep_link" || key === "link") && !validateNotificationUrl(data[key], undefined)) delete data[key];
+  }
+}
 // Scheduled Notification Functions
 async function listScheduledNotifications(auth, url, cors) {
   const limit = Number(url.searchParams.get("limit") ?? "50");
   const status = url.searchParams.get("status");
-  let query = supabase.from("scheduled_notifications").select("*").eq("user_id", auth.user.id).order("schedule_at", {
+  let query = supabase.from("scheduled_notifications").select("*").order("schedule_at", {
     ascending: false
   }).limit(Math.min(limit, 200));
+  if (!auth.isAdmin) query = query.eq("user_id", auth.user.id);
   if (status) {
     query = query.eq("status", status);
   }
   const { data, error } = await query;
   if (error) throw error;
+  const localIds = (data ?? []).filter((row: { deliver_local_time: string | null }) => row.deliver_local_time != null).map((row: { id: string }) => row.id);
+  if (localIds.length) {
+    const { data: summaries, error: summaryError } = await supabase.rpc("scheduled_bucket_summary", { p_job_ids: localIds });
+    if (summaryError) throw summaryError;
+    const byId = new Map((summaries ?? []).map((row: { job_id: string; counts: Record<string, number> }) => [row.job_id, row.counts]));
+    for (const row of data ?? []) if (row.deliver_local_time != null) row.bucket_summary = byId.get(row.id) ?? {};
+  }
+
   const responseHeaders = {
     ...cors,
     "Content-Type": "application/json"
@@ -917,10 +966,23 @@ async function listScheduledNotifications(auth, url, cors) {
   });
 }
 async function createScheduledNotification(auth, body, cors) {
-  const parsed = scheduledNotificationSchema.parse(body);
+  const validation = scheduledNotificationSchema.safeParse(body);
+  if (!validation.success) return createSecureResponse(JSON.stringify({ error: validation.error.message }), { status: 400, headers: { ...cors, "Content-Type": "application/json" } });
+  const parsed = validation.data;
+  if (!auth.isAdmin && (parsed.deliver_local_date !== undefined || parsed.deliver_local_time !== undefined || parsed.local_time_fallback !== undefined)) return forbidden(cors);
+  const localError = parsed.local_time_fallback !== undefined && parsed.audience !== "broadcast" ? "local_time_fallback requires broadcast audience" : localScheduleError(parsed);
+  if (localError || (!parsed.schedule_at && !parsed.deliver_local_time)) return createSecureResponse(JSON.stringify({ error: localError ?? "schedule_at is required" }), { status: 400, headers: { ...cors, "Content-Type": "application/json" } });
+  if (!parsed.schedule_at && parsed.deliver_local_date && parsed.deliver_local_time) parsed.schedule_at = defaultLocalScheduleAt(parsed.deliver_local_date, parsed.deliver_local_time);
+  if (parsed.audience_filter !== undefined && !auth.isAdmin) return forbidden(cors);
+  if (parsed.audience_filter != null && parsed.audience !== "broadcast") return createSecureResponse(JSON.stringify({ error: "audience_filter requires broadcast audience" }), { status: 400, headers: { ...cors, "Content-Type": "application/json" } });
+  if (!canManageScheduledRecipient(auth.isAdmin, auth.user.id, parsed)) return forbidden(cors);
+  if (parsed.audience === "broadcast" && parsed.user_id != null) throw new Error("Broadcast user_id must be null or omitted");
+  if (parsed.audience === "user" && parsed.target_user_ids !== undefined) throw new Error("target_user_ids requires broadcast audience");
+  sanitizeNotificationDataUrls(parsed.data);
   const { data, error } = await supabase.from("scheduled_notifications").insert({
     ...parsed,
-    user_id: auth.user.id
+    user_id: parsed.audience === "broadcast" ? null : parsed.user_id ?? auth.user.id,
+    created_by: auth.user.id
   }).select("*").single();
   if (error) throw error;
   const responseHeaders = {
@@ -935,8 +997,32 @@ async function createScheduledNotification(auth, body, cors) {
   });
 }
 async function updateScheduledNotification(auth, scheduledId, body, cors) {
-  const parsed = updateScheduledNotificationSchema.parse(body);
-  const { data, error } = await supabase.from("scheduled_notifications").update(parsed).eq("id", scheduledId).eq("user_id", auth.user.id).select("*").single();
+  const validation = updateScheduledNotificationSchema.safeParse(body);
+  if (!validation.success) return createSecureResponse(JSON.stringify({ error: validation.error.message }), { status: 400, headers: { ...cors, "Content-Type": "application/json" } });
+  const parsed = validation.data;
+  if (!auth.isAdmin && (parsed.deliver_local_date !== undefined || parsed.deliver_local_time !== undefined || parsed.local_time_fallback !== undefined)) return forbidden(cors);
+  if (parsed.audience_filter !== undefined && !auth.isAdmin) return forbidden(cors);
+  if (!canManageScheduledRecipient(auth.isAdmin, auth.user.id, parsed)) return forbidden(cors);
+  let existingQuery = supabase.from("scheduled_notifications").select("*").eq("id", scheduledId);
+  if (!auth.isAdmin) existingQuery = existingQuery.eq("user_id", auth.user.id);
+  const { data: existing, error: readError } = await existingQuery.single();
+  if (readError) throw readError;
+  const audience = parsed.audience ?? existing.audience;
+  const mergedLocal = { ...existing, ...parsed, audience };
+  const localError = parsed.local_time_fallback !== undefined && audience !== "broadcast" ? "local_time_fallback requires broadcast audience" : localScheduleError(mergedLocal);
+  if (localError || (mergedLocal.deliver_local_time != null && existing.status !== "pending")) return createSecureResponse(JSON.stringify({ error: localError ?? "Started local-time jobs cannot be edited; create a new job" }), { status: 400, headers: { ...cors, "Content-Type": "application/json" } });
+
+  const audienceFilter = parsed.audience_filter !== undefined ? parsed.audience_filter : audience === "user" ? null : existing.audience_filter;
+  if (audienceFilter != null && audience !== "broadcast") return createSecureResponse(JSON.stringify({ error: "audience_filter requires broadcast audience" }), { status: 400, headers: { ...cors, "Content-Type": "application/json" } });
+  const userId = audience === "broadcast" ? null : parsed.user_id ?? existing.user_id ?? auth.user.id;
+  if (audience === "broadcast" && parsed.user_id != null) throw new Error("Broadcast user_id must be null");
+  const targetUserIds = parsed.target_user_ids !== undefined ? parsed.target_user_ids : audience === "user" ? null : existing.target_user_ids;
+  if (audience === "user" && parsed.target_user_ids != null) throw new Error("target_user_ids requires broadcast audience");
+  sanitizeNotificationDataUrls(parsed.data);
+  let query = supabase.from("scheduled_notifications").update({ ...parsed, ...(mergedLocal.deliver_local_time != null ? { translated_payloads: null } : {}), audience, audience_filter: audienceFilter, user_id: userId, target_user_ids: targetUserIds }).eq("id", scheduledId);
+  if (existing.deliver_local_time != null || mergedLocal.deliver_local_time != null) query = query.eq("status", "pending");
+  if (!auth.isAdmin) query = query.eq("user_id", auth.user.id);
+  const { data, error } = await query.select("*").single();
   if (error) throw error;
   const responseHeaders = {
     ...cors,
@@ -949,9 +1035,9 @@ async function updateScheduledNotification(auth, scheduledId, body, cors) {
   });
 }
 async function deleteScheduledNotification(auth, scheduledId, cors) {
-  const { data, error } = await supabase.from("scheduled_notifications").update({
-    status: "cancelled"
-  }).eq("id", scheduledId).eq("user_id", auth.user.id).select("*").single();
+  let query = supabase.from("scheduled_notifications").update({ status: "cancelled" }).eq("id", scheduledId);
+  if (!auth.isAdmin) query = query.eq("user_id", auth.user.id);
+  const { data, error } = await query.select("*").single();
   if (error) throw error;
   const responseHeaders = {
     ...cors,
@@ -1153,7 +1239,9 @@ async function broadcastNotification(auth, body, cors, correlationId) {
     if (!auth.isAdmin) {
       return forbidden(cors);
     }
-    const parsed = broadcastNotificationSchema.parse(body);
+    const validation = broadcastNotificationSchema.safeParse(body);
+    if (!validation.success) return createSecureResponse(JSON.stringify({ error: validation.error.message }), { status: 400, headers: { ...cors, "Content-Type": "application/json" } });
+    const parsed = validation.data;
     const initialDataRecord = parsed.data;
     logInfo('Broadcast notification request received', {
       correlationId,
@@ -1215,12 +1303,24 @@ async function broadcastNotification(auth, body, cors, correlationId) {
     }
     // If dry run, return early
     if (parsed.dry_run) {
+      let matchedTokenCount: number | undefined;
+      if (parsed.audience_filter != null) {
+        const { data: matched, error } = await supabase.rpc("get_broadcast_tokens", {
+          p_target_device_types: targetDeviceTypes,
+          p_target_user_ids: parsed.target_user_ids ?? null,
+          p_audience_filter: parsed.audience_filter
+        });
+        if (error) throw error;
+        matchedTokenCount = matched?.length ?? 0;
+      }
       const responseHeaders = {
         ...cors,
         "Content-Type": "application/json"
       };
       return createSecureResponse(JSON.stringify({
         message: "Dry run successful",
+        audience_filter: parsed.audience_filter ?? null,
+        ...(matchedTokenCount !== undefined ? { matched_token_count: matchedTokenCount } : {}),
         title: parsed.title,
         body: parsed.body,
         platform: parsed.platform,
@@ -1233,243 +1333,22 @@ async function broadcastNotification(auth, body, cors, correlationId) {
         headers: responseHeaders
       });
     }
-    // Get target tokens with locale information
-    let tokenQuery = supabase.from("user_fcm_tokens").select("id, user_id, token, device_type, locale").eq("is_active", true);
-    if (targetDeviceTypes.length > 0) {
-      tokenQuery = tokenQuery.in("device_type", targetDeviceTypes);
-    }
-    if (parsed.target_user_ids?.length) {
-      tokenQuery = tokenQuery.in("user_id", parsed.target_user_ids);
-    }
-    const { data: tokens, error: tokenError } = await tokenQuery;
-    if (tokenError) throw tokenError;
-    if (!tokens || tokens.length === 0) {
-      const responseHeaders = {
-        ...cors,
-        "Content-Type": "application/json"
-      };
-      return createSecureResponse(JSON.stringify({
-        message: "No active tokens found",
-        tokens_targeted: 0
-      }), {
-        status: 200,
-        headers: responseHeaders
+    const result = await sendBroadcast({
+      title: parsed.title, body: parsed.body, data: parsed.data,
+      priority: parsed.priority, platform: parsed.platform, locale: parsed.locale,
+      translate: parsed.translate, target_user_ids: parsed.target_user_ids, audienceFilter: parsed.audience_filter
+    }, correlationId, { supabase, fetch, translateNotificationBatch, sendFunctionUrl, serviceRoleKey, logWarning });
+    if (result.noTokens) {
+      return createSecureResponse(JSON.stringify({ message: "No active tokens found", tokens_targeted: 0 }), {
+        status: 200, headers: { ...cors, "Content-Type": "application/json" }
       });
     }
-    // Get distinct target locales from tokens
-    const { data: targetLocalesData, error: localesError } = await supabase.rpc("get_broadcast_target_locales", {
-      p_target_device_types: targetDeviceTypes,
-      p_target_user_ids: parsed.target_user_ids ?? null
-    });
-    if (localesError) {
-      logWarning('Failed to get target locales from tokens', {
-        error: localesError.message,
-        correlationId
-      }, correlationId);
-    }
-    const targetLocales = (targetLocalesData || []).map((row)=>row.locale).filter((locale)=>locale && locale !== parsed.locale); // Skip source locale
-    // Ensure the source locale is always included for delivery
-    if (!targetLocales.includes(parsed.locale)) {
-      targetLocales.unshift(parsed.locale);
-    }
-    // Handle translation flow if enabled
-    const broadcastResults = [];
-    let overallSuccess = false;
-    if (parsed.translate) {
-      // Group tokens by locale
-      const tokensByLocale = new Map();
-      for (const token of tokens){
-        const locale = token.locale || 'en'; // Default to 'en' if no locale specified
-        if (!tokensByLocale.has(locale)) {
-          tokensByLocale.set(locale, []);
-        }
-        tokensByLocale.get(locale).push(token);
-      }
-      if (targetLocales.length === 0) {
-        logWarning('No target locales for translation', {
-          correlationId
-        }, correlationId);
-      } else {
-        // Translate content for all target locales
-        const translations = await translateNotificationBatch(targetLocales, parsed.title, parsed.body, parsed.data, correlationId);
-        // Send notifications for each locale group
-        for (const locale of targetLocales){
-          const localeTokens = tokensByLocale.get(locale) || [];
-          if (localeTokens.length === 0) continue;
-          if (!translations.has(locale)) {
-            logWarning(`No translation available for locale: ${locale}`, {
-              correlationId
-            }, correlationId);
-            continue;
-          }
-          const translation = translations.get(locale);
-          const mergedData = {
-            ...parsed.data,
-            ...translation.data
-          };
-          const localeDataRecord = mergedData;
-          logInfo('Broadcast locale payload prepared', {
-            correlationId,
-            locale,
-            tokenCount: localeTokens.length,
-            platform: parsed.platform,
-            linkFields: {
-              deep_link: localeDataRecord?.["deep_link"] ?? null,
-              external_url: localeDataRecord?.["external_url"] ?? null,
-              open_in_browser: localeDataRecord?.["open_in_browser"] ?? null
-            }
-          }, correlationId);
-          // Send to FCM service for this locale (let send-fcm-notification create the record)
-          const response = await fetch(sendFunctionUrl, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${serviceRoleKey}`
-            },
-            body: JSON.stringify({
-              userId: null,
-              tokens: localeTokens.map((t)=>({
-                  token: t.token,
-                  device_type: t.device_type,
-                  locale: t.locale,
-                  id: t.id
-                })),
-              title: translation.title,
-              body: translation.body,
-              data: mergedData,
-              priority: parsed.priority,
-              platform: parsed.platform,
-              locale: locale
-            })
-          });
-          if (response.ok) {
-            let notificationId;
-            try {
-              const respJson = await response.json();
-              if (Array.isArray(respJson.results)) {
-                notificationId = respJson.results.find((r)=>r.locale === locale)?.notificationId;
-              }
-              notificationId = notificationId ?? respJson.notificationId ?? respJson.id;
-            } catch  {
-              notificationId = undefined;
-            }
-            logInfo('Broadcast locale sent to FCM', {
-              correlationId,
-              locale,
-              tokenCount: localeTokens.length,
-              notificationId: notificationId ?? 'unknown',
-              linkFields: {
-                deep_link: localeDataRecord?.["deep_link"] ?? null,
-                external_url: localeDataRecord?.["external_url"] ?? null,
-                open_in_browser: localeDataRecord?.["open_in_browser"] ?? null
-              }
-            }, correlationId);
-            broadcastResults.push({
-              notificationId: notificationId ?? "unknown",
-              locale: locale,
-              tokensTargeted: localeTokens.length,
-              success: true
-            });
-            overallSuccess = true;
-          } else {
-            // Parse error response properly to avoid [object Object] issue
-            let errorMessage;
-            try {
-              const errorData = await response.json();
-              errorMessage = errorData.error || errorData.message || 'FCM service error';
-            } catch  {
-              errorMessage = await response.text();
-            }
-            logError(`FCM send failed for locale ${locale}`, new Error(errorMessage), ErrorCategory.EXTERNAL_API, ErrorSeverity.HIGH, {
-              locale,
-              tokenCount: localeTokens.length,
-              correlationId
-            }, correlationId);
-            broadcastResults.push({
-              notificationId: "unknown",
-              locale: locale,
-              tokensTargeted: localeTokens.length,
-              success: false
-            });
-          }
-        }
-      }
-    } else {
-      // Original non-translation flow (backward compatibility)
-      // Send to FCM service (let send-fcm-notification create the record)
-      const nonTranslateDataRecord = parsed.data;
-      logInfo('Broadcast (no translation) sending to FCM', {
-        correlationId,
-        tokenCount: tokens.length,
-        targetDeviceTypes,
-        linkFields: {
-          deep_link: nonTranslateDataRecord?.["deep_link"] ?? null,
-          external_url: nonTranslateDataRecord?.["external_url"] ?? null,
-          open_in_browser: nonTranslateDataRecord?.["open_in_browser"] ?? null
-        }
-      }, correlationId);
-      const response = await fetch(sendFunctionUrl, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${serviceRoleKey}`
-        },
-        body: JSON.stringify({
-          userId: null,
-          tokens: tokens.map((t)=>({
-              token: t.token,
-              device_type: t.device_type,
-              locale: t.locale,
-              id: t.id
-            })),
-          title: parsed.title,
-          body: parsed.body,
-          data: parsed.data,
-          priority: parsed.priority,
-          platform: parsed.platform,
-          locale: parsed.locale
-        })
+    if (result.httpError) {
+      return createSecureResponse(JSON.stringify({ error: result.httpError.error }), {
+        status: result.httpError.status, headers: { ...cors, "Content-Type": "application/json" }
       });
-      let responseJson = null;
-      if (response.ok) {
-        try {
-          responseJson = await response.json();
-        } catch  {
-          responseJson = null;
-        }
-      }
-      if (!response.ok) {
-        // Parse error response properly to avoid [object Object] issue
-        let errorMessage;
-        try {
-          const errorData = responseJson ?? await response.json();
-          errorMessage = errorData.error || errorData.message || 'FCM service error';
-        } catch  {
-          errorMessage = await response.text();
-        }
-        logError('FCM broadcast send failed', new Error(errorMessage), ErrorCategory.EXTERNAL_API, ErrorSeverity.HIGH, {
-          status: response.status,
-          correlationId
-        }, correlationId);
-        const responseHeaders = {
-          ...cors,
-          "Content-Type": "application/json"
-        };
-        return createSecureResponse(JSON.stringify({
-          error: errorMessage
-        }), {
-          status: response.status,
-          headers: responseHeaders
-        });
-      }
-      const notificationId = Array.isArray(responseJson?.results) ? responseJson.results[0]?.notificationId : responseJson?.notificationId ?? responseJson?.id ?? "unknown";
-      broadcastResults.push({
-        notificationId,
-        tokensTargeted: tokens.length,
-        success: true
-      });
-      overallSuccess = true;
     }
+    const { results: broadcastResults, overallSuccess, targetLocales } = result;
     const responseHeaders = {
       ...cors,
       "Content-Type": "application/json"

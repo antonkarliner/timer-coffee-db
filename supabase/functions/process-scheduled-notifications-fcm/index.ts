@@ -1,8 +1,30 @@
+import { processLocalTimeJob, type LocalTimeJob } from "../_shared/local-time-broadcast.ts";
+import { partitionScheduledJobs } from "../_shared/scheduled-notification-policy.ts";
 import { serve } from "https://deno.land/std@0.223.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.42.5";
+import { sendBroadcast } from "../_shared/broadcast-notification.ts";
+import { translateNotificationBatch } from "../_shared/translation-service.ts";
 import { corsHeaders } from "../_shared/cors.ts";
 import { validateAndLogEnvironment, ENVIRONMENT_CONFIG } from "../_shared/env-validation.ts";
 import { generateCorrelationId, createPerformanceTracker, completePerformanceTracking, logInfo, logWarning, logError, logFatal, ErrorCategory, ErrorSeverity, flushLogsOnExit } from "../_shared/monitoring.ts";
+import type { AudienceFilter } from "../_shared/audience-filter.ts";
+interface LockedScheduledJob {
+  audience_filter?: AudienceFilter | null;
+  id: string;
+  audience?: "user" | "broadcast";
+  user_id: string | null;
+  title: string | null;
+  body: string | null;
+  template_id: string | null;
+  template_name: string | null;
+  data: Record<string, unknown> | null;
+  priority: "low" | "normal" | "high";
+  category: string | null;
+  locale: string;
+  translate: boolean;
+  platform: "all" | "ios" | "android" | "web";
+  target_user_ids: string[] | null;
+}
 // Validate environment variables
 validateAndLogEnvironment();
 const supabaseUrl = ENVIRONMENT_CONFIG.supabaseUrl;
@@ -70,6 +92,7 @@ serve(async (req)=>{
       }
     });
   }
+  const invocationDeadline = Date.now() + 90_000;
   try {
     logInfo('Processing scheduled notifications', {
       batchSize,
@@ -86,7 +109,9 @@ serve(async (req)=>{
       }, correlationId);
       throw new Error(`Failed to lock scheduled notifications: ${error.message}`);
     }
-    if (!jobs || jobs.length === 0) {
+    const { data: localJobs, error: localLockError } = await supabase.rpc("lock_local_time_scheduled_notifications", { p_limit: batchSize });
+    if (localLockError) throw new Error(localLockError.message);
+    if ((!jobs || jobs.length === 0) && (!localJobs || localJobs.length === 0)) {
       completePerformanceTracking(performanceTracker, req, 200);
       logInfo('No scheduled notifications to process', {
         batchSize,
@@ -103,11 +128,18 @@ serve(async (req)=>{
       });
     }
     logInfo('Locked scheduled notifications for processing', {
-      jobCount: jobs.length,
+      jobCount: (jobs ?? []).length,
       correlationId
     }, correlationId);
+    // Release extra broadcasts before doing any slow translation or FCM work.
+    const { processJobs, deferredIds } = partitionScheduledJobs((jobs ?? []) as LockedScheduledJob[]);
+    if (deferredIds.length) {
+      const { error: releaseError } = await supabase.from("scheduled_notifications")
+        .update({ status: "pending" }).in("id", deferredIds).eq("status", "processing");
+      if (releaseError) throw new Error(`Failed to release deferred broadcasts: ${releaseError.message}`);
+    }
     const results = [];
-    for (const job of jobs){
+    for (const job of processJobs){
       const jobPerformanceTracker = createPerformanceTracker('process-scheduled-notifications-fcm', 'process_job', correlationId);
       try {
         logInfo('Processing scheduled notification job', {
@@ -118,6 +150,23 @@ serve(async (req)=>{
           priority: job.priority,
           correlationId
         }, correlationId);
+        if (job.audience === "broadcast") {
+          if (!job.title || !job.body) throw new Error("Scheduled broadcasts require explicit title and body; templates are not supported");
+          const broadcast = await sendBroadcast({
+            title: job.title, body: job.body, data: job.data ?? {},
+            priority: job.priority, category: job.category ?? "general",
+            locale: job.locale ?? "en", translate: job.translate ?? false,
+            platform: job.platform ?? "all", target_user_ids: job.target_user_ids, audienceFilter: job.audience_filter
+          }, correlationId, { supabase, fetch, translateNotificationBatch, sendFunctionUrl, serviceRoleKey, logWarning, captureLocaleErrors: true, respectDeliveryResults: true });
+          const status = broadcast.overallSuccess ? "sent" : "failed";
+          const failureReason = broadcast.noTokens ? "No active tokens found" : broadcast.failures.length
+            ? JSON.stringify(broadcast.failures) : broadcast.overallSuccess ? null : "No broadcast locale was sent";
+          await markScheduledNotification(job.id, status, failureReason, null);
+          if (broadcast.overallSuccess) await maybeScheduleNext(job);
+          results.push({ id: job.id, status });
+          completePerformanceTracking(jobPerformanceTracker, req, broadcast.overallSuccess ? 200 : 500);
+          continue;
+        }
         const payload = buildSendPayload(job);
         const linkSummary = summarizeLinkFields(payload.data);
         logInfo('Dispatching scheduled payload to send-fcm-notification', {
@@ -180,9 +229,25 @@ serve(async (req)=>{
         await markScheduledNotification(job.id, "failed", message, null);
       }
     }
+    for (const job of (localJobs ?? [])) {
+      if (Date.now() >= invocationDeadline) break;
+      try {
+        await processLocalTimeJob({
+          ...job, title: job.title ?? "", body: job.body ?? "", data: job.data ?? {},
+          audienceFilter: job.audience_filter,
+        } as LocalTimeJob, correlationId, {
+          supabase, fetch, translateNotificationBatch, sendFunctionUrl, serviceRoleKey,
+          logWarning, captureLocaleErrors: true, respectDeliveryResults: true,
+        }, invocationDeadline);
+        results.push({ id: job.id, status: "delivering" });
+      } catch (error) {
+        // Never mark a whole local-time job failed on a transient RPC error.
+        logError('Local-time broadcast processing failed', error instanceof Error ? error : new Error(String(error)), ErrorCategory.DATABASE, ErrorSeverity.MEDIUM, { jobId: job.id }, correlationId);
+      }
+    }
     completePerformanceTracking(performanceTracker, req, 200);
     logInfo('Completed processing scheduled notifications', {
-      totalJobs: jobs.length,
+      totalJobs: (jobs ?? []).length + (localJobs ?? []).length,
       successfulJobs: results.filter((r)=>r.status === 'sent').length,
       failedJobs: results.filter((r)=>r.status === 'failed').length,
       correlationId
@@ -268,6 +333,11 @@ async function maybeScheduleNext(job) {
     });
     const { error } = await supabase.from("scheduled_notifications").insert({
       user_id: job.user_id,
+      audience: job.audience ?? "user",
+      platform: job.platform ?? "all",
+      target_user_ids: job.target_user_ids,
+      audience_filter: job.audience_filter,
+      created_by: job.created_by,
       template_id: job.template_id,
       template_name: job.template_name,
       template_data: job.template_data ?? {},
