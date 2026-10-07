@@ -1,6 +1,7 @@
 import { classifyFailure } from "./failure-classification.ts";
 import { ImageFormatError } from "../_shared/image-variants.ts";
 import {
+  BlockedSourceError,
   DbError,
   EmbeddingConfigError,
   EmbeddingInputError,
@@ -27,6 +28,12 @@ function assertEquals<T>(actual: T, expected: T, message: string): void {
 Deno.test("failure classification maps every typed error to its stable slug", () => {
   const cases: Array<[unknown, string, boolean, string]> = [
     // [error, errorClass, terminal, description]
+    [
+      new BlockedSourceError("Blocked logo destination: ip"),
+      "blocked_destination",
+      true,
+      "private destination is terminal",
+    ],
     [
       new SourceTooLargeError(
         "source_too_large: 6543x6543 (42.8 Mpx) exceeds 16 Mpx cap — replace roaster_logo_url",

@@ -58,6 +58,14 @@ export class StorageUploadError extends Error {
   }
 }
 
+/** Destination policy rejected the source. TERMINAL — the URL needs a fix. */
+export class BlockedSourceError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "BlockedSourceError";
+  }
+}
+
 /** Source URL is absent or syntactically invalid. TERMINAL. */
 export class MalformedSourceError extends Error {
   constructor(message: string) {
@@ -123,7 +131,8 @@ export class EmbeddingResponseError extends Error {
  * terminal data-quality classes that share the same rationale).
  */
 export function isExpectedDataQualityError(error: unknown): boolean {
-  return error instanceof ImageFormatError ||
+  return error instanceof BlockedSourceError ||
+    error instanceof ImageFormatError ||
     error instanceof SourceTooLargeError ||
     error instanceof SvgRasterizationUnsupportedError ||
     error instanceof MalformedSourceError ||

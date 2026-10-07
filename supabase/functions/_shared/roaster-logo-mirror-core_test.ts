@@ -8,11 +8,20 @@ import {
   RASTER_ASSET_SUFFIX,
 } from "./roaster-logo-mirror-core.ts";
 import {
+  BlockedSourceError,
+  HttpSourceError,
   MalformedSourceError,
+  SourceTimeoutError,
   SourceTooLargeError,
   StorageUploadError,
   SvgRasterizationUnsupportedError,
 } from "./roaster-postprocess-errors.ts";
+import {
+  BlockedDestinationError,
+  fetchPublicWeb,
+  ResponseTooLargeError,
+} from "./public-web-fetch.ts";
+import { classifyFailure } from "../roaster-postprocess-worker/failure-classification.ts";
 import { ImageFormatError } from "./image-variants.ts";
 
 function assertEquals<T>(actual: T, expected: T, message: string): void {
@@ -621,6 +630,14 @@ Deno.test("storage upload failure of the main asset surfaces as retryable Storag
 
 // --- fetchLogoWithGuards (global fetch stubbed — no network) -------------------
 
+// Leave the scripted response streaming so the logo's own guards are exercised.
+const scriptedPublicFetch: typeof fetchPublicWeb = async (url, options) => {
+  const response = await fetch(url);
+  await options.onResponse?.(response);
+  return { response, finalUrl: url, redirects: 0, truncated: false };
+};
+const fetchDeps = { publicFetch: scriptedPublicFetch, supabaseUrl: "" };
+
 Deno.test("fetchLogoWithGuards rejects a declared content-length over the byte cap without consuming the body", async () => {
   const originalFetch = globalThis.fetch;
   let bytesEnqueued = 0;
@@ -640,7 +657,7 @@ Deno.test("fetchLogoWithGuards rejects a declared content-length over the byte c
   }) as typeof fetch;
   try {
     const error = await assertThrows(
-      () => fetchLogoWithGuards("https://src/logo.png"),
+      () => fetchLogoWithGuards("https://src/logo.png", fetchDeps),
       SourceTooLargeError,
       "declared 3500000 bytes",
     );
@@ -679,7 +696,7 @@ Deno.test("fetchLogoWithGuards enforces the byte cap while streaming when conten
   }) as typeof fetch;
   try {
     const error = await assertThrows(
-      () => fetchLogoWithGuards("https://src/logo.png"),
+      () => fetchLogoWithGuards("https://src/logo.png", fetchDeps),
       SourceTooLargeError,
       "while streaming",
     );
@@ -708,7 +725,10 @@ Deno.test("fetchLogoWithGuards passes a small body through with its content-type
     });
   }) as typeof fetch;
   try {
-    const fetched = await fetchLogoWithGuards("https://src/logo.png");
+    const fetched = await fetchLogoWithGuards(
+      "https://src/logo.png",
+      fetchDeps,
+    );
     assertEquals(fetched.contentType, "image/png", "content-type preserved");
     assertEquals(fetched.bytes.length, png.length, "bytes intact");
   } finally {
@@ -729,4 +749,119 @@ Deno.test("buildBasePath keeps the {id}_{name} storage layout", () => {
     "9_kofeynya_1",
     "Cyrillic transliterated, punctuation stripped",
   );
+});
+
+Deno.test("blocked logo destination is terminal, streamed cap and timeout keep typed errors", async () => {
+  for (
+    const [cause, kind, message] of [
+      [
+        new BlockedDestinationError("ip"),
+        BlockedSourceError,
+        "Blocked logo destination: ip",
+      ],
+      [
+        new ResponseTooLargeError(null),
+        SourceTooLargeError,
+        "while streaming (declared content-length: absent)",
+      ],
+      [
+        new Error("Request timeout after 20000ms"),
+        SourceTimeoutError,
+        "Request timeout after ",
+      ],
+    ] as const
+  ) {
+    const error = await assertThrows(
+      () =>
+        fetchLogoWithGuards("https://src/logo.png", {
+          supabaseUrl: "",
+          publicFetch: () => Promise.reject(cause),
+        }),
+      kind,
+      message,
+    );
+    assertEquals(
+      classifyFailure(error).terminal,
+      !(error instanceof SourceTimeoutError),
+      "classification retained",
+    );
+  }
+});
+
+Deno.test("only the exact project's public Storage prefix uses trusted fetch", async () => {
+  let trustedCalls = 0;
+  let publicCalls = 0;
+  const deps = {
+    supabaseUrl: "https://project.supabase.co",
+    trustedFetch: () => {
+      trustedCalls++;
+      return Promise.resolve(
+        new Response(new Uint8Array(smallPngBytes()), {
+          headers: { "content-type": "image/png" },
+        }),
+      );
+    },
+    publicFetch: (() => {
+      publicCalls++;
+      throw new BlockedDestinationError("ip");
+    }) as typeof fetchPublicWeb,
+  };
+  await fetchLogoWithGuards(
+    "https://project.supabase.co/storage/v1/object/public/logos/a.png",
+    deps,
+  );
+  for (
+    const url of [
+      "https://project.supabase.co/storage/v1/object/publicity/a.png",
+      "https://project.supabase.co.evil/storage/v1/object/public/logos/a.png",
+      "https://other.supabase.co/storage/v1/object/public/logos/a.png",
+      "https://project.supabase.co/private/logo.png",
+      "https://project.supabase.co/storage/v1/object/public/../../../../private/logo.png",
+    ]
+  ) {
+    await assertThrows(
+      () => fetchLogoWithGuards(url, deps),
+      BlockedSourceError,
+    );
+  }
+  assertEquals(trustedCalls, 1, "exact prefix alone is trusted");
+  assertEquals(publicCalls, 5, "other sources use pinned transport");
+});
+
+Deno.test("public transport preserves pre-body HTTP, MIME and declared-size error precedence", async () => {
+  for (
+    const [status, headers, kind, message] of [
+      [
+        404,
+        { "content-type": "image/avif", "content-length": "3500000" },
+        HttpSourceError,
+        "Failed to fetch logo: HTTP 404",
+      ],
+      [
+        200,
+        { "content-type": "image/avif", "content-length": "3500000" },
+        ImageFormatError,
+        "Unsupported content-type 'image/avif'",
+      ],
+      [
+        200,
+        { "content-type": "image/png", "content-length": "3500000" },
+        SourceTooLargeError,
+        "declared 3500000 bytes",
+      ],
+    ] as const
+  ) {
+    await assertThrows(
+      () =>
+        fetchLogoWithGuards("https://src/logo.png", {
+          supabaseUrl: "",
+          publicFetch: async (_url, options) => {
+            await options.onResponse?.(new Response(null, { status, headers }));
+            throw new Error("body must never be downloaded");
+          },
+        }),
+      kind,
+      message,
+    );
+  }
 });

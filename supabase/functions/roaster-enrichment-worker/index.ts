@@ -7,6 +7,10 @@ import {
   groqReasoningOverride,
   OPENAI_MODELS,
 } from "../_shared/ai-models.ts";
+import {
+  BlockedDestinationError,
+  fetchPublicWeb,
+} from "../_shared/public-web-fetch.ts";
 import { fetchWithTimeout } from "../_shared/fetch-with-timeout.ts";
 import {
   boundEvidencePayload,
@@ -459,11 +463,14 @@ async function fetchWithRetry(
     label?: string;
     timeoutMs?: number;
   } = {},
+  transport?: (url: string) => Promise<Response>,
 ) {
   let lastResponse = null;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
-      const response = timeoutMs
+      const response = transport
+        ? await transport(url)
+        : timeoutMs
         ? await fetchWithTimeout(url, options, timeoutMs)
         : await fetch(url, options);
       lastResponse = response;
@@ -484,6 +491,14 @@ async function fetchWithRetry(
       }, correlationId);
       await sleep(delay);
     } catch (error) {
+      if (error instanceof BlockedDestinationError) {
+        logWarning(
+          "Blocked website destination",
+          { url, reason: error.reason },
+          correlationId,
+        );
+        throw error;
+      }
       const errorMessage = getErrorMessage(error);
       // Don't retry on timeout errors - fail fast
       if (errorMessage.includes("timeout")) {
@@ -512,6 +527,24 @@ async function fetchWithRetry(
     throw new Error("No response received from fetchWithRetry");
   }
   return lastResponse;
+}
+function fetchUntrustedPage(
+  url: string,
+  { label, correlationId }: { label: string; correlationId?: string },
+) {
+  return fetchWithRetry(
+    url,
+    {},
+    { maxAttempts: 2, label, correlationId },
+    async (url) => {
+      const result = await fetchPublicWeb(url, {
+        headers: { "User-Agent": "timer.coffee/1.0 (admin@timer.coffee)" },
+        timeoutMs: FETCH_TIMEOUT_MS,
+        maxBytes: 1_500_000,
+      });
+      return result.response;
+    },
+  );
 }
 function stripCodeFence(value) {
   return value.replace(/^```(?:json)?\s*/i, "").replace(/```$/i, "").trim();
@@ -1296,17 +1329,9 @@ async function processFetchCandidatesStage(job, correlationId) {
       url,
     }, correlationId);
     try {
-      const response = await fetchWithRetry(url, {
-        method: "GET",
-        redirect: "follow",
-        headers: {
-          "User-Agent": "timer.coffee/1.0 (admin@timer.coffee)",
-        },
-      }, {
-        maxAttempts: 2,
+      const response = await fetchUntrustedPage(url, {
         correlationId,
         label: "fetch_candidate",
-        timeoutMs: FETCH_TIMEOUT_MS,
       });
       if (response.ok) {
         const contentType =
@@ -1614,17 +1639,9 @@ async function processFetchDiscoveredStage(job, correlationId) {
       url,
     }, correlationId);
     try {
-      const response = await fetchWithRetry(url, {
-        method: "GET",
-        redirect: "follow",
-        headers: {
-          "User-Agent": "timer.coffee/1.0 (admin@timer.coffee)",
-        },
-      }, {
-        maxAttempts: 2,
+      const response = await fetchUntrustedPage(url, {
         correlationId,
         label: "fetch_discovered",
-        timeoutMs: FETCH_TIMEOUT_MS,
       });
       if (response.ok) {
         const contentType =
@@ -2637,14 +2654,7 @@ async function buildEvidenceBundle(urls, correlationId) {
       logInfo("Fetching evidence URL", {
         url,
       }, correlationId);
-      const response = await fetchWithRetry(url, {
-        method: "GET",
-        redirect: "follow",
-        headers: {
-          "User-Agent": "timer.coffee/1.0 (admin@timer.coffee)",
-        },
-      }, {
-        maxAttempts: 2,
+      const response = await fetchUntrustedPage(url, {
         correlationId,
         label: "website_fetch",
       });
@@ -2706,14 +2716,7 @@ async function buildEvidenceBundle(urls, correlationId) {
       logInfo("Fetching discovered address page", {
         url,
       }, correlationId);
-      const response = await fetchWithRetry(url, {
-        method: "GET",
-        redirect: "follow",
-        headers: {
-          "User-Agent": "timer.coffee/1.0 (admin@timer.coffee)",
-        },
-      }, {
-        maxAttempts: 2,
+      const response = await fetchUntrustedPage(url, {
         correlationId,
         label: "website_fetch",
       });

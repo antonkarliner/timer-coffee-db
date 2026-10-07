@@ -59,8 +59,14 @@ import {
   parseImageDimensions,
 } from "./image-dimensions.ts";
 import { ensureImageMagickReady } from "./magick-init.ts";
+import {
+  BlockedDestinationError,
+  fetchPublicWeb,
+  ResponseTooLargeError,
+} from "./public-web-fetch.ts";
 import { fetchWithTimeout } from "./fetch-with-timeout.ts";
 import {
+  BlockedSourceError,
   DbError,
   HttpSourceError,
   ImageDecodeError,
@@ -369,24 +375,7 @@ async function cancelBodyQuietly(response: Response): Promise<void> {
  *     streamed body (a missing content-length used to mean "no check";
  *     chunked responses could OOM the isolate before any check ran).
  */
-export async function fetchLogoWithGuards(url: string): Promise<FetchedLogo> {
-  let response: Response;
-  try {
-    response = await fetchWithTimeout(
-      url,
-      { headers: { Accept: ACCEPT_HEADER } },
-      LOGO_FETCH_TIMEOUT_MS,
-    );
-  } catch (error) {
-    if (
-      error instanceof Error &&
-      error.message.startsWith("Request timeout after ")
-    ) {
-      throw new SourceTimeoutError(error.message);
-    }
-    throw error; // network errors surface as TypeError — classified retryable
-  }
-
+async function validateLogoResponse(response: Response): Promise<void> {
   if (!response.ok) {
     await cancelBodyQuietly(response);
     throw new HttpSourceError(
@@ -416,6 +405,69 @@ export async function fetchLogoWithGuards(url: string): Promise<FetchedLogo> {
       );
     }
   }
+}
+
+export interface LogoFetchDeps {
+  publicFetch?: typeof fetchPublicWeb;
+  trustedFetch?: typeof fetchWithTimeout;
+  supabaseUrl?: string;
+}
+
+export async function fetchLogoWithGuards(
+  url: string,
+  deps: LogoFetchDeps = {},
+): Promise<FetchedLogo> {
+  let response: Response;
+  try {
+    let supabaseUrl = deps.supabaseUrl;
+    if (supabaseUrl === undefined) {
+      try {
+        supabaseUrl = Deno.env.get("SUPABASE_URL");
+      } catch { /* no trusted prefix */ }
+    }
+    // Only this project's public Storage objects may use the native fetch path.
+    const trustedPrefix = supabaseUrl
+      ? `${supabaseUrl.replace(/\/$/, "")}/storage/v1/object/public/`
+      : null;
+    const trustedSource = trustedPrefix && url.startsWith(trustedPrefix) &&
+      new URL(url).href.startsWith(trustedPrefix);
+    response = trustedSource
+      ? await (deps.trustedFetch ?? fetchWithTimeout)(
+        url,
+        { headers: { Accept: ACCEPT_HEADER } },
+        LOGO_FETCH_TIMEOUT_MS,
+      )
+      : (await (deps.publicFetch ?? fetchPublicWeb)(url, {
+        headers: { Accept: ACCEPT_HEADER },
+        timeoutMs: LOGO_FETCH_TIMEOUT_MS,
+        maxBytes: MAX_SOURCE_BYTES,
+        onBytesExceeded: "error",
+        onResponse: validateLogoResponse,
+      })).response;
+  } catch (error) {
+    if (error instanceof BlockedDestinationError) {
+      throw new BlockedSourceError(`Blocked logo destination: ${error.reason}`);
+    }
+    if (error instanceof ResponseTooLargeError) {
+      throw new SourceTooLargeError(
+        `Source image too large: body exceeded ${MAX_SOURCE_BYTES} byte cap while streaming (declared content-length: ${
+          error.declaredLength ?? "absent"
+        }) — replace roaster_logo_url`,
+      );
+    }
+    if (
+      error instanceof Error &&
+      error.message.startsWith("Request timeout after ")
+    ) {
+      throw new SourceTimeoutError(error.message);
+    }
+    throw error; // network errors surface as TypeError — classified retryable
+  }
+
+  await validateLogoResponse(response);
+  const contentType = response.headers.get("content-type")
+    ?.split(";")[0].trim() ?? null;
+  const declaredLength = response.headers.get("content-length");
   // content-length absent or unparseable → unknown, must measure while reading.
 
   const reader = response.body?.getReader();
@@ -426,7 +478,19 @@ export async function fetchLogoWithGuards(url: string): Promise<FetchedLogo> {
   const chunks: Uint8Array[] = [];
   let total = 0;
   for (;;) {
-    const { done, value } = await reader.read();
+    let result: ReadableStreamReadResult<Uint8Array>;
+    try {
+      result = await reader.read();
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        error.message.startsWith("Request timeout after ")
+      ) {
+        throw new SourceTimeoutError(error.message);
+      }
+      throw error;
+    }
+    const { done, value } = result;
     if (done) break;
     total += value.byteLength;
     if (total > MAX_SOURCE_BYTES) {

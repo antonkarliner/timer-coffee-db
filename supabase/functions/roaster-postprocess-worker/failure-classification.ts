@@ -14,6 +14,7 @@
 
 import { ImageFormatError } from "../_shared/image-variants.ts";
 import {
+  BlockedSourceError,
   DbError,
   EmbeddingConfigError,
   EmbeddingInputError,
@@ -35,6 +36,9 @@ export interface ClassifiedFailure {
 }
 
 export function classifyFailure(error: unknown): ClassifiedFailure {
+  if (error instanceof BlockedSourceError) {
+    return { errorClass: "blocked_destination", terminal: true };
+  }
   if (error instanceof SourceTooLargeError) {
     return { errorClass: "source_too_large", terminal: true };
   }
