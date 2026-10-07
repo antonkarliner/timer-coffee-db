@@ -16,9 +16,13 @@
 // Inserts run with the service-role key, so the tables have no insert
 // policies for anon/authenticated (migration 20261004120000). Operator
 // notifications are modelled on check-new-roaster: email via Resend from
-// roasters@timer.coffee, gated by ROASTER_EMAIL_ENABLED/ADMIN_EMAIL, and
+// roasters@timer.coffee to ADMIN_EMAIL, and
 // Telegram gated by TELEGRAM_ENABLED/bot token/chat ids. Notification
 // failures are logged and never fail the request.
+//
+// Claim emails deliberately ignore ROASTER_EMAIL_ENABLED: that switch silences
+// check-new-roaster's high-volume candidate alerts, while a claim is rare and
+// means a business is waiting (plan 078, decision D3).
 // ────────────────────────────────────────────────────────────────
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.42.5";
 import { getCorsHeaders } from "../_shared/cors.ts";
@@ -50,10 +54,9 @@ const supabase = createClient(supabaseUrl, supabaseServiceRoleKey, {
 // website can fall back to the email contact instead of erroring oddly.
 const turnstileSecret = Deno.env.get("TURNSTILE_SECRET_KEY");
 
-// Operator-notification configuration, gated like check-new-roaster.
+// Operator-notification configuration (see the header for the email gate).
 const resendApiKey = Deno.env.get("RESEND_API_KEY");
 const adminEmail = Deno.env.get("ADMIN_EMAIL");
-const emailEnabled = Deno.env.get("ROASTER_EMAIL_ENABLED") !== "false";
 const telegramBotToken = Deno.env.get("TELEGRAM_BOT_TOKEN");
 const telegramChatIds = Deno.env.get("TELEGRAM_CHAT_IDS");
 const telegramEnabled = Deno.env.get("TELEGRAM_ENABLED") !== "false";
@@ -149,7 +152,12 @@ async function sendOperatorEmail(
   profile: RoasterProfile,
   domainMatch: boolean,
 ): Promise<void> {
-  if (!emailEnabled || !resendApiKey || !adminEmail) return;
+  if (!resendApiKey || !adminEmail) {
+    console.warn(
+      "claim operator email skipped: RESEND_API_KEY or ADMIN_EMAIL unset",
+    );
+    return;
+  }
   const roasterName = profile.roaster_name ?? profile.slug;
   const html =
     `<p>A new roaster page claim request is waiting in the queue.</p><p><strong>Roaster:</strong> ${
