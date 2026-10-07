@@ -218,3 +218,50 @@ verify_jwt = false
 # verification rejects the `sb_secret_...` form, so the function validates the
 # service-role credential itself via _shared/service-role-auth.ts.
 verify_jwt = false
+
+# --- Gateway settings pinned for the security remediation (2026-10). Each value
+# matches what production ran before this change, except where noted, so that a
+# plain `supabase functions deploy <name>` cannot flip it. Every function below
+# authenticates (or deliberately refuses) requests inside its handler.
+
+# Buy Me a Coffee cannot send a Supabase JWT; the handler verifies the HMAC.
+[functions.buymeacoffee-webhook]
+verify_jwt = false
+
+# Service-only: the handler requires the service-role key (security F05).
+[functions.send-fcm-notification]
+verify_jwt = true
+
+# Admin JWT (website) or service-role key (operator scripts), checked in the
+# handler (security F06).
+[functions.add-roaster]
+verify_jwt = true
+
+[functions.add-alias]
+verify_jwt = false
+
+# Retired: always 410 with no side effects (security F07/F08).
+[functions.roaster-logo-mirror]
+verify_jwt = false
+
+[functions.generate-roaster-dominant-color]
+verify_jwt = false
+
+# The caller is resolved from the JWT inside the handler (security F12/F13).
+[functions.parse-coffee-label]
+verify_jwt = true
+
+[functions.parse-coffee-label-gemini]
+verify_jwt = false
+
+# AI recipe review / extraction resolve the caller from the JWT (security F14).
+[functions.verify-user-recipe-draft]
+verify_jwt = true
+
+[functions.parse-user-recipe-draft]
+verify_jwt = true
+
+# New (security F11): the website proxies sign-ups with the anon key, like
+# submit-roaster-feedback; Turnstile is verified inside the handler.
+[functions.subscribe-blog]
+verify_jwt = true
