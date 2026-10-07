@@ -121,24 +121,30 @@ export async function checkUserRateLimit(
  * Check rate limit for an IP address (for anonymous requests)
  * @param ipAddress The IP address to check
  * @param limit Optional custom limit override
+ * @param failClosed Throw on database errors instead of allowing the request
+ * @param rateLimitClient Injectable client for offline tests
  * @returns Rate limit result
  */
 export async function checkIpRateLimit(
   ipAddress: string,
-  limit: number = ENVIRONMENT_CONFIG.anonymousRateLimit
+  limit: number = ENVIRONMENT_CONFIG.anonymousRateLimit,
+  failClosed: boolean = false,
+  rateLimitClient = supabase
 ): Promise<RateLimitResult> {
   const now = Date.now();
   const windowStart = now - ENVIRONMENT_CONFIG.rateLimitWindowMs;
   
   try {
     // Clean old entries first
-    await supabase
+    const { error: cleanupError } = await rateLimitClient
       .from("rate_limits")
       .delete()
       .lt("timestamp", new Date(windowStart).toISOString());
     
+    if (failClosed && cleanupError) throw new Error("IP rate limit cleanup failed");
+
     // Count recent requests for this IP
-    const { data: existingRequests, error: countError } = await supabase
+    const { data: existingRequests, error: countError } = await rateLimitClient
       .from("rate_limits")
       .select("id, timestamp")
       .eq("ip_address", ipAddress)
@@ -146,6 +152,7 @@ export async function checkIpRateLimit(
       .gte("timestamp", new Date(windowStart).toISOString());
     
     if (countError) {
+      if (failClosed) throw new Error("IP rate limit count failed");
       console.error("IP rate limit check error:", countError);
       return {
         allowed: true,
@@ -174,7 +181,7 @@ export async function checkIpRateLimit(
     }
     
     // Log this request
-    await supabase
+    const { error: insertError } = await rateLimitClient
       .from("rate_limits")
       .insert({
         user_id: null,
@@ -182,6 +189,8 @@ export async function checkIpRateLimit(
         timestamp: new Date().toISOString()
       });
     
+    if (failClosed && insertError) throw new Error("IP rate limit accounting failed");
+
     return {
       allowed: true,
       remaining,
@@ -189,6 +198,7 @@ export async function checkIpRateLimit(
       limitType: 'anonymous'
     };
   } catch (error) {
+    if (failClosed) throw new Error("IP rate limit check failed");
     console.error("IP rate limiting error:", error);
     return {
       allowed: true,
