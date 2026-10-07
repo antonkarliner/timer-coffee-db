@@ -2,6 +2,9 @@ import { assertEquals } from "https://deno.land/std@0.223.0/assert/mod.ts";
 import {
   decideAfterOldUserLookup,
   decideBeforeOldUserLookup,
+  hasSourceProof,
+  isCanonicalUuid,
+  isMissingOldUserError,
 } from "./decide.ts";
 
 const signedInCaller = { id: "new-user", isAnonymous: false };
@@ -71,4 +74,49 @@ Deno.test("migrates an anonymous old user into the caller", () => {
     }),
     { kind: "migrate", oldUserId: "old-user", newUserId: "new-user" },
   );
+});
+
+Deno.test("canonical UUID validation accepts hex case and rejects other shapes", () => {
+  for (
+    const value of [
+      "aabbccdd-1122-3344-5566-aabbccddeeff",
+      "AABBCCDD-1122-3344-5566-AABBCCDDEEFF",
+    ]
+  ) assertEquals(isCanonicalUuid(value), true);
+  for (
+    const value of [
+      null,
+      12,
+      "",
+      " aabbccdd-1122-3344-5566-aabbccddeeff",
+      "aabbccdd112233445566aabbccddeeff",
+      "zzbbccdd-1122-3344-5566-aabbccddeeff",
+    ]
+  ) {
+    assertEquals(isCanonicalUuid(value), false);
+  }
+});
+
+Deno.test("source proof requires a nonempty string", () => {
+  assertEquals(hasSourceProof("token"), true);
+  for (const value of [undefined, null, "", 42, {}]) {
+    assertEquals(hasSourceProof(value), false);
+  }
+});
+
+Deno.test("only a definite missing-user error counts as missing", () => {
+  for (
+    const error of [{ status: 404 }, {
+      code: "user_not_found",
+    }, { message: "User Not Found" }]
+  ) {
+    assertEquals(isMissingOldUserError(error), true);
+  }
+  for (
+    const error of [null, "not found", { status: 400 }, { status: 500 }, {
+      message: "unavailable",
+    }]
+  ) {
+    assertEquals(isMissingOldUserError(error), false);
+  }
 });

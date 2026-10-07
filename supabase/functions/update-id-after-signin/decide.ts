@@ -55,3 +55,29 @@ export function decideAfterOldUserLookup(
   }
   return { kind: "migrate", oldUserId, newUserId: caller.id };
 }
+
+export function isCanonicalUuid(value: unknown): value is string {
+  return typeof value === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+      value,
+    );
+}
+
+export function hasSourceProof(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+// Only a definite "no such user" counts as missing. A 400 is not: treating it
+// as missing would let the ledger mark a migration completed while the source
+// Auth user still exists.
+export function isMissingOldUserError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const candidate = error as {
+    status?: number;
+    code?: string;
+    message?: string;
+  };
+  return candidate.status === 404 ||
+    candidate.code === "user_not_found" ||
+    candidate.message?.toLowerCase().includes("not found") === true;
+}
