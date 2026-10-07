@@ -57,8 +57,8 @@ declare
   payload constant jsonb := '{"event_id":"security-f03-bmc-synthetic-20261007","type":"donation.created","live_mode":false,"data":{"amount":"1","currency":"USD"}}'::jsonb;
 begin
   -- support_created is the only kind production has received since the
-  -- function's 2026-03-25 definition. (Other kinds carrying an event_id hit a
-  -- pre-existing NOT NULL failure on match_status, unrelated to this grant fix.)
+  -- function's 2026-03-25 definition. bmc_support_event_kinds.sql covers all
+  -- five kinds; until 20261007211500 the others failed on NOT NULL match_status.
   first_result := public.insert_bmc_support_event(
     'support_created', payload, repeat('b', 64), 'synthetic-test-signature'
   );
