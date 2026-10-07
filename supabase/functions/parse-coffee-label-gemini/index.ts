@@ -1,3 +1,5 @@
+import { makeLabelParseDeps } from "../_shared/label-parse-quota.ts";
+import { beginLabelParseRequest, runReservedLabelParse } from "../parse-coffee-label/request-flow.ts";
 import { serve } from "https://deno.land/std@0.223.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.42.5";
 import { getCorsHeaders } from "../_shared/cors.ts";
@@ -16,6 +18,7 @@ if (!supabaseUrl || !supabaseServiceRoleKey || !geminiProjectId || !geminiRegion
   Deno.exit(1);
 }
 const supabase = createClient(supabaseUrl, supabaseServiceRoleKey);
+const labelParseDeps = makeLabelParseDeps(supabase);
 async function getAccessToken() {
   const response = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
@@ -79,8 +82,11 @@ serve(async (req)=>{
       headers: cors
     });
   }
-  const body = await req.json();
-  const { imagesBase64, locale, userId } = body;
+  const prepared = await beginLabelParseRequest(req, labelParseDeps, 'gemini', cors);
+  if (prepared.response) return prepared.response;
+  const context = prepared.context!;
+  const { images: imagesBase64, locale } = context.input;
+  return runReservedLabelParse(context, labelParseDeps, async () => {
   // Detect the current year for more accurate roast date handling.
   const currentYear = new Date().getFullYear();
   // Updated prompt with instructions to return a single JSON object and include the current year.
@@ -104,40 +110,6 @@ serve(async (req)=>{
   }
   If no coffee labels are detected in any images, return:
   { "error": "No coffee labels detected" }`;
-  async function isProUser(userId) {
-    const { data, error } = await supabase.from('pro_users').select('user_id').eq('user_id', userId);
-    if (error) {
-      console.error('Error checking pro user status:', error);
-      return false;
-    }
-    return data.length > 0;
-  }
-  async function getMonthlyTokensUsed(userId) {
-    const startOfMonth = new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString();
-    const { data, error } = await supabase.from('parse_coffee_label_invocations').select('tokens_used').eq('user_id', userId).gte('invoked_at', startOfMonth);
-    if (error) {
-      console.error('Error getting monthly tokens used:', error);
-      return 0;
-    }
-    return data.reduce((acc, row)=>acc + row.tokens_used, 0);
-  }
-  const proUser = await isProUser(userId);
-  const tokenLimit = proUser ? 500 : 10;
-  const tokensUsedThisMonth = await getMonthlyTokensUsed(userId);
-  const tokensToUse = imagesBase64.length;
-  if (tokensUsedThisMonth + tokensToUse > tokenLimit) {
-    console.log(`Invocation limit reached for user ${userId}. Tokens used: ${tokensUsedThisMonth}, Tokens to use: ${tokensToUse}, Limit: ${tokenLimit}`);
-    return new Response(JSON.stringify({
-      error: 'Invocation limit reached',
-      message: 'Sorry, you reached your token limit for image recognition this month'
-    }), {
-      status: 200,
-      headers: {
-        ...cors,
-        'Content-Type': 'application/json'
-      }
-    });
-  }
   const processImages = async (base64Images)=>{
     const accessToken = await getAccessToken();
     const requestBody = {
@@ -161,6 +133,7 @@ serve(async (req)=>{
         responseMimeType: "application/json"
       }
     };
+    context.dispatched = true;
     const response = await fetch(`https://${geminiRegion}-aiplatform.googleapis.com/v1/projects/${geminiProjectId}/locations/${geminiRegion}/publishers/google/models/gemini-2.5-flash-lite:generateContent`, {
       method: 'POST',
       headers: {
@@ -182,36 +155,28 @@ serve(async (req)=>{
     const result = Array.isArray(parsedContent) ? parsedContent[0] : parsedContent;
     return result;
   };
-  try {
-    const parsedContent = await processImages(imagesBase64.slice(0, 2));
+    const parsedContent = await processImages(imagesBase64);
     // Replace "Unknown" with null
     Object.keys(parsedContent).forEach((key)=>{
       if (parsedContent[key] === "Unknown") {
         parsedContent[key] = null;
       }
     });
-    await supabase.from('parse_coffee_label_invocations').insert([
-      {
-        user_id: userId,
-        invoked_at: new Date().toISOString(),
-        tokens_used: tokensToUse
-      }
-    ]);
     return new Response(JSON.stringify(parsedContent), {
       headers: {
         ...cors,
         'Content-Type': 'application/json'
       }
     });
-  } catch (error) {
+  }, (error) => {
     console.error('Error:', error);
     return new Response(JSON.stringify({
-      error: error.message
+      error: error instanceof Error ? error.message : String(error)
     }), {
       headers: {
         ...cors,
         'Content-Type': 'application/json'
       }
     });
-  }
+  });
 });

@@ -1,3 +1,5 @@
+import { makeLabelParseDeps } from "../_shared/label-parse-quota.ts";
+import { beginLabelParseRequest, runReservedLabelParse } from "./request-flow.ts";
 import { serve } from "https://deno.land/std@0.223.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.42.5";
 import { getCorsHeaders } from "../_shared/cors.ts";
@@ -47,6 +49,7 @@ if (!supabaseUrl || !supabaseServiceRoleKey) {
   Deno.exit(1);
 }
 const supabase = createClient(supabaseUrl, supabaseServiceRoleKey);
+const labelParseDeps = makeLabelParseDeps(supabase);
 // --- Roaster link (plan 034 §2.2): Jev-based catalog roaster matching ---
 // Both flags default to off, in which case nothing runs and the response is
 // byte-identical to a deployment without this block. The resolved mode is
@@ -286,13 +289,19 @@ serve(async (req)=>{
       headers: cors
     });
   }
-  const body = await req.json();
-  const { imagesBase64, ocrText, locale, userId } = body;
+  const prepared = await beginLabelParseRequest(req, labelParseDeps, 'primary', cors,
+    (details) => logWarnEvent(requestId, 'invocation_limit_reached', details));
+  if (prepared.response) return prepared.response;
+  const context = prepared.context!;
+  const { images: imagesBase64, ocrText, locale, units } = context.input;
+  const userId = context.userId;
+  return runReservedLabelParse(context, labelParseDeps, async () => {
   logInfoEvent(requestId, 'request_received', {
-    imageCount: Array.isArray(imagesBase64) ? imagesBase64.length : 0,
-    ocrTextLength: typeof ocrText === 'string' ? ocrText.trim().length : 0,
+    imageCount: imagesBase64.length,
+    ocrTextLength: ocrText ? ocrText.trim().length : 0,
     locale: typeof locale === 'string' ? locale : null,
-    hasUserId: typeof userId === 'string' && userId.length > 0
+    userId,
+    units
   });
   // --- Roaster link pre-warm experiment (plan 034) ---
   // Resolve the mode now (cached 60s) and, when it is on, draw the
@@ -319,23 +328,6 @@ serve(async (req)=>{
       today: formatUtcDate(todayUtc()),
       ocrText
     });
-  async function isProUser(userId) {
-    const { data, error } = await supabase.from('pro_users').select('user_id').eq('user_id', userId);
-    if (error) {
-      logErrorEvent(requestId, 'pro_user_lookup_failed', error);
-      return false;
-    }
-    return data.length > 0;
-  }
-  async function getMonthlyTokensUsed(userId) {
-    const startOfMonth = new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString();
-    const { data, error } = await supabase.from('parse_coffee_label_invocations').select('tokens_used').eq('user_id', userId).gte('invoked_at', startOfMonth);
-    if (error) {
-      logErrorEvent(requestId, 'token_usage_lookup_failed', error);
-      return 0;
-    }
-    return data.reduce((acc, row)=>acc + row.tokens_used, 0);
-  }
   function parseModelResponse(content, provider) {
     try {
       return normalizeResult(JSON.parse(content));
@@ -368,6 +360,7 @@ serve(async (req)=>{
         text: `OCR context from mobile device: ${ocrText}`
       });
     }
+    context.dispatched = true;
     const response = await fetch(`${VERCEL_GATEWAY_BASE_URL}/chat/completions`, {
       method: 'POST',
       headers: {
@@ -445,6 +438,7 @@ serve(async (req)=>{
         text: `OCR context from mobile device: ${ocrText}`
       });
     }
+    context.dispatched = true;
     const response = await fetch(`${ZAI_BASE_URL}/chat/completions`, {
       method: 'POST',
       headers: {
@@ -524,6 +518,7 @@ serve(async (req)=>{
         text: `OCR context from mobile device: ${ocrText}`
       });
     }
+    context.dispatched = true;
     const response = await fetch('https://api.cerebras.ai/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -594,6 +589,7 @@ serve(async (req)=>{
         text: `OCR context from mobile device: ${ocrText}`
       });
     }
+    context.dispatched = true;
     const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -668,6 +664,7 @@ serve(async (req)=>{
         text: `OCR context from mobile device: ${ocrText}`
       });
     }
+    context.dispatched = true;
     const response = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -756,6 +753,7 @@ serve(async (req)=>{
         responseSchema: responseSchema.gemini
       }
     };
+    context.dispatched = true;
     const response = await fetch(`https://${geminiRegion}-aiplatform.googleapis.com/v1/projects/${geminiProjectId}/locations/${geminiRegion}/publishers/google/models/${GEMINI_DEFAULT_MODEL}:generateContent`, {
       method: 'POST',
       headers: {
@@ -782,43 +780,7 @@ serve(async (req)=>{
     const content = jsonResponse.candidates[0].content.parts[0].text;
     return parseModelResponse(content, 'Gemini');
   };
-  try {
-    const proUser = await isProUser(userId);
-    const tokenLimit = proUser ? 500 : 20;
-    const tokensUsedThisMonth = await getMonthlyTokensUsed(userId);
-    const tokensToUse = imagesBase64 ? imagesBase64.length : 1;
-    if (tokensUsedThisMonth + tokensToUse > tokenLimit) {
-      logWarnEvent(requestId, 'invocation_limit_reached', {
-        proUser,
-        tokensUsedThisMonth,
-        tokensToUse,
-        tokenLimit
-      });
-      return new Response(JSON.stringify({
-        error: 'Invocation limit reached',
-        message: 'Sorry, you reached your token limit for image recognition this month'
-      }), {
-        status: 200,
-        headers: {
-          ...cors,
-          'Content-Type': 'application/json'
-        }
-      });
-    }
-    const hasImages = imagesBase64 && imagesBase64.length > 0;
-    const hasOcrText = ocrText && ocrText.trim().length > 0;
-    if (!hasImages && !hasOcrText) {
-      return new Response(JSON.stringify({
-        error: 'No images or OCR text provided'
-      }), {
-        status: 400,
-        headers: {
-          ...cors,
-          'Content-Type': 'application/json'
-        }
-      });
-    }
-    const images = hasImages ? imagesBase64.slice(0, 2) : null;
+    const images = imagesBase64.length > 0 ? imagesBase64 : null;
     const primaryPrompt = getSystemPrompt(ocrText);
     // Ordered provider chain: Z.ai/GLM (primary) → Vercel AI Gateway → Groq →
     // OpenAI → Gemini. Each tier runs only if its credential is configured;
@@ -988,16 +950,10 @@ serve(async (req)=>{
     }
     logInfoEvent(requestId, 'parse_succeeded', {
       provider,
-      tokensToUse,
+      userId,
+      units,
       resultSummary: summarizeParsedResult(result)
     });
-    await supabase.from('parse_coffee_label_invocations').insert([
-      {
-        user_id: userId,
-        invoked_at: new Date().toISOString(),
-        tokens_used: tokensToUse
-      }
-    ]);
     // --- Roaster link (plan 034 §2.2) ---
     // Shadow mode: fire-and-forget after this response is serialized; it
     // never touches `result`, so the payload stays byte-identical. Enforce
@@ -1030,7 +986,7 @@ serve(async (req)=>{
         'Content-Type': 'application/json'
       }
     });
-  } catch (error) {
+  }, (error) => {
     logErrorEvent(requestId, 'request_failed', error);
     return new Response(JSON.stringify({
       error: getErrorMessage(error)
@@ -1040,5 +996,5 @@ serve(async (req)=>{
         'Content-Type': 'application/json'
       }
     });
-  }
+  });
 });
