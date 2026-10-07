@@ -6,8 +6,21 @@ import {
   type RecipeDraftParser,
 } from "../parse-user-recipe-draft/parser.ts";
 
-const OPENAI_DAILY_TOKEN_BUDGET = 10_000_000;
-const HOURLY_USER_REQUEST_LIMIT = 10;
+export const OPENAI_DAILY_TOKEN_BUDGET = 10_000_000;
+export const HOURLY_USER_REQUEST_LIMIT = 10;
+
+// Upper bound on OpenAI tokens one verification can bill, reserved against the
+// daily budget at admission and released to the actual usage afterwards.
+// Attempts: 2 OpenAI models (medium, big) x 2 tries x 4 stages (extraction,
+// normalization, repair, cumulative rewrite) = 16.
+// Output: 2 x 2 x (8000 + 4000 + 4000 + 4000) = 80,000.
+// Input per attempt, at a conservative 3 characters per token: system prompt
+// (~18,200 characters, measured 2026-10-07) ~7,000 + verifier text (capped by
+// the request schema below at ~54,000 characters) ~18,000 + earlier stage JSON
+// fed back in (extraction 8,000 + normalized 4,000) 12,000 = ~37,000;
+// 16 x 37,000 = 592,000. Total ~672,000, rounded up. Production's largest
+// verification so far billed 18,207 tokens.
+export const OPENAI_RESERVATION_PER_REQUEST = 700_000;
 
 type AuthenticatedUser = {
   id: string;
@@ -15,29 +28,31 @@ type AuthenticatedUser = {
 };
 
 const recipeSchema = z.object({
-  name: z.string().trim().min(1),
+  name: z.string().trim().min(1).max(200),
   brewing_method_id: z.string().trim().min(1),
   coffee_amount: z.number().positive(),
   water_amount: z.number().positive(),
   water_temp: z.number().positive().nullable().optional(),
   brew_time_seconds: z.number().int().nonnegative(),
-  grind_size: z.string().trim().min(1),
-  short_description: z.string().trim().min(1),
+  grind_size: z.string().trim().min(1).max(200),
+  short_description: z.string().trim().min(1).max(1000),
 });
 
 const stepSchema = z.object({
   order: z.number().int().positive(),
   kind: z.enum(["preparation", "brew"]),
-  description: z.string().trim().min(1),
+  description: z.string().trim().min(1).max(1000),
   duration_seconds: z.number().int().nonnegative(),
 });
 
 export const verifyUserRecipeDraftRequestSchema = z.object({
-  app_locale: z.string().trim().min(1),
-  source_language_hint: z.string().trim().min(1).nullable().optional(),
+  app_locale: z.string().trim().min(1).max(35),
+  source_language_hint: z.string().trim().min(1).max(35).nullable().optional(),
   consent_to_diagnostics: z.boolean().default(false),
   recipe: recipeSchema,
-  steps: z.array(stepSchema).min(1),
+  // Bounded so OPENAI_RESERVATION_PER_REQUEST is a true upper bound. The
+  // largest production request so far had 21 steps and 318-character steps.
+  steps: z.array(stepSchema).min(1).max(50),
 });
 
 export type VerifyUserRecipeDraftRequest = z.infer<
@@ -48,15 +63,20 @@ export type VerifyUserRecipeDraftHandlerDeps = {
   parser: RecipeDraftParser;
   getUserFromToken(token: string): Promise<AuthenticatedUser | null>;
   getBrewingMethods(): Promise<BrewingMethodOption[]>;
-  getOpenAiDailyTokensUsed(): Promise<number>;
-  getRecentInvocationCount(userId: string, sinceIso: string): Promise<number>;
-  logInvocation(data: {
-    userId: string;
+  admitInvocation(userId: string): Promise<{
+    admitted: boolean;
+    invocationId: number | null;
+    openAiAllowed: boolean;
+  }>;
+  finalizeInvocation(data: {
+    invocationId: number;
+    status: "succeeded" | "failed";
     tokensUsed: number;
     openaiTokensUsed: number;
-    providerUsed: string;
-    providerModelUsed: string;
-  }): Promise<{ id: number | null }>;
+    providerUsed: string | null;
+    providerModelUsed: string | null;
+    billingUnknown: boolean;
+  }): Promise<void>;
   logDiagnostic(data: {
     invocationId: number | null;
     userId: string;
@@ -538,23 +558,56 @@ export function createVerifyUserRecipeDraftHandler(
       });
     }
 
-    const now = deps.now?.() ?? new Date();
-    const sinceIso = new Date(now.getTime() - 60 * 60 * 1000).toISOString();
-    const recentInvocationCount = await deps.getRecentInvocationCount(
-      user.id,
-      sinceIso,
-    );
-    if (recentInvocationCount >= HOURLY_USER_REQUEST_LIMIT) {
+    let admission;
+    try {
+      admission = await deps.admitInvocation(user.id);
+      if (admission.admitted && admission.invocationId === null) {
+        throw new Error("Admission returned no invocation id.");
+      }
+    } catch {
+      return jsonResponse(deps, cors, 503, {
+        error: "Service Unavailable",
+        message: "AI recipe review is temporarily unavailable.",
+      });
+    }
+    if (!admission.admitted) {
       return jsonResponse(deps, cors, 429, {
         error: "Too Many Requests",
         message: "AI recipe review rate limit exceeded.",
       });
     }
 
+    const invocationId = admission.invocationId!;
+    let tokensUsed = 0;
+    let openaiTokensUsed = 0;
+    let billingUnknown = false;
+    let finalized = false;
+    const finalize = async (
+      status: "succeeded" | "failed",
+      result?: ParseUserRecipeDraftResponse,
+    ) => {
+      if (finalized) return;
+      finalized = true;
+      try {
+        await deps.finalizeInvocation({
+          invocationId,
+          status,
+          tokensUsed,
+          openaiTokensUsed,
+          providerUsed: result?.provider_used ?? null,
+          providerModelUsed: result?.provider_model_used ?? null,
+          billingUnknown,
+        });
+      } catch (error) {
+        console.error("Failed to finalize recipe verification:", error);
+      }
+    };
+
     let body: unknown;
     try {
       body = await req.json();
     } catch {
+      await finalize("failed");
       return jsonResponse(deps, cors, 400, {
         error: "Bad Request",
         message: "Request body must be valid JSON.",
@@ -565,6 +618,7 @@ export function createVerifyUserRecipeDraftHandler(
     try {
       parsedBody = verifyUserRecipeDraftRequestSchema.parse(body);
     } catch (error) {
+      await finalize("failed");
       if (error instanceof z.ZodError) {
         return jsonResponse(deps, cors, 400, {
           error: "Bad Request",
@@ -579,16 +633,14 @@ export function createVerifyUserRecipeDraftHandler(
     }
 
     try {
-      const [brewingMethods, openAiDailyTokens] = await Promise.all([
-        deps.getBrewingMethods(),
-        deps.getOpenAiDailyTokensUsed(),
-      ]);
+      const brewingMethods = await deps.getBrewingMethods();
 
       if (
         !brewingMethods.some((method) =>
           method.brewing_method_id === parsedBody.recipe.brewing_method_id
         )
       ) {
+        await finalize("failed");
         return jsonResponse(deps, cors, 400, {
           error: "Bad Request",
           message: "Unknown brewing_method_id '" +
@@ -596,8 +648,9 @@ export function createVerifyUserRecipeDraftHandler(
         });
       }
 
-      const disabledProviders: LlmProviderName[] =
-        openAiDailyTokens >= OPENAI_DAILY_TOKEN_BUDGET ? ["openai"] : [];
+      const disabledProviders: LlmProviderName[] = admission.openAiAllowed
+        ? []
+        : ["openai"];
 
       const result = await deps.parser.parseDraft({
         text: buildVerifierText(parsedBody),
@@ -609,6 +662,15 @@ export function createVerifyUserRecipeDraftHandler(
         requestId: crypto.randomUUID(),
         disabledProviders,
         mode: "verify",
+        onProviderUsage(usage) {
+          tokensUsed += usage.totalTokens ?? 0;
+          if (usage.provider === "openai") {
+            openaiTokensUsed += usage.totalTokens ?? 0;
+            if (usage.totalTokens === null) billingUnknown = true;
+          }
+          // Unknown non-OpenAI usage is reported by the hook, but does not
+          // retain an OpenAI reservation; billingUnknown is OpenAI-only.
+        },
       });
 
       revertLossyRewrites(parsedBody, result);
@@ -616,23 +678,18 @@ export function createVerifyUserRecipeDraftHandler(
 
       const correctedSteps = mapCorrectedSteps(parsedBody, result);
       if (!correctedSteps) {
+        await finalize("failed", result);
         return jsonResponse(deps, cors, 502, {
           error: "Provider Error",
           message: "AI correction changed the recipe step count.",
         });
       }
 
-      const invocation = await deps.logInvocation({
-        userId: user.id,
-        tokensUsed: result.tokens_used,
-        openaiTokensUsed: result.openai_tokens_used,
-        providerUsed: result.provider_used,
-        providerModelUsed: result.provider_model_used,
-      });
+      await finalize("succeeded", result);
 
       if (parsedBody.consent_to_diagnostics) {
         deps.logDiagnostic({
-          invocationId: invocation.id,
+          invocationId,
           userId: user.id,
           request: parsedBody,
           result,
@@ -651,6 +708,7 @@ export function createVerifyUserRecipeDraftHandler(
         corrected_steps: correctedSteps,
       });
     } catch (error) {
+      await finalize("failed");
       return jsonResponse(deps, cors, 502, {
         error: "Provider Error",
         message: error instanceof Error ? error.message : String(error),

@@ -173,12 +173,19 @@ function createHandlerOverrides(
 ): VerifyUserRecipeDraftHandlerDeps & {
   parseCalls: RecipeDraftParserInput[];
   diagnostics: unknown[];
+  finalizations: Parameters<
+    VerifyUserRecipeDraftHandlerDeps["finalizeInvocation"]
+  >[0][];
 } {
   const parseCalls: RecipeDraftParserInput[] = [];
   const diagnostics: unknown[] = [];
+  const finalizations: Parameters<
+    VerifyUserRecipeDraftHandlerDeps["finalizeInvocation"]
+  >[0][] = [];
   return {
     parseCalls,
     diagnostics,
+    finalizations,
     parser: options.parser ?? {
       parseDraft(input) {
         parseCalls.push(input);
@@ -202,14 +209,16 @@ function createHandlerOverrides(
         ],
       );
     },
-    getOpenAiDailyTokensUsed() {
-      return Promise.resolve(0);
+    admitInvocation() {
+      return Promise.resolve({
+        admitted: (options.recentInvocationCount ?? 0) < 10,
+        invocationId: 42,
+        openAiAllowed: true,
+      });
     },
-    getRecentInvocationCount() {
-      return Promise.resolve(options.recentInvocationCount ?? 0);
-    },
-    logInvocation() {
-      return Promise.resolve({ id: 42 });
+    finalizeInvocation(data) {
+      finalizations.push(data);
+      return Promise.resolve();
     },
     logDiagnostic(data) {
       diagnostics.push(data);
@@ -1495,5 +1504,305 @@ Deno.test("preserves step count end-to-end through the real parser for a drawdow
     correctedSteps.length,
     request.steps.length,
     "Expected corrected_steps to preserve the request's step count instead of appending a synthetic drawdown step.",
+  );
+});
+
+Deno.test("F14 concurrent admission caps parser calls at ten", async () => {
+  const deps = createHandlerOverrides();
+  let admitted = 0;
+  deps.admitInvocation = () =>
+    Promise.resolve({
+      admitted: admitted++ < 10,
+      invocationId: admitted,
+      openAiAllowed: true,
+    });
+  const handler = createVerifyUserRecipeDraftHandler(deps);
+  const responses = await Promise.all(
+    Array.from({ length: 11 }, () => handler(post(requestBody()))),
+  );
+  assertEquals(
+    responses.filter((r) => r.status === 200).length,
+    10,
+    "ten admitted",
+  );
+  assertEquals(
+    responses.filter((r) => r.status === 429).length,
+    1,
+    "one denied",
+  );
+  assertEquals(deps.parseCalls.length, 10, "ten parser calls");
+  assertEquals(deps.finalizations.length, 10, "one finalization per admission");
+});
+
+Deno.test("F14 admission errors fail closed before parser", async () => {
+  const deps = createHandlerOverrides();
+  deps.admitInvocation = () => Promise.reject(new Error("database"));
+  const response = await createVerifyUserRecipeDraftHandler(deps)(
+    post(requestBody()),
+  );
+  assertEquals(response.status, 503, "unavailable");
+  assertEquals(await json(response), {
+    error: "Service Unavailable",
+    message: "AI recipe review is temporarily unavailable.",
+  }, "body");
+  assertEquals(deps.parseCalls.length, 0, "no provider");
+  assertEquals(deps.finalizations.length, 0, "no admitted row");
+});
+
+Deno.test("F14 every validation and brewing-method exit finalizes once", async () => {
+  for (const path of ["schema", "json", "unknown", "load"] as const) {
+    const deps = createHandlerOverrides(
+      path === "unknown" ? { brewingMethods: [] } : {},
+    );
+    if (path === "load") {
+      deps.getBrewingMethods = () => Promise.reject(new Error("load"));
+    }
+    const request = path === "json"
+      ? new Request("http://localhost", {
+        method: "POST",
+        headers: { Authorization: "Bearer valid-token" },
+        body: "{",
+      })
+      : post(path === "schema" ? {} : requestBody());
+    const response = await createVerifyUserRecipeDraftHandler(deps)(request);
+    assertEquals(response.status, path === "load" ? 502 : 400, path);
+    assertEquals(deps.finalizations.length, 1, "once");
+    assertEquals(deps.finalizations[0].status, "failed", "failed");
+    assertEquals(deps.finalizations[0].tokensUsed, 0, "zero tokens");
+  }
+});
+
+Deno.test("F14 billed attempts accumulate on failure, fallback, and step mismatch", async () => {
+  for (
+    const path of [
+      "throw",
+      "success",
+      "mismatch",
+      "unknown-openai",
+      "unknown-gemini",
+      "finalize-error",
+    ] as const
+  ) {
+    const deps = createHandlerOverrides();
+    deps.admitInvocation = () =>
+      Promise.resolve({
+        admitted: true,
+        invocationId: 42,
+        openAiAllowed: false,
+      });
+    deps.parser = {
+      parseDraft(input) {
+        assertEquals(
+          input.disabledProviders,
+          ["openai"],
+          "budget disables OpenAI",
+        );
+        input.onProviderUsage?.({
+          provider: "openai",
+          model: "test",
+          stage: "extraction",
+          totalTokens: 30,
+        });
+        input.onProviderUsage?.({
+          provider: "gemini",
+          model: "test",
+          stage: "extraction",
+          totalTokens: 70,
+        });
+        if (path === "unknown-openai" || path === "unknown-gemini") {
+          input.onProviderUsage?.({
+            provider: path === "unknown-openai" ? "openai" : "gemini",
+            model: "test",
+            stage: "extraction",
+            totalTokens: null,
+          });
+        }
+        if (path === "throw") {
+          return Promise.reject(new Error("billed failure"));
+        }
+        return Promise.resolve(
+          parserResponse(path === "mismatch" ? [] : undefined),
+        );
+      },
+    };
+    if (path === "finalize-error") {
+      const finalize = deps.finalizeInvocation;
+      deps.finalizeInvocation = async (data) => {
+        await finalize(data);
+        throw new Error("database");
+      };
+    }
+    const response = await createVerifyUserRecipeDraftHandler(deps)(
+      post(requestBody()),
+    );
+    assertEquals(
+      response.status,
+      path === "throw" || path === "mismatch" ? 502 : 200,
+      path,
+    );
+    assertEquals(deps.finalizations.length, 1, "once");
+    assertEquals(deps.finalizations[0].tokensUsed, 100, "all attempts");
+    assertEquals(deps.finalizations[0].openaiTokensUsed, 30, "OpenAI only");
+    assertEquals(
+      deps.finalizations[0].billingUnknown,
+      path === "unknown-openai",
+      "unknown OpenAI only",
+    );
+    assertEquals(
+      deps.finalizations[0].status,
+      response.status === 200 ? "succeeded" : "failed",
+      "status",
+    );
+    if (response.status === 200) {
+      assertEquals(
+        (await json(response) as Record<string, unknown>).tokens_used,
+        100,
+        "compatible response",
+      );
+    }
+  }
+});
+
+for (const failure of ["length", "malformed", "schema"] as const) {
+  Deno.test(`F14 real parser ${failure} records billed failures`, async () => {
+    const deps = createHandlerOverrides();
+    deps.parser = createRecipeDraftParser({
+      openAiApiKey: "fake",
+      logger: { info() {}, warn() {}, error() {} },
+      fetchImpl: () =>
+        Promise.resolve(
+          Response.json({
+            choices: [{
+              message: { content: failure === "malformed" ? "{broken" : "{}" },
+              finish_reason: failure === "length" ? "length" : "stop",
+            }],
+            usage: { total_tokens: 25 },
+          }),
+        ),
+    });
+    const response = await createVerifyUserRecipeDraftHandler(deps)(
+      post(requestBody()),
+    );
+    assertEquals(response.status, 502, "provider failure");
+    assertEquals(deps.finalizations.length, 1, "once");
+    assertEquals(deps.finalizations[0].status, "failed", "failed");
+    assertEquals(
+      deps.finalizations[0].tokensUsed,
+      100,
+      "two attempts per OpenAI model",
+    );
+    assertEquals(
+      deps.finalizations[0].openaiTokensUsed,
+      100,
+      "all billed OpenAI tokens",
+    );
+  });
+}
+
+Deno.test("F14 real parser fallback accounts for both failed attempts and successful stages", async () => {
+  const deps = createHandlerOverrides();
+  const normalized: NormalizedDraft = {
+    detected_input_language: "fr",
+    warnings: [],
+    extracted_amounts: [],
+    recipe: {
+      brewing_method_id: "v60",
+      brewing_method_confidence: "high",
+      coffee_amount: 15,
+      water_amount: 250,
+      water_temp: 93,
+    },
+    localization: {
+      name: "V60 clair",
+      grind_size: "Moyen",
+      short_description: "Simple et clair",
+    },
+    steps: parserResponse().draft.steps,
+  };
+  const provider = (fail: boolean): RecipeDraftAiProvider => ({
+    name: "openai",
+    model: "fake",
+    invokeJson<T>(
+      input: Pick<
+        Parameters<RecipeDraftAiProvider["invokeJson"]>[0],
+        "stage" | "onUsage"
+      >,
+    ) {
+      input.onUsage?.({
+        provider: "openai",
+        model: "fake",
+        stage: input.stage,
+        totalTokens: fail ? 30 : 70,
+      });
+      if (fail) return Promise.reject(new Error("billed attempt"));
+      return Promise.resolve({
+        result: (input.stage === "extraction"
+          ? parserResponse().extraction
+          : normalized) as T,
+        tokensUsed: 70,
+      });
+    },
+  });
+  deps.parser = createRecipeDraftParser({
+    providers: [provider(true), provider(false)],
+    logger: { info() {}, warn() {}, error() {} },
+  });
+  const response = await createVerifyUserRecipeDraftHandler(deps)(
+    post(requestBody()),
+  );
+  assertEquals(response.status, 200, "fallback success");
+  assertEquals(deps.finalizations.length, 1, "once");
+  assertEquals(
+    deps.finalizations[0].tokensUsed,
+    200,
+    "60 failed + 140 successful",
+  );
+  assertEquals(
+    deps.finalizations[0].openaiTokensUsed,
+    200,
+    "all OpenAI attempts",
+  );
+  assertEquals(
+    (await json(response) as Record<string, unknown>).tokens_used,
+    140,
+    "response remains successful attempts only",
+  );
+});
+
+Deno.test("input caps keep the OpenAI reservation an upper bound", async () => {
+  const baseStep = requestBody().steps[1];
+  const tooManySteps = requestBody({
+    steps: Array.from({ length: 51 }, (_, index) => ({
+      ...baseStep,
+      order: index + 1,
+    })),
+  });
+  const longStep = requestBody({
+    steps: [{ ...baseStep, description: "x".repeat(1001) }],
+  });
+  const atTheCaps = requestBody({
+    steps: Array.from({ length: 50 }, (_, index) => ({
+      ...baseStep,
+      order: index + 1,
+      description: "x".repeat(1000),
+    })),
+  });
+  for (
+    const [body, status] of [[tooManySteps, 400], [longStep, 400]] as const
+  ) {
+    const deps = createHandlerOverrides();
+    const response = await createVerifyUserRecipeDraftHandler(deps)(post(body));
+    assertEquals(response.status, status, "rejected over the cap");
+    assertEquals(deps.finalizations.length, 1, "admitted attempt finalized");
+    assertEquals(deps.finalizations[0].status, "failed", "counts as failed");
+  }
+  const deps = createHandlerOverrides();
+  const response = await createVerifyUserRecipeDraftHandler(deps)(
+    post(atTheCaps),
+  );
+  assertEquals(
+    response.status === 400,
+    false,
+    "a request exactly at the caps is not rejected by the schema",
   );
 });

@@ -8,7 +8,12 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2.42.5";
 import { getCorsHeaders } from "../_shared/cors.ts";
 import { createSecureResponse } from "../_shared/security-headers.ts";
 import { createRecipeDraftParser } from "../parse-user-recipe-draft/parser.ts";
-import { createVerifyUserRecipeDraftHandler } from "./handler.ts";
+import {
+  createVerifyUserRecipeDraftHandler,
+  HOURLY_USER_REQUEST_LIMIT,
+  OPENAI_DAILY_TOKEN_BUDGET,
+  OPENAI_RESERVATION_PER_REQUEST,
+} from "./handler.ts";
 
 const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
 const supabaseServiceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
@@ -89,58 +94,54 @@ const handler = createVerifyUserRecipeDraftHandler({
 
     return data;
   },
-  async getOpenAiDailyTokensUsed() {
-    const today = new Date().toISOString().slice(0, 10);
-    const { data } = await supabase
-      .schema("service")
-      .from("user_recipe_verification_invocations")
-      .select("openai_tokens_used")
-      .gte("invoked_at", today);
-    return (data ?? []).reduce(
-      (sum: number, row: { openai_tokens_used: number }) =>
-        sum + (row.openai_tokens_used ?? 0),
-      0,
+  async admitInvocation(userId) {
+    const { data, error } = await supabase.schema("service").rpc(
+      "admit_recipe_verification",
+      {
+        p_user_id: userId,
+        p_hourly_limit: HOURLY_USER_REQUEST_LIMIT,
+        p_openai_daily_budget: OPENAI_DAILY_TOKEN_BUDGET,
+        p_openai_reservation: OPENAI_RESERVATION_PER_REQUEST,
+      },
     );
-  },
-  async getRecentInvocationCount(userId, sinceIso) {
-    const { count, error } = await supabase
-      .schema("service")
-      .from("user_recipe_verification_invocations")
-      .select("id", { count: "exact", head: true })
-      .eq("user_id", userId)
-      .gte("invoked_at", sinceIso);
-
-    if (error) {
+    if (error || !data?.[0]) {
       throw new Error(
-        "Failed to check recipe verification limit: " + error.message,
+        "Failed to admit recipe verification: " +
+          (error?.message ?? "missing result"),
       );
     }
-
-    return count ?? 0;
+    const row = data[0];
+    if (
+      typeof row.admitted !== "boolean" ||
+      typeof row.openai_allowed !== "boolean" ||
+      (row.admitted && !Number.isSafeInteger(row.invocation_id))
+    ) {
+      throw new Error("Invalid recipe verification admission result.");
+    }
+    return {
+      admitted: row.admitted,
+      invocationId: row.invocation_id,
+      openAiAllowed: row.openai_allowed,
+    };
   },
-  async logInvocation(
-    { userId, tokensUsed, openaiTokensUsed, providerUsed, providerModelUsed },
-  ) {
-    const { data, error } = await supabase
-      .schema("service")
-      .from("user_recipe_verification_invocations")
-      .insert({
-        user_id: userId,
-        tokens_used: tokensUsed,
-        openai_tokens_used: openaiTokensUsed,
-        provider_used: providerUsed,
-        provider_model_used: providerModelUsed,
-      })
-      .select("id")
-      .single();
-
+  async finalizeInvocation(data) {
+    const { error } = await supabase.schema("service").rpc(
+      "finalize_recipe_verification",
+      {
+        p_invocation_id: data.invocationId,
+        p_status: data.status,
+        p_tokens_used: data.tokensUsed,
+        p_openai_tokens_used: data.openaiTokensUsed,
+        p_provider_used: data.providerUsed,
+        p_provider_model_used: data.providerModelUsed,
+        p_billing_unknown: data.billingUnknown,
+      },
+    );
     if (error) {
       throw new Error(
-        "Failed to log recipe verification invocation: " + error.message,
+        "Failed to finalize recipe verification: " + error.message,
       );
     }
-
-    return { id: data?.id ?? null };
   },
   async logDiagnostic(
     { invocationId, userId, request, result, correctedSteps },

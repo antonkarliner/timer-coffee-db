@@ -552,7 +552,15 @@ type ProviderInvocationStage =
   | "repair"
   | "cumulative_rewrite";
 
+export type ProviderUsage = {
+  provider: LlmProviderName;
+  model: string;
+  stage: ProviderInvocationStage;
+  totalTokens: number | null;
+};
+
 type ProviderInvocation<T> = {
+  onUsage?: (usage: ProviderUsage) => void;
   requestId: string;
   stage: ProviderInvocationStage;
   systemPrompt: string;
@@ -633,6 +641,7 @@ export type RecipeDraftParserConfig = {
 export type RecipeDraftParserMode = "extract" | "verify";
 
 export type RecipeDraftParserInput = {
+  onProviderUsage?: (usage: ProviderUsage) => void;
   text: string;
   userId: string;
   brewingMethods: BrewingMethodOption[];
@@ -2324,6 +2333,22 @@ function createOpenAiCompatibleProvider(args: {
       let rawText = "";
       let finishReason: string | null = null;
 
+      let usageReported = false;
+      const reportUsage = (totalTokens: number | null) => {
+        if (usageReported) return;
+        usageReported = true;
+        try {
+          input.onUsage?.({
+            provider: args.name,
+            model: args.model,
+            stage: input.stage,
+            totalTokens,
+          });
+        } catch {
+          // Accounting callbacks must not alter provider behavior.
+        }
+      };
+
       try {
         const response = await args.fetchImpl(args.endpoint, {
           method: "POST",
@@ -2356,6 +2381,7 @@ function createOpenAiCompatibleProvider(args: {
         });
 
         if (!response.ok) {
+          reportUsage(null);
           const errorBody = await response.text();
           rawText = errorBody;
           throw new Error(
@@ -2366,6 +2392,7 @@ function createOpenAiCompatibleProvider(args: {
         }
 
         const data = await response.json();
+        reportUsage(data.usage?.total_tokens ?? null);
         finishReason = data.choices?.[0]?.finish_reason ?? null;
         const content = data.choices?.[0]?.message?.content;
         rawText = typeof content === "string" ? content : "";
@@ -2400,6 +2427,7 @@ function createOpenAiCompatibleProvider(args: {
           tokensUsed: data.usage?.total_tokens ?? 0,
         };
       } catch (error) {
+        reportUsage(null);
         input.onAttempt?.({
           rawText,
           finishReason,
@@ -2543,6 +2571,22 @@ function createGeminiProvider(args: {
       let rawText = "";
       let finishReason: string | null = null;
 
+      let usageReported = false;
+      const reportUsage = (totalTokens: number | null) => {
+        if (usageReported) return;
+        usageReported = true;
+        try {
+          input.onUsage?.({
+            provider: "gemini",
+            model: args.model,
+            stage: input.stage,
+            totalTokens,
+          });
+        } catch {
+          // Accounting callbacks must not alter provider behavior.
+        }
+      };
+
       try {
         const accessToken = await getAccessToken();
         const response = await args.fetchImpl(endpoint, {
@@ -2578,6 +2622,7 @@ function createGeminiProvider(args: {
         });
 
         if (!response.ok) {
+          reportUsage(null);
           const errorBody = await response.text();
           rawText = errorBody;
           throw new Error(
@@ -2588,6 +2633,7 @@ function createGeminiProvider(args: {
         }
 
         const data = await response.json();
+        reportUsage(data.usageMetadata?.totalTokenCount ?? null);
 
         // F10: Gemini's truncation signal, mirroring the OpenAI-compatible
         // finish_reason === "length" check above.
@@ -2620,6 +2666,7 @@ function createGeminiProvider(args: {
           tokensUsed: data.usageMetadata?.totalTokenCount ?? 0,
         };
       } catch (error) {
+        reportUsage(null);
         input.onAttempt?.({
           rawText,
           finishReason,
@@ -8668,6 +8715,7 @@ export function createRecipeDraftParser(
                 }),
                 schema: extractionSchema,
                 maxCompletionTokens: STAGE_MAX_COMPLETION_TOKENS.extraction,
+                onUsage: input.onProviderUsage,
                 onAttempt: createStageAttemptRecorder(
                   stageOutputs?.extraction ?? null,
                   extractionAttemptCounter,
@@ -8750,6 +8798,7 @@ export function createRecipeDraftParser(
                 }),
                 schema: normalizedDraftSchema,
                 maxCompletionTokens: STAGE_MAX_COMPLETION_TOKENS.normalization,
+                onUsage: input.onProviderUsage,
                 onAttempt: createStageAttemptRecorder(
                   stageOutputs?.normalization ?? null,
                   normalizationAttemptCounter,
@@ -8850,6 +8899,7 @@ export function createRecipeDraftParser(
                   }),
                   schema: normalizedDraftSchema,
                   maxCompletionTokens: STAGE_MAX_COMPLETION_TOKENS.repair,
+                  onUsage: input.onProviderUsage,
                   onAttempt: createStageAttemptRecorder(
                     stageOutputs?.repair ?? null,
                     repairAttemptCounter,
@@ -8973,6 +9023,7 @@ export function createRecipeDraftParser(
                 schema: cumulativeRewriteSchema,
                 maxCompletionTokens:
                   STAGE_MAX_COMPLETION_TOKENS.cumulative_rewrite,
+                onUsage: input.onProviderUsage,
                 onAttempt: createStageAttemptRecorder(
                   stageOutputs?.cumulative_rewrite ?? null,
                   cumulativeRewriteAttemptCounter,

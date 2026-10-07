@@ -91,10 +91,13 @@ const handler = createParseUserRecipeDraftHandler({
   },
   async getOpenAiDailyTokensUsed() {
     const today = new Date().toISOString().slice(0, 10);
-    const { data } = await supabase
+    const { data, error } = await supabase
       .from("parse_user_recipe_draft_invocations")
       .select("openai_tokens_used")
       .gte("invoked_at", today);
+    if (error) {
+      throw new Error("Failed to load OpenAI daily usage: " + error.message);
+    }
     return (data ?? []).reduce(
       (sum: number, row: { openai_tokens_used: number }) =>
         sum + (row.openai_tokens_used ?? 0),
