@@ -183,13 +183,10 @@ The pipeline is additive: the ledger and worker can be paused without data loss.
    ```sql
    select cron.unschedule('roaster-postprocess-dispatch');
    ```
-2. **Restore legacy behaviour** only if the enqueue path itself is broken.
-   Re-create the pre-029 triggers from
-   `supabase/migrations/20260427000000_add_roaster_logo_update_trigger.sql` and
-   the pre-029 body of `public.attach_pending_global_beans()`.
-   Be aware this reintroduces the 12-second single-insert and >600-second
-   50-row batch latency measured before plan 029, and the hardcoded production
-   URL hazard described below.
+2. **Pause the worker** as needed. The legacy `roaster-logo-mirror` and
+   `generate-roaster-dominant-color` routes are retired (410); do not restore
+   the HTTP triggers from `20260427000000` or re-point triggers at those routes.
+   Rollback means pausing the dispatcher / worker instead.
 3. **Keep queued jobs for replay.** Do not truncate
    `service.roaster_postprocess_jobs`. After correcting the fault, re-schedule
    the dispatcher and the backlog drains on its own.
@@ -202,8 +199,8 @@ The pipeline is additive: the ledger and worker can be paused without data loss.
   `supabase_functions.http_request(...)` with a **literal production URL**, so
   inserting a roaster locally POSTed to production and could overwrite a real
   roaster's mirror by id collision. The 029 enqueue triggers only write to a
-  local table, which removes the hazard. If you ever restore the legacy
-  triggers (rollback step 2), disable them locally again.
+  local table, which removes the hazard. The legacy HTTP routes are now retired;
+  do not restore those triggers.
 - **`edge_functions_api_key` is not provisioned in Vault.** The dispatcher
   therefore falls back to the legacy `Authorization: Bearer <service_role_key>`
   JWT, which the platform rejects ~1–2% of the time with

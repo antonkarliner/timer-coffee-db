@@ -1,3 +1,4 @@
+import { gateSendFcmRequest } from "./auth-gate.ts";
 import { authorizeServiceRole } from "../_shared/service-role-auth.ts";
 import { serve } from "https://deno.land/std@0.223.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.42.5";
@@ -290,6 +291,20 @@ serve(async (req)=>{
       error: "Method not allowed"
     }), {
       status: 405,
+      headers: {
+        ...cors,
+        "Content-Type": "application/json"
+      }
+    });
+  }
+  const auth = gateSendFcmRequest(req, serviceRoleKey);
+  if (!auth.authorized) {
+    completePerformanceTracking(performanceTracker, req, auth.status);
+    logApiResponse(requestId, auth.status, Date.now() - performanceTracker.startTime, undefined, correlationId);
+    return createSecureResponse(JSON.stringify({
+      error: auth.error
+    }), {
+      status: auth.status,
       headers: {
         ...cors,
         "Content-Type": "application/json"

@@ -1,3 +1,7 @@
+import {
+  authorizeAdminOrService,
+  createAdminAuthDeps,
+} from "../_shared/admin-auth.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.42.5";
 import { classifyRoasterUrl } from "../_shared/roaster-url.ts";
 import { corsHeaders } from "./_shared/cors.ts";
@@ -26,6 +30,14 @@ Deno.serve(async (req) => {
   }
   if (req.method !== "POST") {
     return json({ error: "Method not allowed" }, 405);
+  }
+
+  const auth = await authorizeAdminOrService(
+    req,
+    createAdminAuthDeps(supabase, supabaseServiceRoleKey),
+  );
+  if (!auth.ok) {
+    return json({ error: auth.error }, auth.status);
   }
 
   let body: unknown;

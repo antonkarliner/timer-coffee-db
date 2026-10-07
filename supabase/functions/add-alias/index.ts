@@ -1,3 +1,4 @@
+import { authorizeAdminOrService, createAdminAuthDeps } from '../_shared/admin-auth.ts';
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.42.5';
 import { corsHeaders } from '../_shared/cors.ts';
 const supabaseUrl = Deno.env.get('SUPABASE_URL');
@@ -18,6 +19,21 @@ Deno.serve(async (req)=>{
       error: 'Method not allowed'
     }), {
       status: 405,
+      headers: {
+        ...corsHeaders,
+        'Content-Type': 'application/json'
+      }
+    });
+  }
+  const auth = await authorizeAdminOrService(
+    req,
+    createAdminAuthDeps(supabase, supabaseServiceRoleKey),
+  );
+  if (!auth.ok) {
+    return new Response(JSON.stringify({
+      error: auth.error
+    }), {
+      status: auth.status,
       headers: {
         ...corsHeaders,
         'Content-Type': 'application/json'

@@ -1,6 +1,6 @@
 export type ServiceRoleAuthorization =
   | { authorized: true }
-  | { authorized: false; status: 401 | 403; error: string };
+  | { authorized: false; status: 401 | 403 | 500; error: string };
 
 export function authorizeServiceRole(
   authorizationHeader: string | null,
@@ -42,4 +42,28 @@ function constantTimeEqual(left: string, right: string): boolean {
       (right.charCodeAt(index) || 0);
   }
   return difference === 0;
+}
+
+export function authorizeServiceRequest(
+  req: Request,
+  serviceRoleKey: string,
+): ServiceRoleAuthorization {
+  if (!serviceRoleKey) {
+    return {
+      authorized: false,
+      status: 500,
+      error: "Service credential is not configured.",
+    };
+  }
+
+  const authorization = authorizeServiceRole(
+    req.headers.get("authorization"),
+    serviceRoleKey,
+  );
+  if (authorization.authorized) return authorization;
+  const apiKey = req.headers.get("apikey");
+  if (apiKey !== null && constantTimeEqual(apiKey, serviceRoleKey)) {
+    return { authorized: true };
+  }
+  return authorization;
 }
