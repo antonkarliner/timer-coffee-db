@@ -17,6 +17,8 @@
  *        --env-file=supabase/.env.local --no-lock scripts/jev-real-scan-eval.ts
  */
 
+import { csvRawCell, csvTextCell } from "./lib/spreadsheet-safe.ts";
+
 const JEV_KEY = Deno.env.get("TYPESAFE_API_KEY");
 const SB_URL = Deno.env.get("SUPABASE_URL");
 const SB_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
@@ -271,16 +273,15 @@ const csv = [
   "raw_roaster,bean_name,jev_choice_name,jev_p,trigram_top_name,trigram_top_sim,agree,TRUE_ROASTER_OR_NONE",
   ...rows.map((r) =>
     [
-      r.raw_roaster,
-      r.bean_name ?? "",
-      r.jev_choice_name ?? "__none__",
-      r.jev_p.toFixed(3),
-      r.trigram_top_name ?? "",
-      (r.trigram_top_sim ?? 0).toFixed(3),
-      r.agree ? "yes" : "NO",
-      "",
-    ]
-      .map((f) => `"${String(f).replace(/"/g, '""')}"`).join(",")
+      csvTextCell(r.raw_roaster),
+      csvTextCell(r.bean_name ?? ""),
+      csvTextCell(r.jev_choice_name ?? "__none__"),
+      csvRawCell(r.jev_p.toFixed(3)),
+      csvTextCell(r.trigram_top_name ?? ""),
+      csvRawCell((r.trigram_top_sim ?? 0).toFixed(3)),
+      csvRawCell(r.agree ? "yes" : "NO"),
+      csvRawCell(""),
+    ].join(",")
   ),
 ].join("\n");
 await Deno.writeTextFile(`${DIR}/jev-real-scan-to-label.csv`, csv);
