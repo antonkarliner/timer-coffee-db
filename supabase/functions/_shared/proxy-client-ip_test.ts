@@ -28,6 +28,10 @@ function request(assertedIP: string = ip, signature: string = vector) {
 
 Deno.test("fixed HMAC vector and valid round trips", async () => {
   assert(await signProxyClientIP(secret, audience, ip, now) === vector);
+  assert(
+    await signProxyClientIP(secret, "submit-roaster-feedback", ip, now) ===
+      "v1.1791400000.ac7214e207954dddd59ee75e43bfd448335b7caea66508112e43f798047814f6",
+  );
   for (const address of [ip, "2001:db8::1", "::ffff:203.0.113.7"]) {
     const signature = await signProxyClientIP(secret, audience, address, now);
     assert(

@@ -27,6 +27,10 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.42.5";
 import { getCorsHeaders } from "../_shared/cors.ts";
 import {
+  PROXY_CLIENT_IP_HEADER,
+  verifyProxyClientIP,
+} from "../_shared/proxy-client-ip.ts";
+import {
   checkIpRateLimit,
   checkUserRateLimit,
   createRateLimitResponse,
@@ -53,6 +57,7 @@ const supabase = createClient(supabaseUrl, supabaseServiceRoleKey, {
 // Web-submission anti-bot gate. Missing key degrades to a clear 503 so the
 // website can fall back to the email contact instead of erroring oddly.
 const turnstileSecret = Deno.env.get("TURNSTILE_SECRET_KEY");
+const proxySecret = Deno.env.get("WEBSITE_PROXY_SECRET");
 
 // Operator-notification configuration (see the header for the email gate).
 const resendApiKey = Deno.env.get("RESEND_API_KEY");
@@ -102,8 +107,20 @@ type TurnstileCheck =
   | { ok: true }
   | { ok: false; status: number; error: string };
 
+async function resolveClientIP(req: Request): Promise<string> {
+  const ip = await verifyProxyClientIP(
+    req,
+    proxySecret,
+    "submit-roaster-feedback",
+  );
+  if (req.headers.has(PROXY_CLIENT_IP_HEADER) && ip === null) {
+    console.warn("Ignoring unverified proxy client IP assertion.");
+  }
+  return ip ?? getClientIP(req);
+}
+
 async function verifyTurnstileToken(
-  req: Request,
+  ip: string,
   token: string,
 ): Promise<TurnstileCheck> {
   if (!turnstileSecret) {
@@ -117,7 +134,6 @@ async function verifyTurnstileToken(
     secret: turnstileSecret,
     response: token,
   });
-  const ip = getClientIP(req);
   if (ip && ip !== "unknown") form.set("remoteip", ip);
   let response: Response;
   try {
@@ -315,11 +331,12 @@ Deno.serve(async (req) => {
     ? body.turnstileToken.trim()
     : "";
   if (turnstileToken) {
-    const check = await verifyTurnstileToken(req, turnstileToken);
+    const ip = await resolveClientIP(req);
+    const check = await verifyTurnstileToken(ip, turnstileToken);
     if (!check.ok) {
       return json({ error: check.error }, check.status, cors);
     }
-    const rate = await checkIpRateLimit(getClientIP(req), FEEDBACK_RATE_LIMIT);
+    const rate = await checkIpRateLimit(ip, FEEDBACK_RATE_LIMIT);
     if (!rate.allowed) {
       return createRateLimitResponse(rate);
     }
