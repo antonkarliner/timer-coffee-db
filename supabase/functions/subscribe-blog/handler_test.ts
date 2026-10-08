@@ -253,6 +253,24 @@ Deno.test("new, pending and confirmed addresses have identical successful respon
   }
 });
 
+Deno.test("async client IP reaches rate limiting and Turnstile", async () => {
+  const resolvedIP = "203.0.113.7";
+  const seen: string[] = [];
+  const f = fixture({
+    getClientIP: () => Promise.resolve(resolvedIP),
+    checkIpRate: (ip) => {
+      seen.push(ip);
+      return Promise.resolve({ allowed: true });
+    },
+    verifyTurnstile: (_token, ip) => {
+      seen.push(ip);
+      return Promise.resolve(true);
+    },
+  });
+  await expectResponse(await f.handler(request()), 200, success.message);
+  assert(seen.length === 2 && seen.every((ip) => ip === resolvedIP));
+});
+
 Deno.test("email failure still succeeds with sanitized logs", async () => {
   const f = fixture({
     sendConfirmationEmail: () => {

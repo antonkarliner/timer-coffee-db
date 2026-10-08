@@ -2,6 +2,10 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2.42.5";
 import { getCorsHeaders } from "../_shared/cors.ts";
 import { checkIpRateLimit, getClientIP } from "../_shared/rate-limiter.ts";
 import {
+  PROXY_CLIENT_IP_HEADER,
+  verifyProxyClientIP,
+} from "../_shared/proxy-client-ip.ts";
+import {
   confirmationEmailContent,
   createSubscribeBlogHandler,
   type SubscriptionResult,
@@ -17,10 +21,17 @@ const supabase = createClient(supabaseUrl, serviceRoleKey, {
 });
 const turnstileSecret = Deno.env.get("TURNSTILE_SECRET_KEY");
 const resendApiKey = Deno.env.get("RESEND_API_KEY");
+const proxySecret = Deno.env.get("WEBSITE_PROXY_SECRET");
 
 Deno.serve(createSubscribeBlogHandler({
   getCorsHeaders,
-  getClientIP,
+  getClientIP: async (req) => {
+    const ip = await verifyProxyClientIP(req, proxySecret, "subscribe-blog");
+    if (req.headers.has(PROXY_CLIENT_IP_HEADER) && ip === null) {
+      console.warn("Ignoring unverified proxy client IP assertion.");
+    }
+    return ip ?? getClientIP(req);
+  },
   logger: console,
   siteUrl: Deno.env.get("BLOG_SITE_URL"),
   checkIpRate: (ip) => checkIpRateLimit(ip, 5, true),

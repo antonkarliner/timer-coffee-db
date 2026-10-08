@@ -12,7 +12,7 @@ export interface ConfirmationEmail {
 
 export interface SubscribeBlogDeps {
   getCorsHeaders(origin?: string): Record<string, string>;
-  getClientIP(req: Request): string;
+  getClientIP(req: Request): string | Promise<string>;
   verifyTurnstile(token: string, ip: string): Promise<boolean | "unconfigured">;
   checkIpRate(ip: string): Promise<{ allowed: boolean }>;
   requestSubscription(email: string): Promise<SubscriptionResult>;
@@ -53,7 +53,7 @@ export function createSubscribeBlogHandler(deps: SubscribeBlogDeps) {
       return json("Invalid email address provided.", 400);
     }
 
-    const ip = deps.getClientIP(req);
+    const ip = await deps.getClientIP(req);
     try {
       const rate = await deps.checkIpRate(ip);
       if (!rate.allowed) {
