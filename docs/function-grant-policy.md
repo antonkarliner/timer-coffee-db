@@ -68,6 +68,16 @@ stays. Edge functions call them with the service-role key. The remaining
 in the body. Removing `authenticated` would mean moving the website admin routes
 to the service-role key.
 
+The same reasoning covers the two `service` functions behind the website's
+roaster-candidate review page, `service.hold_roaster_candidate_cluster` and
+`service.re_enrich_roaster_candidate_cluster`. Migration `20260916200405`
+deliberately grants them to `{postgres, authenticated, service_role}`; both
+raise `42501` unless the caller is `service_role`, `is_admin()` or the
+`postgres` session. Callers: `src/pages/api/admin/roaster-candidates/actions.ts`
+(admin session) and `scripts/roaster-review/execute-*.mjs` (service key).
+Verified on production 2026-10-08. They are the advisor's 38th and 39th
+authenticated findings, beyond the 37 `public` ones in this doc.
+
 ### Signed-in — `{postgres, authenticated, service_role}`
 
 | Function | Why |
