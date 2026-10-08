@@ -11,6 +11,7 @@ import {
   OPENAI_MODELS,
   VERCEL_GATEWAY_BASE_URL,
   VERCEL_GATEWAY_DEFAULT_MODEL,
+  vertexGenerateContentUrl,
   ZAI_BASE_URL,
   ZAI_DEFAULT_MODEL,
 } from "../_shared/ai-models.ts";
@@ -754,7 +755,8 @@ serve(async (req)=>{
       }
     };
     context.dispatched = true;
-    const response = await fetch(`https://${geminiRegion}-aiplatform.googleapis.com/v1/projects/${geminiProjectId}/locations/${geminiRegion}/publishers/google/models/${GEMINI_DEFAULT_MODEL}:generateContent`, {
+    // Endpoint location comes from GEMINI_DEFAULT_LOCATION.
+    const response = await fetch(vertexGenerateContentUrl(geminiProjectId, GEMINI_DEFAULT_MODEL), {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${accessToken}`,

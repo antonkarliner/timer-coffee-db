@@ -5,6 +5,7 @@ import {
   OPENAI_MODELS,
   OPENAI_SPECIALIZED_MODELS,
   resolveOpenAiModelSettings,
+  vertexGenerateContentUrl,
 } from "./ai-models.ts";
 
 function assert(condition: boolean, message: string): void {
@@ -164,5 +165,34 @@ Deno.test("JEV_MODEL resolves the TYPESAFE_MODEL override with the reviewed defa
     JEV_MODEL,
     override || "jev-latest",
     "JEV_MODEL must track the trimmed TYPESAFE_MODEL override and default to jev-latest.",
+  );
+});
+
+Deno.test("Vertex generateContent URL uses default global location", () => {
+  assertEquals(
+    vertexGenerateContentUrl("p", "m"),
+    "https://aiplatform.googleapis.com/v1/projects/p/locations/global/publishers/google/models/m:generateContent",
+    "The URL should use the selected endpoint location.",
+  );
+});
+
+Deno.test("Vertex generateContent URL uses explicit regional location", () => {
+  assertEquals(
+    vertexGenerateContentUrl("p", "m", "europe-west9"),
+    "https://europe-west9-aiplatform.googleapis.com/v1/projects/p/locations/europe-west9/publishers/google/models/m:generateContent",
+    "The URL should use the selected endpoint location.",
+  );
+});
+
+Deno.test("Vertex generateContent URL uses the .rep. hostname for multi-regions", () => {
+  assertEquals(
+    vertexGenerateContentUrl("p", "m", "eu"),
+    "https://aiplatform.eu.rep.googleapis.com/v1/projects/p/locations/eu/publishers/google/models/m:generateContent",
+    "The EU multi-region uses Google's representative endpoint hostname.",
+  );
+  assertEquals(
+    vertexGenerateContentUrl("p", "m", "us"),
+    "https://aiplatform.us.rep.googleapis.com/v1/projects/p/locations/us/publishers/google/models/m:generateContent",
+    "The US multi-region uses Google's representative endpoint hostname.",
   );
 });

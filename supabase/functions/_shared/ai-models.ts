@@ -117,10 +117,29 @@ export const OPENAI_SPECIALIZED_MODELS = Object.freeze({
 // Google Gemini (Vertex AI) default model. GA model, shutdown 2027-05-07.
 export const GEMINI_DEFAULT_MODEL = "gemini-3.1-flash-lite";
 
-// Recipe parsing uses Vertex's global endpoint: GA gemini-3.1-flash-lite
-// returned 404 on europe-west9 on 2026-10-07. GEMINI_REGION remains in use
-// by other callers (moderation and label parsing).
+// Recipe and label parsing call GEMINI_DEFAULT_MODEL on Vertex's global
+// endpoint: GA gemini-3.1-flash-lite returned 404 on europe-west9 on
+// 2026-10-07. GEMINI_REGION still gates whether Gemini is configured and is
+// the endpoint for moderation's gemini-2.5-flash-lite.
 export const GEMINI_DEFAULT_LOCATION: string = "global";
+
+/**
+ * Builds a Vertex AI generateContent URL for the selected endpoint location.
+ * Hostnames per Google's locations doc: `global` has no prefix, the `us`/`eu`
+ * multi-regions use the `.rep.` hostname, regions use a `<region>-` prefix.
+ */
+export function vertexGenerateContentUrl(
+  projectId: string,
+  model: string,
+  location: string = GEMINI_DEFAULT_LOCATION,
+): string {
+  const host = location === "global"
+    ? "aiplatform.googleapis.com"
+    : location === "us" || location === "eu"
+    ? `aiplatform.${location}.rep.googleapis.com`
+    : `${location}-aiplatform.googleapis.com`;
+  return `https://${host}/v1/projects/${projectId}/locations/${location}/publishers/google/models/${model}:generateContent`;
+}
 
 // Cerebras default vision model — Gemma 4 31B (multimodal, OpenAI-compatible
 // chat completions API). Accepts base64 PNG/JPEG data URIs only, max 5 images
