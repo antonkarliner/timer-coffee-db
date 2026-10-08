@@ -119,6 +119,14 @@ for (const provider of ["openai", "gemini"] as const) {
       "empty",
       "success",
       "http",
+      400,
+      401,
+      403,
+      404,
+      422,
+      429,
+      408,
+      503,
       "fetch",
       "response-json",
     ] as const
@@ -144,6 +152,16 @@ for (const provider of ["openai", "gemini"] as const) {
           }
           attempts++;
           if (outcome === "fetch") return Promise.reject(new Error("network"));
+          if (typeof outcome === "number") {
+            return Promise.resolve(Response.json({
+              error: {
+                message: "You have no credits remaining.",
+                type: "insufficient_quota",
+                param: null,
+                code: "credit_balance_exhausted",
+              },
+            }, { status: outcome }));
+          }
           if (outcome === "http") {
             return Promise.resolve(new Response("error", { status: 500 }));
           }
@@ -193,7 +211,11 @@ for (const provider of ["openai", "gemini"] as const) {
       equal(
         usages.map((u) => u.totalTokens),
         Array(attempts).fill(
-          ["http", "fetch", "response-json"].includes(outcome) ? null : 37,
+          typeof outcome === "number"
+            ? outcome < 500 && outcome !== 408 ? 0 : null
+            : ["http", "fetch", "response-json"].includes(outcome)
+            ? null
+            : 37,
         ),
       );
       equal(

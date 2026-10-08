@@ -2312,6 +2312,12 @@ function normalizeExpressionLikeMath(args: {
   );
 }
 
+// Providers do not bill requests rejected with 4xx. A 408 or 5xx may have
+// been processed, so billing is unknown.
+function usageForRejectedResponse(status: number): number | null {
+  return status >= 400 && status < 500 && status !== 408 ? 0 : null;
+}
+
 function createOpenAiCompatibleProvider(args: {
   name: "groq" | "cerebras" | "openai";
   apiKey: string;
@@ -2381,7 +2387,7 @@ function createOpenAiCompatibleProvider(args: {
         });
 
         if (!response.ok) {
-          reportUsage(null);
+          reportUsage(usageForRejectedResponse(response.status));
           const errorBody = await response.text();
           rawText = errorBody;
           throw new Error(
@@ -2622,7 +2628,7 @@ function createGeminiProvider(args: {
         });
 
         if (!response.ok) {
-          reportUsage(null);
+          reportUsage(usageForRejectedResponse(response.status));
           const errorBody = await response.text();
           rawText = errorBody;
           throw new Error(

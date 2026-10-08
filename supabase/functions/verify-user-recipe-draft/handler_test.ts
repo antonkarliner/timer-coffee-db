@@ -1806,3 +1806,79 @@ Deno.test("input caps keep the OpenAI reservation an upper bound", async () => {
     "a request exactly at the caps is not rejected by the schema",
   );
 });
+
+for (const status of [429, 503]) {
+  Deno.test(`F14 real parser HTTP ${status} finalizes failed usage`, async () => {
+    let attempts = 0;
+    const deps = createHandlerOverrides({
+      parser: createRecipeDraftParser({
+        openAiApiKey: "fake",
+        logger: { info() {}, warn() {}, error() {} },
+        fetchImpl: () => {
+          attempts++;
+          return Promise.resolve(Response.json({
+            error: {
+              message: "You have no credits remaining.",
+              type: "insufficient_quota",
+              param: null,
+              code: "credit_balance_exhausted",
+            },
+          }, { status }));
+        },
+      }),
+    });
+    const response = await createVerifyUserRecipeDraftHandler(deps)(
+      post(requestBody()),
+    );
+    assertEquals(response.status, 502, "provider failure");
+    assertEquals(attempts, 4, "two attempts per OpenAI model");
+    assertEquals(deps.finalizations.length, 1, "once");
+    assertEquals(deps.finalizations[0].status, "failed", "failed");
+    assertEquals(
+      deps.finalizations[0].billingUnknown,
+      status === 503,
+      "billing",
+    );
+    assertEquals(
+      deps.finalizations[0].openaiTokensUsed,
+      0,
+      "zero known tokens",
+    );
+  });
+}
+
+for (const description of ["", undefined, " ", "x".repeat(1001)]) {
+  Deno.test(`optional short description: ${description === undefined ? "omitted" : description.length + " characters"}`, async () => {
+    const body = requestBody();
+    if (description === undefined) {
+      delete body.recipe.short_description;
+    } else {
+      body.recipe.short_description = description;
+    }
+    const deps = createHandlerOverrides();
+    const response = await createVerifyUserRecipeDraftHandler(deps)(post(body));
+    const tooLong = description !== undefined && description.length > 1000;
+    assertEquals(response.status, tooLong ? 400 : 200, "response status");
+    assertEquals(deps.parseCalls.length, tooLong ? 0 : 1, "parser calls");
+    if (!tooLong) {
+      assertEquals(
+        deps.parseCalls[0].text.includes("Short description"),
+        false,
+        "no empty description line",
+      );
+    }
+  });
+}
+
+Deno.test("a non-empty short description still reaches the verifier text", async () => {
+  const body = requestBody();
+  body.recipe.short_description = "  Simple et clair  ";
+  const deps = createHandlerOverrides();
+  const response = await createVerifyUserRecipeDraftHandler(deps)(post(body));
+  assertEquals(response.status, 200, "response status");
+  assertEquals(
+    deps.parseCalls[0].text.includes("\nShort description: Simple et clair\n"),
+    true,
+    "trimmed description line",
+  );
+});

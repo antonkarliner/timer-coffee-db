@@ -35,7 +35,7 @@ const recipeSchema = z.object({
   water_temp: z.number().positive().nullable().optional(),
   brew_time_seconds: z.number().int().nonnegative(),
   grind_size: z.string().trim().min(1).max(200),
-  short_description: z.string().trim().min(1).max(1000),
+  short_description: z.string().trim().max(1000).optional(),
 });
 
 const stepSchema = z.object({
@@ -125,6 +125,7 @@ function formatValidationError(error: z.ZodError): string {
 
 function buildVerifierText(request: VerifyUserRecipeDraftRequest): string {
   const recipe = request.recipe;
+  const shortDescription = recipe.short_description?.trim();
   const stepLines = request.steps
     .map((step) =>
       String(step.order) + ". [" + step.kind + ", " +
@@ -140,7 +141,7 @@ function buildVerifierText(request: VerifyUserRecipeDraftRequest): string {
     "Source language hint: " +
     (request.source_language_hint ?? request.app_locale),
     "Recipe name: " + recipe.name,
-    "Short description: " + recipe.short_description,
+    ...(shortDescription ? ["Short description: " + shortDescription] : []),
     "Brewing method id: " + recipe.brewing_method_id,
     "Coffee amount: " + String(recipe.coffee_amount) + " g",
     "Water amount: " + String(recipe.water_amount) + " ml",
@@ -238,8 +239,7 @@ const GENERIC_PREPARATION_PLACEHOLDERS = new Set([
 // separate a generic-preparation placeholder word from real content that
 // follows it (e.g. "الإعداد: Filter einlegen..." or "準備：フィルターを..."),
 // covering both ASCII and fullwidth/CJK punctuation.
-const GENERIC_PREPARATION_PREFIX_SEPARATOR_REGEX =
-  /^[\s:：、,，\-–—]+/;
+const GENERIC_PREPARATION_PREFIX_SEPARATOR_REGEX = /^[\s:：、,，\-–—]+/;
 
 function containsTokenIgnoringCase(text: string, token: string): boolean {
   if (!token) return false;
