@@ -50,6 +50,15 @@ begin
   perform pg_temp.assert(first_request.confirmation_token <> first_request.unsubscribe_token, 'credentials are distinct');
   perform pg_temp.assert(exists(select 1 from public.blog_subscribers where email = 'f11-c2a-pending@example.invalid' and not confirmed and confirmation_token_expires_at = now() + interval '7 days'), 'normalized pending row and expiry');
 
+  -- A repeat within 10 minutes sends nothing and keeps the first link.
+  select * into second_request from public.request_blog_subscription('f11-c2a-pending@example.invalid');
+  perform pg_temp.assert(not second_request.should_send and second_request.confirmation_token is null and second_request.unsubscribe_token is null, 'resend within 10 minutes is suppressed');
+  perform pg_temp.assert(exists(select 1 from public.blog_subscribers where email = 'f11-c2a-pending@example.invalid' and confirmation_token = first_request.confirmation_token and confirmation_token_expires_at = now() + interval '7 days'), 'suppressed resend keeps the first link');
+  update public.blog_subscribers set confirmation_token_expires_at = now() + interval '7 days' - interval '9 minutes 59 seconds' where email = 'f11-c2a-pending@example.invalid';
+  select * into second_request from public.request_blog_subscription('f11-c2a-pending@example.invalid');
+  perform pg_temp.assert(not second_request.should_send, 'resend just inside 10 minutes is suppressed');
+  update public.blog_subscribers set confirmation_token_expires_at = now() + interval '7 days' - interval '10 minutes' where email = 'f11-c2a-pending@example.invalid';
+
   select * into second_request from public.request_blog_subscription('f11-c2a-pending@example.invalid');
   perform pg_temp.assert(second_request.should_send and second_request.confirmation_token <> first_request.confirmation_token and second_request.unsubscribe_token = first_request.unsubscribe_token, 'only confirmation rotates');
   select * into result from public.confirm_subscription(first_request.confirmation_token);
