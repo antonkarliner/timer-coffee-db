@@ -50,7 +50,7 @@ do $$
 declare
   result jsonb;
   retry jsonb;
-  expected jsonb := '{"global_stats":1,"label_invocations":1,"recipes":2,"recipe_localizations":2,"recipe_steps":2,"fcm_tokens":1}'::jsonb;
+  expected jsonb := '{"global_stats":1,"label_invocations":1,"recipes":2,"recipe_localizations":2,"recipe_steps":2,"fcm_tokens":1,"bean_reviews":0,"bean_reviews_dropped_duplicates":0,"review_replies":0,"notifications":0}'::jsonb;
 begin
   result := service.migrate_anonymous_account_data('11111111-1111-4111-8111-111111111111', '22222222-2222-4222-8222-222222222222');
   perform pg_temp.assert(result = jsonb_build_object('status', 'data_migrated', 'already', false, 'moved', expected), 'RPC result and counts');
@@ -69,7 +69,7 @@ begin
   perform pg_temp.assert((select user_id = '22222222-2222-4222-8222-222222222222' and token = 'f01-synthetic-token' from service.user_fcm_tokens where id = '44444444-4444-4444-8444-444444444444'), 'FCM token moved');
   perform pg_temp.assert((select destination_user_id = '22222222-2222-4222-8222-222222222222' and status = 'data_migrated' and moved = expected and completed_at is null from service.anonymous_account_migrations where source_user_id = '11111111-1111-4111-8111-111111111111'), 'ledger claim and counts');
   retry := service.migrate_anonymous_account_data('11111111-1111-4111-8111-111111111111', '22222222-2222-4222-8222-222222222222');
-  perform pg_temp.assert(retry = jsonb_build_object('status', 'data_migrated', 'already', true, 'moved', expected), 'retry returns original counts without moving twice');
+  perform pg_temp.assert(retry = jsonb_build_object('status', 'data_migrated', 'already', true, 'moved', expected), 'resumed retry moves nothing new and keeps the stored counts');
   perform pg_temp.assert((select count(*) = 3 from public.user_recipes where vendor_id = 'usr-22222222-2222-4222-8222-222222222222'), 'retry leaves destination recipe count unchanged');
   perform pg_temp.assert((select count(*) = 1 from public.user_recipes where vendor_id = 'usr-11111111-1111-4111-8111-111111111111'), 'retry leaves collision at source');
 end
