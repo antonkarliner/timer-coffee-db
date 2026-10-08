@@ -117,6 +117,11 @@ export const OPENAI_SPECIALIZED_MODELS = Object.freeze({
 // Google Gemini (Vertex AI) default model. GA model, shutdown 2027-05-07.
 export const GEMINI_DEFAULT_MODEL = "gemini-3.1-flash-lite";
 
+// Recipe parsing uses Vertex's global endpoint: GA gemini-3.1-flash-lite
+// returned 404 on europe-west9 on 2026-10-07. GEMINI_REGION remains in use
+// by other callers (moderation and label parsing).
+export const GEMINI_DEFAULT_LOCATION: string = "global";
+
 // Cerebras default vision model — Gemma 4 31B (multimodal, OpenAI-compatible
 // chat completions API). Accepts base64 PNG/JPEG data URIs only, max 5 images
 // per request. Used as the primary coffee-label parsing model.

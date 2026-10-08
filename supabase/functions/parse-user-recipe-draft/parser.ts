@@ -1,5 +1,9 @@
 import { z } from "https://deno.land/x/zod@v3.23.8/mod.ts";
-import { GEMINI_DEFAULT_MODEL, OPENAI_MODELS } from "../_shared/ai-models.ts";
+import {
+  GEMINI_DEFAULT_LOCATION,
+  GEMINI_DEFAULT_MODEL,
+  OPENAI_MODELS,
+} from "../_shared/ai-models.ts";
 import {
   type ProvenanceFinding,
   type RenderedAmount,
@@ -2558,11 +2562,12 @@ function createGeminiProvider(args: {
     serviceAccountKeyJson: args.serviceAccountKeyJson,
     fetchImpl: args.fetchImpl,
   });
-  const isPreviewModel = args.model.includes("preview");
-  const location = isPreviewModel ? "global" : args.region;
-  const host = isPreviewModel
+  // Region is still required for configuration; endpoint location comes from
+  // GEMINI_DEFAULT_LOCATION, not the configured region.
+  const location = GEMINI_DEFAULT_LOCATION;
+  const host = location === "global"
     ? "aiplatform.googleapis.com"
-    : `${args.region}-aiplatform.googleapis.com`;
+    : `${location}-aiplatform.googleapis.com`;
   const endpoint =
     `https://${host}/v1/projects/${args.projectId}/locations/${location}/publishers/google/models/${args.model}:generateContent`;
 

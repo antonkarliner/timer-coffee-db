@@ -1,4 +1,5 @@
 import { createRecipeDraftParser, type ProviderUsage } from "./parser.ts";
+import { GEMINI_DEFAULT_MODEL } from "../_shared/ai-models.ts";
 
 function equal(actual: unknown, expected: unknown) {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
@@ -109,6 +110,38 @@ const parserInput = {
   sourceLanguageHint: "en",
   brewingMethods: [{ brewing_method_id: "v60", brewing_method: "V60" }],
 };
+
+Deno.test("Gemini generateContent uses the global endpoint despite configured region", async () => {
+  const requestUrls: string[] = [];
+  const parser = createRecipeDraftParser({
+    geminiServiceAccountKeyJson: await geminiCredentials(),
+    geminiProjectId: "fake",
+    geminiRegion: "us-central1",
+    logger: { info() {}, warn() {}, error() {} },
+    fetchImpl: (url) => {
+      if (String(url).includes("oauth2")) {
+        return Promise.resolve(
+          Response.json({ access_token: "fake", expires_in: 3600 }),
+        );
+      }
+      requestUrls.push(String(url));
+      const payload = requestUrls.length === 1
+        ? buildMinimalValidExtractionPayload()
+        : buildMinimalValidNormalizedPayload();
+      return Promise.resolve(Response.json({
+        candidates: [{
+          content: { parts: [{ text: JSON.stringify(payload) }] },
+          finishReason: "STOP",
+        }],
+        usageMetadata: { totalTokenCount: 37 },
+      }));
+    },
+  });
+  await parser.parseDraft(parserInput);
+  const expectedUrl =
+    `https://aiplatform.googleapis.com/v1/projects/fake/locations/global/publishers/google/models/${GEMINI_DEFAULT_MODEL}:generateContent`;
+  equal(requestUrls, [expectedUrl, expectedUrl]);
+});
 
 for (const provider of ["openai", "gemini"] as const) {
   for (
