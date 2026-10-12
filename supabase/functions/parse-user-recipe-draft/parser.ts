@@ -1832,6 +1832,51 @@ function nearestKeywordDistance(args: {
 // float-noise comparison (see e.g. the scalable_amounts allowlist match).
 const EXACT_AMOUNT_MATCH_TOLERANCE = 0.01;
 
+// Plan 043 Phase 1: the branch of resolveAmountPlaceholder /
+// convertNumericValuesToExpressions that decided an amount's fate. Reported
+// by explainNumericValueConversion so the corpus replay can score the
+// deterministic layer per branch. Diagnostic only — nothing branches on it.
+export type AmountConversionReason =
+  // resolveAmountPlaceholder
+  | "exact_total_coffee"
+  | "exact_total_water"
+  | "keyword_coffee"
+  | "keyword_water"
+  | "keyword_tie"
+  | "cleanest_ratio_step_role"
+  | "brew_default_water"
+  | "cleanest_ratio"
+  | "no_base_amounts"
+  // convertNumericValuesToExpressions
+  | "skipped_tiny_value"
+  | "skipped_rate"
+  | "not_in_allowlist"
+  | "skipped_inside_expression"
+  | "skipped_rate_context"
+  | "range_placeholder_mismatch"
+  | "skipped_no_base_amount"
+  | "skipped_below_floor";
+
+type ResolvedAmountPlaceholder = {
+  placeholder: DraftExpression["placeholder"] | null;
+  reason: AmountConversionReason;
+};
+
+// One amount the converter detected. Contains no step text. start/end are
+// UTF-16, end-exclusive offsets into the description passed in (single
+// amounts found after the range pass are mapped back through it). For a
+// range, value is the upper endpoint. placeholder is what the converter
+// wrote, or null when it left the amount literal; reason names why.
+export type AmountConversionExplanation = {
+  start: number;
+  end: number;
+  value: number;
+  unit: string;
+  isRange: boolean;
+  placeholder: DraftExpression["placeholder"] | null;
+  reason: AmountConversionReason;
+};
+
 function resolveAmountPlaceholder(args: {
   description: string;
   stepKind: "preparation" | "brew";
@@ -1850,7 +1895,7 @@ function resolveAmountPlaceholder(args: {
     | "drawdown"
     | "serve"
     | null;
-}): DraftExpression["placeholder"] | null {
+}): ResolvedAmountPlaceholder {
   // Defect 1 (Aug 2026 live pass): highest-priority, language-agnostic
   // signal, checked BEFORE any keyword matching. A live German step "15 g
   // Kaffee zugeben und umruehren." (coffee_amount 15, water_amount 250)
@@ -1868,11 +1913,14 @@ function resolveAmountPlaceholder(args: {
     Math.abs(args.value - args.waterAmount) < EXACT_AMOUNT_MATCH_TOLERANCE;
 
   if (matchesCoffeeExactly && !matchesWaterExactly) {
-    return "<final_coffee_amount>";
+    return {
+      placeholder: "<final_coffee_amount>",
+      reason: "exact_total_coffee",
+    };
   }
 
   if (matchesWaterExactly && !matchesCoffeeExactly) {
-    return "<final_water_amount>";
+    return { placeholder: "<final_water_amount>", reason: "exact_total_water" };
   }
 
   // English-only fallback keyword matching (see COFFEE_CONTEXT_KEYWORDS'
@@ -1893,23 +1941,23 @@ function resolveAmountPlaceholder(args: {
   });
 
   if (coffeeDistance !== null && waterDistance === null) {
-    return "<final_coffee_amount>";
+    return { placeholder: "<final_coffee_amount>", reason: "keyword_coffee" };
   }
 
   if (waterDistance !== null && coffeeDistance === null) {
-    return "<final_water_amount>";
+    return { placeholder: "<final_water_amount>", reason: "keyword_water" };
   }
 
   if (coffeeDistance !== null && waterDistance !== null) {
     if (coffeeDistance < waterDistance) {
-      return "<final_coffee_amount>";
+      return { placeholder: "<final_coffee_amount>", reason: "keyword_coffee" };
     }
     if (waterDistance < coffeeDistance) {
-      return "<final_water_amount>";
+      return { placeholder: "<final_water_amount>", reason: "keyword_water" };
     }
     // Coffee and water wording are exactly equidistant — leave the amount
     // unconverted rather than guessing.
-    return null;
+    return { placeholder: null, reason: "keyword_tie" };
   }
 
   if (args.stepKind === "brew" && args.waterAmount !== null) {
@@ -1926,21 +1974,31 @@ function resolveAmountPlaceholder(args: {
       (args.stepRole === "preparation" || args.stepRole === "stir") &&
       args.coffeeAmount !== null
     ) {
-      return getCleanestPlaceholder({
-        value: args.value,
-        coffeeAmount: args.coffeeAmount,
-        waterAmount: args.waterAmount,
-      });
+      return {
+        placeholder: getCleanestPlaceholder({
+          value: args.value,
+          coffeeAmount: args.coffeeAmount,
+          waterAmount: args.waterAmount,
+        }),
+        reason: "cleanest_ratio_step_role",
+      };
     }
 
-    return "<final_water_amount>";
+    return {
+      placeholder: "<final_water_amount>",
+      reason: "brew_default_water",
+    };
   }
 
-  return getCleanestPlaceholder({
+  const placeholder = getCleanestPlaceholder({
     value: args.value,
     coffeeAmount: args.coffeeAmount,
     waterAmount: args.waterAmount,
   });
+  return {
+    placeholder,
+    reason: placeholder === null ? "no_base_amounts" : "cleanest_ratio",
+  };
 }
 
 // F1(b): amounts under 2% of their base are not meaningfully scalable — a
@@ -2002,7 +2060,7 @@ function restoreRateExpressionsToLiterals(args: {
   );
 }
 
-function convertNumericValuesToExpressions(args: {
+type ConvertNumericValuesArgs = {
   description: string;
   stepKind: "preparation" | "brew";
   coffeeAmount: number | null;
@@ -2030,7 +2088,32 @@ function convertNumericValuesToExpressions(args: {
     | "drawdown"
     | "serve"
     | null;
-}): string {
+};
+
+function convertNumericValuesToExpressions(
+  args: ConvertNumericValuesArgs,
+): string {
+  return convertNumericValuesToExpressionsDetailed(args);
+}
+
+// Plan 043 Phase 1: reports, per detected amount, what the converter wrote
+// and which branch decided it. Runs the exact save path (the trace is the
+// only difference), so the two cannot drift.
+export function explainNumericValueConversion(
+  args: ConvertNumericValuesArgs,
+): AmountConversionExplanation[] {
+  const trace: AmountConversionExplanation[] = [];
+  convertNumericValuesToExpressionsDetailed(args, trace);
+  // The range pass runs first; report in source order.
+  return trace.sort((left, right) =>
+    left.start - right.start || left.end - right.end
+  );
+}
+
+function convertNumericValuesToExpressionsDetailed(
+  args: ConvertNumericValuesArgs,
+  trace?: AmountConversionExplanation[],
+): string {
   if (!args.description.trim().length) {
     return args.description;
   }
@@ -2057,6 +2140,16 @@ function convertNumericValuesToExpressions(args: {
     );
   };
 
+  // Text the range pass replaced, so offsets into withRanges can be mapped
+  // back to the input description. Only filled when tracing.
+  const rangeReplacements: Array<{
+    inputStart: number;
+    inputEnd: number;
+    outputStart: number;
+    outputEnd: number;
+  }> = [];
+  let rangeLengthDelta = 0;
+
   const withRanges = args.description.replace(
     NUMERIC_SCALABLE_RANGE_REGEX,
     (
@@ -2067,6 +2160,36 @@ function convertNumericValuesToExpressions(args: {
       offset,
       fullDescription,
     ) => {
+      const finish = (
+        output: string,
+        reason: AmountConversionReason,
+        placeholder: DraftExpression["placeholder"] | null = null,
+      ): string => {
+        if (trace) {
+          const inputStart = Number(offset);
+          const inputEnd = inputStart + fullMatch.length;
+          trace.push({
+            start: inputStart,
+            end: inputEnd,
+            value: Number(upperNumericValue),
+            unit: String(unit),
+            isRange: true,
+            placeholder,
+            reason,
+          });
+          if (output !== fullMatch) {
+            rangeReplacements.push({
+              inputStart,
+              inputEnd,
+              outputStart: inputStart + rangeLengthDelta,
+              outputEnd: inputStart + rangeLengthDelta + output.length,
+            });
+            rangeLengthDelta += output.length - fullMatch.length;
+          }
+        }
+        return output;
+      };
+
       const lowerValue = Number(lowerNumericValue);
       const upperValue = Number(upperNumericValue);
       if (
@@ -2075,14 +2198,14 @@ function convertNumericValuesToExpressions(args: {
         lowerValue < 0.1 ||
         upperValue < 0.1
       ) {
-        return fullMatch;
+        return finish(fullMatch, "skipped_tiny_value");
       }
 
       if (
         !isListedScalableAmount(lowerValue, String(unit)) ||
         !isListedScalableAmount(upperValue, String(unit))
       ) {
-        return fullMatch;
+        return finish(fullMatch, "not_in_allowlist");
       }
 
       if (
@@ -2091,7 +2214,7 @@ function convertNumericValuesToExpressions(args: {
           matchStart: Number(offset),
         })
       ) {
-        return fullMatch;
+        return finish(fullMatch, "skipped_inside_expression");
       }
 
       const tail = String(fullDescription).slice(
@@ -2099,10 +2222,10 @@ function convertNumericValuesToExpressions(args: {
         Number(offset) + fullMatch.length + 24,
       );
       if (RATE_CONTEXT_REGEX.test(tail)) {
-        return fullMatch;
+        return finish(fullMatch, "skipped_rate_context");
       }
 
-      const lowerPlaceholder = resolveAmountPlaceholder({
+      const lowerResolved = resolveAmountPlaceholder({
         description: String(fullDescription),
         stepKind: args.stepKind,
         matchStart: Number(offset),
@@ -2112,7 +2235,7 @@ function convertNumericValuesToExpressions(args: {
         waterAmount: args.waterAmount,
         stepRole: args.stepRole,
       });
-      const upperPlaceholder = resolveAmountPlaceholder({
+      const upperResolved = resolveAmountPlaceholder({
         description: String(fullDescription),
         stepKind: args.stepKind,
         matchStart: Number(offset),
@@ -2123,8 +2246,15 @@ function convertNumericValuesToExpressions(args: {
         stepRole: args.stepRole,
       });
 
-      if (!lowerPlaceholder || lowerPlaceholder !== upperPlaceholder) {
-        return fullMatch;
+      const lowerPlaceholder = lowerResolved.placeholder;
+      const upperPlaceholder = upperResolved.placeholder;
+
+      if (!lowerPlaceholder) {
+        return finish(fullMatch, lowerResolved.reason);
+      }
+
+      if (lowerPlaceholder !== upperPlaceholder) {
+        return finish(fullMatch, "range_placeholder_mismatch");
       }
 
       const baseAmount = lowerPlaceholder === "<final_coffee_amount>"
@@ -2132,39 +2262,82 @@ function convertNumericValuesToExpressions(args: {
         : args.waterAmount;
 
       if (baseAmount === null || baseAmount <= 0) {
-        return fullMatch;
+        return finish(fullMatch, "skipped_no_base_amount");
       }
 
       if (
         lowerValue / baseAmount < MIN_SCALABLE_AMOUNT_RATIO ||
         upperValue / baseAmount < MIN_SCALABLE_AMOUNT_RATIO
       ) {
-        return fullMatch;
+        return finish(fullMatch, "skipped_below_floor");
       }
 
       const normalizedUnit = normalizeExpressionUnit(String(unit));
-      return `(${
-        formatMultiplier(lowerValue / baseAmount)
-      } x ${lowerPlaceholder})-(${
-        formatMultiplier(upperValue / baseAmount)
-      } x ${upperPlaceholder})${normalizedUnit}`;
+      return finish(
+        `(${
+          formatMultiplier(lowerValue / baseAmount)
+        } x ${lowerPlaceholder})-(${
+          formatMultiplier(upperValue / baseAmount)
+        } x ${upperPlaceholder})${normalizedUnit}`,
+        upperResolved.reason,
+        upperPlaceholder,
+      );
     },
   );
+
+  // Maps an offset into withRanges back to the input description. An
+  // offset inside replaced range text snaps to that range's input bounds.
+  const toInputOffset = (offset: number, isEnd: boolean): number => {
+    let delta = 0;
+    for (const replacement of rangeReplacements) {
+      // An end offset equal to a replacement's start lies before it.
+      if (
+        offset < replacement.outputStart ||
+        (isEnd && offset === replacement.outputStart)
+      ) {
+        break;
+      }
+      if (offset >= replacement.outputEnd) {
+        delta += (replacement.outputEnd - replacement.outputStart) -
+          (replacement.inputEnd - replacement.inputStart);
+        continue;
+      }
+      return isEnd ? replacement.inputEnd : replacement.inputStart;
+    }
+    return offset - delta;
+  };
 
   return withRanges.replace(
     NUMERIC_SCALABLE_AMOUNT_REGEX,
     (fullMatch, numericValue, unit, offset, fullDescription) => {
+      const finish = (
+        output: string,
+        reason: AmountConversionReason,
+        placeholder: DraftExpression["placeholder"] | null = null,
+      ): string => {
+        trace?.push({
+          start: toInputOffset(Number(offset), false),
+          end: toInputOffset(Number(offset) + fullMatch.length, true),
+          value: Number(numericValue),
+          unit: String(unit),
+          isRange: false,
+          placeholder,
+          reason,
+        });
+        return output;
+      };
+
       const value = Number(numericValue);
       if (!Number.isFinite(value) || value < 0.1) {
-        return fullMatch;
+        return finish(fullMatch, "skipped_tiny_value");
       }
 
       if (matchesStructuredRateAmount(args.rateAmounts, value, String(unit))) {
-        return fullMatch;
+        return finish(fullMatch, "skipped_rate");
       }
 
       if (!isListedScalableAmount(value, String(unit))) {
-        return fullMatch;
+        return finish(fullMatch, "not_in_allowlist");
       }
 
       if (
@@ -2173,7 +2346,7 @@ function convertNumericValuesToExpressions(args: {
           matchStart: Number(offset),
         })
       ) {
-        return fullMatch;
+        return finish(fullMatch, "skipped_inside_expression");
       }
 
       const tail = String(fullDescription).slice(
@@ -2181,10 +2354,10 @@ function convertNumericValuesToExpressions(args: {
         Number(offset) + fullMatch.length + 24,
       );
       if (RATE_CONTEXT_REGEX.test(tail)) {
-        return fullMatch;
+        return finish(fullMatch, "skipped_rate_context");
       }
 
-      const placeholder = resolveAmountPlaceholder({
+      const resolved = resolveAmountPlaceholder({
         description: String(fullDescription),
         stepKind: args.stepKind,
         matchStart: Number(offset),
@@ -2195,8 +2368,10 @@ function convertNumericValuesToExpressions(args: {
         stepRole: args.stepRole,
       });
 
+      const placeholder = resolved.placeholder;
+
       if (!placeholder) {
-        return fullMatch;
+        return finish(fullMatch, resolved.reason);
       }
 
       const baseAmount = placeholder === "<final_coffee_amount>"
@@ -2204,16 +2379,20 @@ function convertNumericValuesToExpressions(args: {
         : args.waterAmount;
 
       if (baseAmount === null || baseAmount <= 0) {
-        return fullMatch;
+        return finish(fullMatch, "skipped_no_base_amount");
       }
 
       if (value / baseAmount < MIN_SCALABLE_AMOUNT_RATIO) {
-        return fullMatch;
+        return finish(fullMatch, "skipped_below_floor");
       }
 
-      return `(${formatMultiplier(value / baseAmount)} x ${placeholder})${
-        normalizeExpressionUnit(String(unit))
-      }`;
+      return finish(
+        `(${formatMultiplier(value / baseAmount)} x ${placeholder})${
+          normalizeExpressionUnit(String(unit))
+        }`,
+        resolved.reason,
+        placeholder,
+      );
     },
   );
 }
