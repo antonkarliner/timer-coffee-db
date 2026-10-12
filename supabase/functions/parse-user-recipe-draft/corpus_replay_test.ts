@@ -6,6 +6,12 @@
 //   deno test --no-lock --allow-read --allow-env \
 //     supabase/functions/parse-user-recipe-draft/corpus_replay_test.ts
 //
+// Plan 043 Phase 4 what-if: with RECIPE_CORPUS_WHATIF=1 as well, also scores
+// every candidate placeholder policy on the same labels (formatCorpusWhatIf):
+//
+//   RECIPE_CORPUS_WHATIF=1 deno test --no-lock --allow-read --allow-env \
+//     supabase/functions/parse-user-recipe-draft/corpus_replay_test.ts
+//
 // Prints METRIC aggregate lines only. Never print, log or rethrow anything
 // that could carry step text: every failure below is replaced with a fixed
 // message.
@@ -13,6 +19,7 @@
 import {
   CorpusFormatError,
   formatCorpusAccuracy,
+  formatCorpusWhatIf,
   parseCorpusLabels,
   parseCorpusRows,
   scoreCorpusLabels,
@@ -30,6 +37,7 @@ function readEnv(name: string): string | undefined {
 
 const corpusPath = readEnv("RECIPE_CORPUS_JSON");
 const labelsPath = readEnv("RECIPE_CORPUS_LABELS");
+const whatIf = readEnv("RECIPE_CORPUS_WHATIF") === "1";
 
 Deno.test({
   name: "corpus replay: deterministic converter vs plan-080 labels",
@@ -46,6 +54,13 @@ Deno.test({
           JSON.parse(Deno.readTextFileSync(labelsPath)),
         );
         lines.push(...formatCorpusAccuracy(scoreCorpusLabels(rows, labels)));
+        if (whatIf) {
+          lines.push(...formatCorpusWhatIf(rows, labels));
+        }
+      } else if (whatIf) {
+        throw new CorpusFormatError(
+          "RECIPE_CORPUS_WHATIF needs RECIPE_CORPUS_LABELS.",
+        );
       }
     } catch (error) {
       // File, JSON and conversion errors can quote private input. Never

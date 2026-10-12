@@ -9,6 +9,8 @@
 import {
   type AmountConversionExplanation,
   explainNumericValueConversion,
+  PLACEHOLDER_POLICY_IDS,
+  type PlaceholderPolicyId,
 } from "./parser.ts";
 
 export type CorpusRow = {
@@ -165,10 +167,13 @@ export function matchLabelSpan(
 
 // The fallback-path conditions, deliberately: no LLM scalable/rate lists,
 // step 0 is preparation, every later step is a brew step with no role.
+// placeholderPolicy (plan 043 Phase 4 what-if) is passed only when given,
+// so the default call is exactly the Phase 1 one.
 export function explainCorpusStep(
   row: CorpusRow,
   stepIndex: number,
   explain: Explain = explainNumericValueConversion,
+  placeholderPolicy?: PlaceholderPolicyId,
 ): AmountConversionExplanation[] {
   const isPreparation = stepIndex === 0;
   return explain({
@@ -179,33 +184,44 @@ export function explainCorpusStep(
     scalableAmounts: [],
     rateAmounts: [],
     ...(isPreparation ? { stepRole: "preparation" as const } : {}),
+    ...(placeholderPolicy === undefined ? {} : { placeholderPolicy }),
   });
 }
 
-export function scoreCorpusLabels(
+// One scored label. No step text: the matched amount's value and the row's
+// totals are numbers, the rest are enum keys.
+type ScoredLabel = {
+  label: CorpusLabelName;
+  language: string;
+  kind: "preparation" | "brew";
+  reason: string;
+  outcome: CorpusOutcome;
+  correct: boolean;
+  value: number | null;
+  coffee: number;
+  water: number;
+};
+
+// Scores each label in input order; null marks an orphan.
+function scoreEachLabel(
   rows: CorpusRow[],
   labels: CorpusLabel[],
-  explain: Explain = explainNumericValueConversion,
-): CorpusAccuracy {
-  const result: CorpusAccuracy = {
-    scopes: new Map([["overall", { labelled: 0, correct: 0 }]]),
-    confusion: new Map(),
-    orphan: 0,
-  };
+  explain: Explain,
+  placeholderPolicy?: PlaceholderPolicyId,
+): Array<ScoredLabel | null> {
   const eligible = new Map<number, CorpusRow>();
   for (const row of rows) {
     if (isEligibleCorpusRow(row)) eligible.set(row.id, row);
   }
   const explained = new Map<string, AmountConversionExplanation[]>();
 
-  for (const label of labels) {
+  return labels.map((label) => {
     const row = eligible.get(label.diagnostics_id);
     if (
       row === undefined || label.step_index < 0 ||
       label.step_index >= row.src.length
     ) {
-      result.orphan++;
-      continue;
+      return null;
     }
     if (label.char_end > row.src[label.step_index].length) {
       throw new CorpusFormatError(
@@ -216,14 +232,46 @@ export function scoreCorpusLabels(
     const cacheKey = `${row.id}:${label.step_index}`;
     let amounts = explained.get(cacheKey);
     if (amounts === undefined) {
-      amounts = explainCorpusStep(row, label.step_index, explain);
+      amounts = explainCorpusStep(
+        row,
+        label.step_index,
+        explain,
+        placeholderPolicy,
+      );
       explained.set(cacheKey, amounts);
     }
 
     const matched = matchLabelSpan(amounts, label.char_start, label.char_end);
     const outcome = amountOutcome(matched);
-    const correct = outcome === expectedOutcome(label.label);
-    const confusionKey = `${label.label}:${outcome}`;
+    return {
+      label: label.label,
+      language: corpusLanguage(row),
+      kind: label.step_index === 0 ? "preparation" : "brew",
+      reason: matched?.reason ?? "missed",
+      outcome,
+      correct: outcome === expectedOutcome(label.label),
+      value: matched?.value ?? null,
+      // Eligible rows have positive totals.
+      coffee: row.coffee!,
+      water: row.water!,
+    };
+  });
+}
+
+function aggregateScoredLabels(
+  scored: Array<ScoredLabel | null>,
+): CorpusAccuracy {
+  const result: CorpusAccuracy = {
+    scopes: new Map([["overall", { labelled: 0, correct: 0 }]]),
+    confusion: new Map(),
+    orphan: 0,
+  };
+  for (const entry of scored) {
+    if (entry === null) {
+      result.orphan++;
+      continue;
+    }
+    const confusionKey = `${entry.label}:${entry.outcome}`;
     result.confusion.set(
       confusionKey,
       (result.confusion.get(confusionKey) ?? 0) + 1,
@@ -231,18 +279,29 @@ export function scoreCorpusLabels(
     for (
       const scope of [
         "overall",
-        `lang:${corpusLanguage(row)}`,
-        `kind:${label.step_index === 0 ? "preparation" : "brew"}`,
-        `reason:${matched?.reason ?? "missed"}`,
+        `lang:${entry.language}`,
+        `kind:${entry.kind}`,
+        `reason:${entry.reason}`,
       ]
     ) {
       const counts = result.scopes.get(scope) ?? { labelled: 0, correct: 0 };
       counts.labelled++;
-      if (correct) counts.correct++;
+      if (entry.correct) counts.correct++;
       result.scopes.set(scope, counts);
     }
   }
   return result;
+}
+
+export function scoreCorpusLabels(
+  rows: CorpusRow[],
+  labels: CorpusLabel[],
+  explain: Explain = explainNumericValueConversion,
+  placeholderPolicy?: PlaceholderPolicyId,
+): CorpusAccuracy {
+  return aggregateScoredLabels(
+    scoreEachLabel(rows, labels, explain, placeholderPolicy),
+  );
 }
 
 function metricLine(
@@ -264,22 +323,137 @@ function metricLine(
 
 // Same line format as the app harness (timer-coffee
 // test/tooling/recipe_corpus_accuracy.dart), so the two can be compared.
-export function formatCorpusAccuracy(result: CorpusAccuracy): string[] {
-  const lines = [metricLine("overall", "orphan", result.orphan)];
+// scopePrefix (what-if only) is prepended to every scope, e.g.
+// "C2_prep_dose@1.05/" + "overall".
+export function formatCorpusAccuracy(
+  result: CorpusAccuracy,
+  scopePrefix = "",
+): string[] {
+  const overall = `${scopePrefix}overall`;
+  const lines = [metricLine(overall, "orphan", result.orphan)];
   for (const label of CORPUS_LABELS) {
     for (const outcome of CORPUS_OUTCOMES) {
       const key = `${label}:${outcome}`;
       lines.push(
-        metricLine("overall", "confusion", result.confusion.get(key) ?? 0, key),
+        metricLine(overall, "confusion", result.confusion.get(key) ?? 0, key),
       );
     }
   }
   for (const scope of [...result.scopes.keys()].sort()) {
     const { labelled, correct } = result.scopes.get(scope)!;
+    const prefixed = `${scopePrefix}${scope}`;
     lines.push(
-      metricLine(scope, "labelled", labelled),
-      metricLine(scope, "correct", correct),
-      metricLine(scope, "accuracy", labelled === 0 ? 0 : correct / labelled),
+      metricLine(prefixed, "labelled", labelled),
+      metricLine(prefixed, "correct", correct),
+      metricLine(prefixed, "accuracy", labelled === 0 ? 0 : correct / labelled),
+    );
+  }
+  return lines;
+}
+
+// Plan 043 Phase 4: the branches the candidates target, for the C0 feature
+// breakdown.
+const WHATIF_FEATURE_REASONS: ReadonlySet<string> = new Set([
+  "keyword_coffee",
+  "cleanest_ratio",
+  "cleanest_ratio_step_role",
+]);
+
+// value / coffee: [0, 1.05], (1.05, 2], (2, inf).
+export function valueToCoffeeBucket(ratio: number): string {
+  if (ratio <= 1.05) return "le_1.05";
+  if (ratio <= 2) return "1.05_2";
+  return "gt_2";
+}
+
+// value / water: [0, 0.1), [0.1, 0.5), [0.5, 1], (1, inf).
+export function valueToWaterBucket(ratio: number): string {
+  if (ratio < 0.1) return "lt_0.1";
+  if (ratio < 0.5) return "0.1_0.5";
+  if (ratio <= 1) return "0.5_1";
+  return "gt_1";
+}
+
+// Plan 043 Phase 4, stage A: scores every candidate placeholder policy on
+// the same labels. Per candidate, the full formatCorpusAccuracy set with
+// the candidate id as a scope prefix; for every candidate but C0, label
+// flips against C0 overall and per step kind; for C0, a feature breakdown
+// of the labels the candidates target. Counts only, never text.
+export function formatCorpusWhatIf(
+  rows: CorpusRow[],
+  labels: CorpusLabel[],
+  explain: Explain = explainNumericValueConversion,
+  policies: readonly PlaceholderPolicyId[] = PLACEHOLDER_POLICY_IDS,
+): string[] {
+  const baseline = scoreEachLabel(rows, labels, explain, "C0_current");
+  const lines: string[] = [];
+
+  for (const policy of policies) {
+    const scored = policy === "C0_current"
+      ? baseline
+      : scoreEachLabel(rows, labels, explain, policy);
+    lines.push(
+      ...formatCorpusAccuracy(aggregateScoredLabels(scored), `${policy}/`),
+    );
+    if (policy === "C0_current") continue;
+
+    const flips = new Map<
+      string,
+      { rightToWrong: number; wrongToRight: number }
+    >(
+      ["overall", "kind:preparation", "kind:brew"].map((scope) => [
+        scope,
+        { rightToWrong: 0, wrongToRight: 0 },
+      ]),
+    );
+    scored.forEach((entry, index) => {
+      const before = baseline[index];
+      if (entry === null || before === null) return;
+      if (entry.correct === before.correct) return;
+      for (const scope of ["overall", `kind:${entry.kind}`]) {
+        const counts = flips.get(scope)!;
+        if (before.correct) counts.rightToWrong++;
+        else counts.wrongToRight++;
+      }
+    });
+    for (const [scope, counts] of flips) {
+      lines.push(
+        metricLine(
+          `${policy}/${scope}`,
+          "flip",
+          counts.rightToWrong,
+          "right_to_wrong",
+        ),
+        metricLine(
+          `${policy}/${scope}`,
+          "flip",
+          counts.wrongToRight,
+          "wrong_to_right",
+        ),
+      );
+    }
+  }
+
+  const features = new Map<string, number>();
+  for (const entry of baseline) {
+    if (
+      entry === null || entry.value === null ||
+      !WHATIF_FEATURE_REASONS.has(entry.reason)
+    ) {
+      continue;
+    }
+    const key = [
+      entry.reason,
+      entry.label,
+      entry.outcome,
+      `vc:${valueToCoffeeBucket(entry.value / entry.coffee)}`,
+      `vw:${valueToWaterBucket(entry.value / entry.water)}`,
+    ].join("|");
+    features.set(key, (features.get(key) ?? 0) + 1);
+  }
+  for (const key of [...features.keys()].sort()) {
+    lines.push(
+      metricLine("C0_current/overall", "feature", features.get(key)!, key),
     );
   }
   return lines;
