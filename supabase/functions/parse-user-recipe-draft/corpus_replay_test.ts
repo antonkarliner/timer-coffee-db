@@ -6,8 +6,12 @@
 //   deno test --no-lock --allow-read --allow-env \
 //     supabase/functions/parse-user-recipe-draft/corpus_replay_test.ts
 //
+// The plain scores are the production behaviour, which since plan 043
+// Phase 4 stage C includes the default coffee-vs-water rule.
+//
 // Plan 043 Phase 4 what-if: with RECIPE_CORPUS_WHATIF=1 as well, also scores
-// every candidate placeholder policy on the same labels (formatCorpusWhatIf):
+// the WHATIF_CANDIDATES (C0_legacy, C3_both at 1.25 / 1.5 / 2.0, and the
+// default) on the same labels, flips against C0_legacy (formatCorpusWhatIf):
 //
 //   RECIPE_CORPUS_WHATIF=1 deno test --no-lock --allow-read --allow-env \
 //     supabase/functions/parse-user-recipe-draft/corpus_replay_test.ts

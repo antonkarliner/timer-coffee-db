@@ -75,12 +75,31 @@ Deno.test("explain: keyword branches and tie", () => {
 Deno.test("explain: brew default, step-role and preparation ratio", () => {
   equal(only("Add 60 g.").reason, "brew_default_water");
   const stir = only("Add 30 g.", { stepRole: "stir" });
+  // plan 043 Ph 4: 30 g is 2x the dose, so the preparation dose rule says water.
   equal([stir.placeholder, stir.reason], [
+    "<final_water_amount>",
+    "prep_dose_water",
+  ]);
+  const prep = only("Weigh 30 g.", { stepKind: "preparation" });
+  // plan 043 Ph 4: same preparation dose rule as above.
+  equal([prep.placeholder, prep.reason], [
+    "<final_water_amount>",
+    "prep_dose_water",
+  ]);
+  // The cleanest-ratio branches are still reached under C0_legacy.
+  const legacyStir = only("Add 30 g.", {
+    stepRole: "stir",
+    placeholderPolicy: "C0_legacy",
+  });
+  equal([legacyStir.placeholder, legacyStir.reason], [
     "<final_coffee_amount>",
     "cleanest_ratio_step_role",
   ]);
-  const prep = only("Weigh 30 g.", { stepKind: "preparation" });
-  equal([prep.placeholder, prep.reason], [
+  const legacyPrep = only("Weigh 30 g.", {
+    stepKind: "preparation",
+    placeholderPolicy: "C0_legacy",
+  });
+  equal([legacyPrep.placeholder, legacyPrep.reason], [
     "<final_coffee_amount>",
     "cleanest_ratio",
   ]);

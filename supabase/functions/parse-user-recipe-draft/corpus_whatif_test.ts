@@ -1,6 +1,6 @@
-// Plan 043 Phase 4, stage A: the what-if replay over candidate placeholder
-// policies. Synthetic rows only. Never copy or paraphrase corpus text into
-// this file.
+// Plan 043 Phase 4: the what-if replay over candidate placeholder policies
+// and the default rule. Synthetic rows only. Never copy or paraphrase corpus
+// text into this file.
 
 import {
   type CorpusLabel,
@@ -10,8 +10,12 @@ import {
   scoreCorpusLabels,
   valueToCoffeeBucket,
   valueToWaterBucket,
+  WHATIF_CANDIDATES,
 } from "./corpus_scoring.ts";
-import { PLACEHOLDER_POLICY_IDS } from "./parser.ts";
+import {
+  COFFEE_DOSE_BOUND_FACTOR,
+  explainNumericValueConversion,
+} from "./parser.ts";
 
 function equal(actual: unknown, expected: unknown) {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
@@ -21,7 +25,7 @@ function equal(actual: unknown, expected: unknown) {
   }
 }
 
-// Coffee 15, water 250: C1 thresholds 15 / 15.75 / 18.75, C2 at 15.75.
+// Coffee 15, water 250: C3 thresholds 18.75 (x1.25), 22.5 (x1.5), 30 (x2.0).
 const ROWS: CorpusRow[] = [
   {
     id: 1,
@@ -33,8 +37,10 @@ const ROWS: CorpusRow[] = [
       "Weigh 30 g",
       // brew, keyword says coffee
       "Add 50 g onto the coffee bed",
-      // brew, keyword says coffee, just over x1.05
+      // brew, keyword says coffee, within x1.25
       "Grind 16 g of beans",
+      // brew, keyword says coffee, between x1.25 and x1.5
+      "Grind 21 g of beans",
     ],
   },
   {
@@ -69,6 +75,7 @@ const LABELS: CorpusLabel[] = [
   label(1, 0, "30 g", "water"), // C0 wrong
   label(1, 1, "50 g", "water"), // C0 wrong
   label(1, 2, "16 g", "coffee"), // C0 right
+  label(1, 3, "21 g", "coffee"), // C0 right
   label(2, 0, "15.5 g", "coffee"), // C0 wrong
   // orphan: unknown row
   {
@@ -104,84 +111,134 @@ function flips(policy: string, scope: string): [number?, number?] {
   ];
 }
 
+// The candidate with the same factor as the default.
+function defaultEquivalentCandidate(): string {
+  const candidate = WHATIF_CANDIDATES.find((id) =>
+    id.startsWith("C3_both@") &&
+    Number(id.slice("C3_both@".length)) === COFFEE_DOSE_BOUND_FACTOR
+  );
+  if (candidate === undefined) {
+    throw new Error("no C3_both candidate at COFFEE_DOSE_BOUND_FACTOR");
+  }
+  return candidate;
+}
+
+// Metrics under one prefix, with the prefix stripped.
+function unprefixed(prefix: string, names: string[]): Metric[] {
+  return METRICS.filter((metric) =>
+    metric.scope.startsWith(`${prefix}/`) && names.includes(metric.name)
+  ).map((metric) => ({
+    ...metric,
+    scope: metric.scope.slice(prefix.length + 1),
+  }));
+}
+
+// plan 043 Ph 4: stage C replaced the stage-A candidate set (C0_current,
+// C1 x3, C2, C3@1.05) with these.
+Deno.test("what-if: candidate ids", () => {
+  equal([...WHATIF_CANDIDATES], [
+    "C0_legacy",
+    "C3_both@1.25",
+    "C3_both@1.5",
+    "C3_both@2.0",
+    "default",
+  ]);
+});
+
 Deno.test("what-if: every scope is prefixed by a candidate id", () => {
   for (const metric of METRICS) {
     const prefix = metric.scope.split("/")[0];
-    if (!(PLACEHOLDER_POLICY_IDS as readonly string[]).includes(prefix)) {
+    if (!(WHATIF_CANDIDATES as readonly string[]).includes(prefix)) {
       throw new Error(`unprefixed scope: ${metric.scope}`);
     }
   }
-  for (const policy of PLACEHOLDER_POLICY_IDS) {
-    equal(find(`${policy}/overall`, "labelled"), 4);
+  for (const policy of WHATIF_CANDIDATES) {
+    equal(find(`${policy}/overall`, "labelled"), 5);
     equal(find(`${policy}/overall`, "orphan"), 1);
   }
 });
 
 Deno.test("what-if: overall correct per candidate", () => {
   equal(
-    PLACEHOLDER_POLICY_IDS.map((policy) =>
-      find(`${policy}/overall`, "correct")
-    ),
-    [1, 2, 2, 3, 3, 3],
+    WHATIF_CANDIDATES.map((policy) => find(`${policy}/overall`, "correct")),
+    [2, 4, 5, 4, 5],
   );
-  equal(find("C1_coffee_bound@1.05/reason:coffee_bound_water", "labelled"), 3);
-  equal(find("C1_coffee_bound@1.05/reason:coffee_bound_water", "correct"), 2);
-  equal(find("C2_prep_dose@1.05/reason:prep_dose_water", "correct"), 1);
-  equal(find("C2_prep_dose@1.05/reason:prep_dose_coffee", "correct"), 1);
-  equal(find("C2_prep_dose@1.05/kind:preparation", "correct"), 2);
-  equal(find("C2_prep_dose@1.05/lang:ja", "accuracy"), 1);
-  equal(
-    find("C3_both@1.05/overall", "confusion", "coffee:water"),
-    1,
-  );
+  // x1.25 cuts the 21 g coffee amount; x1.5 keeps it.
+  equal(find("C3_both@1.25/reason:coffee_bound_water", "labelled"), 2);
+  equal(find("C3_both@1.25/reason:coffee_bound_water", "correct"), 1);
+  equal(find("C3_both@1.25/overall", "confusion", "coffee:water"), 1);
+  equal(find("C3_both@1.5/reason:coffee_bound_water", "labelled"), 1);
+  equal(find("C3_both@1.5/reason:keyword_coffee", "correct"), 2);
+  equal(find("C3_both@1.5/reason:prep_dose_water", "correct"), 1);
+  equal(find("C3_both@1.5/reason:prep_dose_coffee", "correct"), 1);
+  equal(find("C3_both@1.5/kind:preparation", "correct"), 2);
+  // x2.0 reads the 30 g preparation amount (exactly 2x) as coffee.
+  equal(find("C3_both@2.0/reason:prep_dose_coffee", "labelled"), 2);
+  equal(find("C3_both@2.0/reason:prep_dose_coffee", "correct"), 1);
+  equal(find("C3_both@2.0/overall", "confusion", "water:coffee"), 1);
+  equal(find("C0_legacy/lang:ja", "accuracy"), 0);
+  equal(find("default/lang:ja", "accuracy"), 1);
 });
 
-Deno.test("what-if: flips against C0, overall and per step kind", () => {
+Deno.test("what-if: flips against C0_legacy, overall and per step kind", () => {
   // [right_to_wrong, wrong_to_right]
-  for (const policy of ["C1_coffee_bound@1.0", "C1_coffee_bound@1.05"]) {
-    equal(flips(policy, "overall"), [1, 2]);
-    equal(flips(policy, "kind:preparation"), [0, 1]);
-    equal(flips(policy, "kind:brew"), [1, 1]);
+  equal(flips("C3_both@1.25", "overall"), [1, 3]);
+  equal(flips("C3_both@1.25", "kind:preparation"), [0, 2]);
+  equal(flips("C3_both@1.25", "kind:brew"), [1, 1]);
+  for (const policy of ["C3_both@1.5", "default"]) {
+    equal(flips(policy, "overall"), [0, 3]);
+    equal(flips(policy, "kind:preparation"), [0, 2]);
+    equal(flips(policy, "kind:brew"), [0, 1]);
   }
-  equal(flips("C1_coffee_bound@1.25", "overall"), [0, 2]);
-  equal(flips("C1_coffee_bound@1.25", "kind:brew"), [0, 1]);
-  equal(flips("C2_prep_dose@1.05", "overall"), [0, 2]);
-  equal(flips("C2_prep_dose@1.05", "kind:preparation"), [0, 2]);
-  equal(flips("C2_prep_dose@1.05", "kind:brew"), [0, 0]);
-  equal(flips("C3_both@1.05", "overall"), [1, 3]);
-  equal(flips("C3_both@1.05", "kind:preparation"), [0, 2]);
-  equal(flips("C3_both@1.05", "kind:brew"), [1, 1]);
-  // No flips are reported for C0 against itself.
+  equal(flips("C3_both@2.0", "overall"), [0, 2]);
+  equal(flips("C3_both@2.0", "kind:preparation"), [0, 1]);
+  equal(flips("C3_both@2.0", "kind:brew"), [0, 1]);
+  // No flips are reported for C0_legacy against itself.
   equal(
     METRICS.filter((metric) =>
-      metric.name === "flip" && metric.scope.startsWith("C0_current/")
+      metric.name === "flip" && metric.scope.startsWith("C0_legacy/")
     ),
     [],
   );
 });
 
-Deno.test("what-if: C0 feature breakdown by reason, label, outcome, buckets", () => {
+Deno.test("what-if: default scores equal C3_both at COFFEE_DOSE_BOUND_FACTOR", () => {
+  const names = [
+    "orphan",
+    "confusion",
+    "labelled",
+    "correct",
+    "accuracy",
+    "flip",
+  ];
+  equal(
+    unprefixed("default", names),
+    unprefixed(defaultEquivalentCandidate(), names),
+  );
+});
+
+Deno.test("what-if: C0_legacy feature breakdown by reason, label, outcome, buckets", () => {
   const features = METRICS.filter((metric) => metric.name === "feature");
   equal(
     features.map((metric) => [metric.scope, metric.key, metric.value]),
     [
       [
-        "C0_current/overall",
+        "C0_legacy/overall",
         "cleanest_ratio|coffee|water|vc:le_1.05|vw:lt_0.1",
         1,
       ],
       [
-        "C0_current/overall",
+        "C0_legacy/overall",
         "cleanest_ratio|water|coffee|vc:1.05_2|vw:0.1_0.5",
         1,
       ],
       [
-        "C0_current/overall",
+        "C0_legacy/overall",
         "keyword_coffee|coffee|coffee|vc:1.05_2|vw:lt_0.1",
-        1,
+        2,
       ],
       [
-        "C0_current/overall",
+        "C0_legacy/overall",
         "keyword_coffee|water|coffee|vc:gt_2|vw:0.1_0.5",
         1,
       ],
@@ -189,15 +246,41 @@ Deno.test("what-if: C0 feature breakdown by reason, label, outcome, buckets", ()
   );
 });
 
-Deno.test("what-if: C0 scores match the plain replay", () => {
-  const plain = formatCorpusAccuracy(scoreCorpusLabels(ROWS, LABELS));
-  const prefixed = METRICS.filter((metric) =>
-    metric.scope.startsWith("C0_current/") && metric.name !== "feature"
-  ).map((metric) => ({
-    ...metric,
-    scope: metric.scope.slice("C0_current/".length),
-  }));
-  equal(prefixed, parse(plain));
+// plan 043 Ph 4: the plain replay used to equal C0; since stage C it runs
+// the default rule, so it equals the "default" candidate, and C0_legacy
+// equals an explicit C0_legacy replay.
+Deno.test("what-if: default and C0_legacy scores match the plain replays", () => {
+  const plainNames = ["orphan", "confusion", "labelled", "correct", "accuracy"];
+  equal(
+    unprefixed("default", plainNames),
+    parse(formatCorpusAccuracy(scoreCorpusLabels(ROWS, LABELS))),
+  );
+  equal(
+    unprefixed("C0_legacy", plainNames),
+    parse(
+      formatCorpusAccuracy(
+        scoreCorpusLabels(
+          ROWS,
+          LABELS,
+          explainNumericValueConversion,
+          "C0_legacy",
+        ),
+      ),
+    ),
+  );
+});
+
+Deno.test("what-if: an explicit candidate list is honoured", () => {
+  const metrics = parse(
+    formatCorpusWhatIf(ROWS, LABELS, explainNumericValueConversion, [
+      "C0_legacy",
+      "C1_coffee_bound@1.25",
+    ]),
+  );
+  equal(
+    [...new Set(metrics.map((metric) => metric.scope.split("/")[0]))],
+    ["C0_legacy", "C1_coffee_bound@1.25"],
+  );
 });
 
 Deno.test("what-if: buckets", () => {

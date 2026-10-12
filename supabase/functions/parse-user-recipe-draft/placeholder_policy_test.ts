@@ -1,9 +1,12 @@
-// Plan 043 Phase 4, stage A: the off-by-default candidate coffee-vs-water
-// policies. Synthetic strings only. Coffee 15, water 250 unless stated, so
-// the factor thresholds are 15 (x1.0), 15.75 (x1.05) and 18.75 (x1.25).
+// Plan 043 Phase 4: the coffee-vs-water rule. Stage A added it as candidate
+// policies; since stage C the C3 shape at COFFEE_DOSE_BOUND_FACTOR is the
+// default (no policy). Synthetic strings only. Coffee 15, water 250 unless
+// stated, so the factor thresholds are 15 (x1.0), 15.75 (x1.05), 18.75
+// (x1.25), 22.5 (x1.5) and 30 (x2.0).
 
 import {
   type AmountConversionExplanation,
+  COFFEE_DOSE_BOUND_FACTOR,
   explainNumericValueConversion,
   PLACEHOLDER_POLICY_IDS,
   type PlaceholderPolicyId,
@@ -52,17 +55,35 @@ const COFFEE = "<final_coffee_amount>";
 const WATER = "<final_water_amount>";
 
 Deno.test("policy: candidate ids", () => {
+  // plan 043 Ph 4: C0_current renamed C0_legacy; C3 at 1.25/1.5/2.0 added.
   equal([...PLACEHOLDER_POLICY_IDS], [
-    "C0_current",
+    "C0_legacy",
     "C1_coffee_bound@1.0",
     "C1_coffee_bound@1.05",
     "C1_coffee_bound@1.25",
     "C2_prep_dose@1.05",
     "C3_both@1.05",
+    "C3_both@1.25",
+    "C3_both@1.5",
+    "C3_both@2.0",
   ]);
 });
 
-Deno.test("policy: C0 and no policy produce identical explanations", () => {
+// The C3 candidate whose factor is COFFEE_DOSE_BOUND_FACTOR.
+function defaultEquivalentPolicy(): PlaceholderPolicyId {
+  const policy = PLACEHOLDER_POLICY_IDS.find((id) =>
+    id.startsWith("C3_both@") &&
+    Number(id.slice("C3_both@".length)) === COFFEE_DOSE_BOUND_FACTOR
+  );
+  if (policy === undefined) {
+    throw new Error("no C3_both candidate at COFFEE_DOSE_BOUND_FACTOR");
+  }
+  return policy;
+}
+
+// plan 043 Ph 4: no policy used to equal C0; since stage C it equals C3 at
+// COFFEE_DOSE_BOUND_FACTOR (the C0 side is pinned by the tests below).
+Deno.test("policy: no policy equals C3_both at COFFEE_DOSE_BOUND_FACTOR", () => {
   const cases: Array<[string, Partial<ExplainArgs>]> = [
     ["Add 50 g onto the coffee bed", {}],
     ["Grind 16 g of beans", { stepKind: "preparation" }],
@@ -74,7 +95,10 @@ Deno.test("policy: C0 and no policy produce identical explanations", () => {
   ];
   for (const [description, overrides] of cases) {
     equal(
-      explain(description, { ...overrides, placeholderPolicy: "C0_current" }),
+      explain(description, {
+        ...overrides,
+        placeholderPolicy: defaultEquivalentPolicy(),
+      }),
       explain(description, overrides),
     );
   }
@@ -83,14 +107,18 @@ Deno.test("policy: C0 and no policy produce identical explanations", () => {
 Deno.test("policy C1: a keyword_coffee amount above the dose becomes water", () => {
   // Only a coffee word nearby, and 50 g is over three doses.
   const description = "Add 50 g onto the coffee bed";
-  equal(decide(description, undefined), [COFFEE, "keyword_coffee"]);
-  equal(decide(description, "C0_current"), [COFFEE, "keyword_coffee"]);
+  // plan 043 Ph 4: the default now applies the coffee bound (50 > 15 x 2).
+  equal(decide(description, undefined), [WATER, "coffee_bound_water"]);
+  equal(decide(description, "C0_legacy"), [COFFEE, "keyword_coffee"]);
   for (
     const policy of [
       "C1_coffee_bound@1.0",
       "C1_coffee_bound@1.05",
       "C1_coffee_bound@1.25",
       "C3_both@1.05",
+      "C3_both@1.25",
+      "C3_both@1.5",
+      "C3_both@2.0",
     ] as const
   ) {
     equal(decide(description, policy), [WATER, "coffee_bound_water"]);
@@ -121,8 +149,10 @@ Deno.test("policy C1: factor boundaries", () => {
 });
 
 Deno.test("policy C1: overturns both cleanest-ratio branches", () => {
-  // 30/15 = 2 is the cleaner ratio, so today these are coffee.
-  equal(decide("Add 30 g now", undefined, { stepRole: "stir" }), [
+  // 30/15 = 2 is the cleaner ratio, so under C0_legacy these are coffee.
+  // plan 043 Ph 4: was no policy, which now applies the dose rule; the
+  // default's own outcome is pinned in the "default:" tests below.
+  equal(decide("Add 30 g now", "C0_legacy", { stepRole: "stir" }), [
     COFFEE,
     "cleanest_ratio_step_role",
   ]);
@@ -130,7 +160,8 @@ Deno.test("policy C1: overturns both cleanest-ratio branches", () => {
     decide("Add 30 g now", "C1_coffee_bound@1.25", { stepRole: "stir" }),
     [WATER, "coffee_bound_water"],
   );
-  equal(decide("Weigh 30 g", undefined, { stepKind: "preparation" }), [
+  // plan 043 Ph 4: was no policy, as above.
+  equal(decide("Weigh 30 g", "C0_legacy", { stepKind: "preparation" }), [
     COFFEE,
     "cleanest_ratio",
   ]);
@@ -157,9 +188,13 @@ Deno.test("policy C1: needs a water base to fall back to", () => {
 
 Deno.test("policy C2: preparation dose rule, both sides of x1.05", () => {
   const prep = { stepKind: "preparation" as const };
-  // 15.5 <= 15.75: coffee. Today the cleanest ratio picks water here
-  // (15.5/250 = 0.062 reads "cleaner" than 15.5/15).
-  equal(decide("Weigh out 15.5 g", undefined, prep), [WATER, "cleanest_ratio"]);
+  // 15.5 <= 15.75: coffee. Under C0_legacy the cleanest ratio picks water
+  // here (15.5/250 = 0.062 reads "cleaner" than 15.5/15).
+  // plan 043 Ph 4: was no policy, which now applies the dose rule (coffee).
+  equal(decide("Weigh out 15.5 g", "C0_legacy", prep), [
+    WATER,
+    "cleanest_ratio",
+  ]);
   equal(decide("Weigh out 15.5 g", "C2_prep_dose@1.05", prep), [
     COFFEE,
     "prep_dose_coffee",
@@ -240,7 +275,7 @@ Deno.test("policy C3: dose rule in preparation, coffee bound elsewhere", () => {
 });
 
 Deno.test("policy: exact totals are untouched by every candidate", () => {
-  for (const policy of PLACEHOLDER_POLICY_IDS) {
+  for (const policy of [...PLACEHOLDER_POLICY_IDS, undefined]) {
     for (const stepKind of ["brew", "preparation"] as const) {
       equal(decide("Add 15 g and stir", policy, { stepKind }), [
         COFFEE,

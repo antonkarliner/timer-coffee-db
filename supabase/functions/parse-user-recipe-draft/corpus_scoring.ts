@@ -9,7 +9,6 @@
 import {
   type AmountConversionExplanation,
   explainNumericValueConversion,
-  PLACEHOLDER_POLICY_IDS,
   type PlaceholderPolicyId,
 } from "./parser.ts";
 
@@ -168,7 +167,9 @@ export function matchLabelSpan(
 // The fallback-path conditions, deliberately: no LLM scalable/rate lists,
 // step 0 is preparation, every later step is a brew step with no role.
 // placeholderPolicy (plan 043 Phase 4 what-if) is passed only when given,
-// so the default call is exactly the Phase 1 one.
+// so the default call is exactly the production one (since Phase 4 stage C
+// that includes the default coffee-vs-water rule; C0_legacy is the Phase 1
+// behaviour).
 export function explainCorpusStep(
   row: CorpusRow,
   stepIndex: number,
@@ -324,7 +325,7 @@ function metricLine(
 // Same line format as the app harness (timer-coffee
 // test/tooling/recipe_corpus_accuracy.dart), so the two can be compared.
 // scopePrefix (what-if only) is prepended to every scope, e.g.
-// "C2_prep_dose@1.05/" + "overall".
+// "C3_both@1.5/" + "overall".
 export function formatCorpusAccuracy(
   result: CorpusAccuracy,
   scopePrefix = "",
@@ -351,8 +352,8 @@ export function formatCorpusAccuracy(
   return lines;
 }
 
-// Plan 043 Phase 4: the branches the candidates target, for the C0 feature
-// breakdown.
+// Plan 043 Phase 4: the branches the rule targets, for the C0_legacy
+// feature breakdown.
 const WHATIF_FEATURE_REASONS: ReadonlySet<string> = new Set([
   "keyword_coffee",
   "cleanest_ratio",
@@ -374,28 +375,43 @@ export function valueToWaterBucket(ratio: number): string {
   return "gt_1";
 }
 
-// Plan 043 Phase 4, stage A: scores every candidate placeholder policy on
-// the same labels. Per candidate, the full formatCorpusAccuracy set with
-// the candidate id as a scope prefix; for every candidate but C0, label
-// flips against C0 overall and per step kind; for C0, a feature breakdown
-// of the labels the candidates target. Counts only, never text.
+// Plan 043 Phase 4, stage C: the candidates the what-if scores by default.
+// "default" passes no placeholderPolicy, i.e. the production rule at
+// COFFEE_DOSE_BOUND_FACTOR; every other id is a parser placeholderPolicy.
+export const WHATIF_CANDIDATES = [
+  "C0_legacy",
+  "C3_both@1.25",
+  "C3_both@1.5",
+  "C3_both@2.0",
+  "default",
+] as const satisfies readonly (PlaceholderPolicyId | "default")[];
+export type WhatIfCandidate = PlaceholderPolicyId | "default";
+
+// Plan 043 Phase 4: scores every candidate on the same labels. Per
+// candidate, the full formatCorpusAccuracy set with the candidate id as a
+// scope prefix; for every candidate but C0_legacy, label flips against
+// C0_legacy overall and per step kind; for C0_legacy, a feature breakdown of
+// the labels the rule targets. Counts only, never text.
 export function formatCorpusWhatIf(
   rows: CorpusRow[],
   labels: CorpusLabel[],
   explain: Explain = explainNumericValueConversion,
-  policies: readonly PlaceholderPolicyId[] = PLACEHOLDER_POLICY_IDS,
+  candidates: readonly WhatIfCandidate[] = WHATIF_CANDIDATES,
 ): string[] {
-  const baseline = scoreEachLabel(rows, labels, explain, "C0_current");
+  const baseline = scoreEachLabel(rows, labels, explain, "C0_legacy");
   const lines: string[] = [];
 
-  for (const policy of policies) {
-    const scored = policy === "C0_current"
-      ? baseline
-      : scoreEachLabel(rows, labels, explain, policy);
+  for (const policy of candidates) {
+    const scored = policy === "C0_legacy" ? baseline : scoreEachLabel(
+      rows,
+      labels,
+      explain,
+      policy === "default" ? undefined : policy,
+    );
     lines.push(
       ...formatCorpusAccuracy(aggregateScoredLabels(scored), `${policy}/`),
     );
-    if (policy === "C0_current") continue;
+    if (policy === "C0_legacy") continue;
 
     const flips = new Map<
       string,
@@ -453,7 +469,7 @@ export function formatCorpusWhatIf(
   }
   for (const key of [...features.keys()].sort()) {
     lines.push(
-      metricLine("C0_current/overall", "feature", features.get(key)!, key),
+      metricLine("C0_legacy/overall", "feature", features.get(key)!, key),
     );
   }
   return lines;

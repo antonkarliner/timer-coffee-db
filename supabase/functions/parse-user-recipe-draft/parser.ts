@@ -1847,8 +1847,8 @@ export type AmountConversionReason =
   | "brew_default_water"
   | "cleanest_ratio"
   | "no_base_amounts"
-  // Plan 043 Phase 4 candidate policies (placeholderPolicy); never produced
-  // when no policy is passed
+  // Plan 043 Phase 4 coffee-vs-water rule (COFFEE_DOSE_BOUND_FACTOR); the
+  // default since stage C, never produced under placeholderPolicy C0_legacy
   | "coffee_bound_water"
   | "prep_dose_coffee"
   | "prep_dose_water"
@@ -1882,24 +1882,39 @@ export type AmountConversionExplanation = {
   reason: AmountConversionReason;
 };
 
-// Plan 043 Phase 4, stage A: candidate coffee-vs-water rules, scored by the
-// corpus what-if replay before one becomes the default. Off unless a caller
-// passes placeholderPolicy; production call sites never do.
+// Plan 043 Phase 4: the coffee-vs-water rule for amounts that neither an
+// exact total nor a lone water word settles. Stage A added it as candidate
+// policies, stage B scored them on the plan-080 labels, and since stage C
+// the C3 shape at COFFEE_DOSE_BOUND_FACTOR is the default:
 //
-// - C1_coffee_bound@f: a coffee decision from keyword_coffee or a
-//   cleanest_ratio branch becomes water when value > coffeeAmount x f (a
-//   coffee quantity larger than the whole dose is implausible).
-// - C2_prep_dose@f: in preparation (stepKind "preparation", or stepRole
-//   preparation/stir), where a cleanest_ratio branch decides today, value
-//   <= coffeeAmount x f is coffee and anything larger is water.
-// - C3_both@f: C2 then C1, same factor.
+// - coffee bound: a coffee decision from keyword_coffee or a cleanest_ratio
+//   branch becomes water when value > coffeeAmount x factor and there is a
+//   water base (a coffee quantity well beyond the whole dose is implausible);
+// - preparation dose rule: in preparation (stepKind "preparation", or
+//   stepRole preparation/stir), where a cleanest_ratio branch decides,
+//   value <= coffeeAmount x factor is coffee and anything larger is water.
+//
+// On the labels, real coffee amounts sat at up to ~1.25x the dose and every
+// amount wrongly read as coffee was over 2x, so any factor in (1.25, 2]
+// separates them; 1.5 leaves margin on both sides.
+export const COFFEE_DOSE_BOUND_FACTOR = 1.5;
+
+// placeholderPolicy overrides the default, for the corpus what-if replay
+// only; production call sites never pass it.
+// - C0_legacy: the behaviour before stage C (neither rule).
+// - C1_coffee_bound@f: the coffee bound alone, at factor f.
+// - C2_prep_dose@f: the preparation dose rule alone, at factor f.
+// - C3_both@f: both rules at factor f (the default's shape).
 export const PLACEHOLDER_POLICY_IDS = [
-  "C0_current",
+  "C0_legacy",
   "C1_coffee_bound@1.0",
   "C1_coffee_bound@1.05",
   "C1_coffee_bound@1.25",
   "C2_prep_dose@1.05",
   "C3_both@1.05",
+  "C3_both@1.25",
+  "C3_both@1.5",
+  "C3_both@2.0",
 ] as const;
 export type PlaceholderPolicyId = typeof PLACEHOLDER_POLICY_IDS[number];
 
@@ -1912,15 +1927,23 @@ const PLACEHOLDER_POLICY_CONFIGS: Record<
   PlaceholderPolicyId,
   PlaceholderPolicyConfig
 > = {
-  "C0_current": { coffeeBoundFactor: null, prepDoseFactor: null },
+  "C0_legacy": { coffeeBoundFactor: null, prepDoseFactor: null },
   "C1_coffee_bound@1.0": { coffeeBoundFactor: 1.0, prepDoseFactor: null },
   "C1_coffee_bound@1.05": { coffeeBoundFactor: 1.05, prepDoseFactor: null },
   "C1_coffee_bound@1.25": { coffeeBoundFactor: 1.25, prepDoseFactor: null },
   "C2_prep_dose@1.05": { coffeeBoundFactor: null, prepDoseFactor: 1.05 },
   "C3_both@1.05": { coffeeBoundFactor: 1.05, prepDoseFactor: 1.05 },
+  "C3_both@1.25": { coffeeBoundFactor: 1.25, prepDoseFactor: 1.25 },
+  "C3_both@1.5": { coffeeBoundFactor: 1.5, prepDoseFactor: 1.5 },
+  "C3_both@2.0": { coffeeBoundFactor: 2.0, prepDoseFactor: 2.0 },
 };
 
-// Decisions C1 may overturn. exact_total_coffee is deliberately absent: a
+const DEFAULT_PLACEHOLDER_POLICY: PlaceholderPolicyConfig = {
+  coffeeBoundFactor: COFFEE_DOSE_BOUND_FACTOR,
+  prepDoseFactor: COFFEE_DOSE_BOUND_FACTOR,
+};
+
+// Decisions the coffee bound may overturn. exact_total_coffee is deliberately absent: a
 // value equal to the recipe's own dose is the dose.
 const COFFEE_BOUND_REASONS: ReadonlySet<AmountConversionReason> = new Set([
   "keyword_coffee",
@@ -1946,15 +1969,15 @@ function resolveAmountPlaceholder(args: {
     | "drawdown"
     | "serve"
     | null;
-  // Plan 043 Phase 4 candidate; absent means today's behaviour.
+  // Plan 043 Phase 4 what-if override; absent means the default rule.
   placeholderPolicy?: PlaceholderPolicyId;
 }): ResolvedAmountPlaceholder {
   const policy = args.placeholderPolicy === undefined
-    ? null
+    ? DEFAULT_PLACEHOLDER_POLICY
     : PLACEHOLDER_POLICY_CONFIGS[args.placeholderPolicy];
   const resolved = resolveAmountPlaceholderBase(args, policy);
   if (
-    policy?.coffeeBoundFactor != null &&
+    policy.coffeeBoundFactor !== null &&
     resolved.placeholder === "<final_coffee_amount>" &&
     COFFEE_BOUND_REASONS.has(resolved.reason) &&
     args.coffeeAmount !== null &&
@@ -1969,7 +1992,7 @@ function resolveAmountPlaceholder(args: {
   return resolved;
 }
 
-// C2 (see PLACEHOLDER_POLICY_IDS): the preparation dose rule that replaces
+// The preparation dose rule (see COFFEE_DOSE_BOUND_FACTOR) that replaces
 // getCleanestPlaceholder. Returns null where it does not apply, so the
 // caller keeps the cleanest-ratio decision: outside preparation, or when
 // either base amount is missing (there is no water base to fall back to).
@@ -1981,10 +2004,10 @@ function resolvePrepDosePlaceholder(
     coffeeAmount: number | null;
     waterAmount: number | null;
   },
-  policy: PlaceholderPolicyConfig | null,
+  policy: PlaceholderPolicyConfig,
 ): ResolvedAmountPlaceholder | null {
   if (
-    policy?.prepDoseFactor == null ||
+    policy.prepDoseFactor === null ||
     args.coffeeAmount === null ||
     args.waterAmount === null ||
     !(args.stepKind === "preparation" || args.stepRole === "preparation" ||
@@ -1999,7 +2022,7 @@ function resolvePrepDosePlaceholder(
 
 function resolveAmountPlaceholderBase(
   args: Parameters<typeof resolveAmountPlaceholder>[0],
-  policy: PlaceholderPolicyConfig | null,
+  policy: PlaceholderPolicyConfig,
 ): ResolvedAmountPlaceholder {
   // Defect 1 (Aug 2026 live pass): highest-priority, language-agnostic
   // signal, checked BEFORE any keyword matching. A live German step "15 g
@@ -2201,9 +2224,9 @@ type ConvertNumericValuesArgs = {
     | "drawdown"
     | "serve"
     | null;
-  // Plan 043 Phase 4, stage A: a candidate coffee-vs-water rule for the
+  // Plan 043 Phase 4: overrides the default coffee-vs-water rule, for the
   // corpus what-if replay (see PLACEHOLDER_POLICY_IDS). Production call
-  // sites must not pass it; absent means today's behaviour.
+  // sites must not pass it; absent means the default.
   placeholderPolicy?: PlaceholderPolicyId;
 };
 
