@@ -324,3 +324,127 @@ Deno.test("policy: ranges apply the policy to both endpoints", () => {
     [[true, COFFEE, "keyword_coffee"]],
   );
 });
+
+// Plan 043 Phase 4, stage C: the default rule (no policy). Values sit well
+// inside x1.25 or well beyond x2.0, so these hold for any factor stage B
+// left open; the factor itself is pinned on its own.
+
+Deno.test("default: COFFEE_DOSE_BOUND_FACTOR is 1.5", () => {
+  equal(COFFEE_DOSE_BOUND_FACTOR, 1.5);
+});
+
+Deno.test("default: a coffee-worded amount at ~3x the dose becomes water", () => {
+  // 45 g next to a coffee word, against a 15 g dose.
+  for (const stepKind of ["brew", "preparation"] as const) {
+    equal(decide("Grind 45 g of beans", undefined, { stepKind }), [
+      WATER,
+      "coffee_bound_water",
+    ]);
+    equal(decide("Grind 45 g of beans", "C0_legacy", { stepKind }), [
+      COFFEE,
+      "keyword_coffee",
+    ]);
+  }
+  // Without a water base there is nothing to fall back to.
+  equal(decide("Grind 45 g of beans", undefined, { waterAmount: null }), [
+    COFFEE,
+    "keyword_coffee",
+  ]);
+});
+
+Deno.test("default: a preparation amount at 1.2x the dose is coffee", () => {
+  // 18 g against a 15 g dose, with no coffee or water word.
+  equal(decide("Weigh out 18 g", undefined, { stepKind: "preparation" }), [
+    COFFEE,
+    "prep_dose_coffee",
+  ]);
+  for (const stepRole of ["preparation", "stir"] as const) {
+    equal(decide("Set aside 18 g", undefined, { stepRole }), [
+      COFFEE,
+      "prep_dose_coffee",
+    ]);
+  }
+  // A coffee word within the bound keeps its keyword decision.
+  equal(
+    decide("Grind 18 g of beans", undefined, { stepKind: "preparation" }),
+    [COFFEE, "keyword_coffee"],
+  );
+});
+
+Deno.test("default: a preparation amount at 2.5x the dose is water", () => {
+  // 37.5/15 = 2.5 is the "cleaner" ratio, so C0_legacy read it as coffee.
+  const prep = { stepKind: "preparation" as const };
+  equal(decide("Weigh out 37.5 g", undefined, prep), [
+    WATER,
+    "prep_dose_water",
+  ]);
+  equal(decide("Weigh out 37.5 g", "C0_legacy", prep), [
+    COFFEE,
+    "cleanest_ratio",
+  ]);
+  for (const stepRole of ["preparation", "stir"] as const) {
+    equal(decide("Set aside 37.5 g", undefined, { stepRole }), [
+      WATER,
+      "prep_dose_water",
+    ]);
+  }
+});
+
+Deno.test("default: exact totals are unchanged", () => {
+  for (const stepKind of ["brew", "preparation"] as const) {
+    for (
+      const stepRole of [undefined, "preparation", "stir", "pour"] as const
+    ) {
+      const overrides = { stepKind, ...(stepRole ? { stepRole } : {}) };
+      equal(decide("Add 15 g and stir", undefined, overrides), [
+        COFFEE,
+        "exact_total_coffee",
+      ]);
+      equal(decide("Grind 15 g of beans", undefined, overrides), [
+        COFFEE,
+        "exact_total_coffee",
+      ]);
+      equal(decide("Top up to 250 g", undefined, overrides), [
+        WATER,
+        "exact_total_water",
+      ]);
+    }
+  }
+});
+
+Deno.test("default: brew-step defaults are unchanged", () => {
+  for (const stepRole of [undefined, "bloom", "pour", "drawdown"] as const) {
+    const overrides = stepRole ? { stepRole } : {};
+    // Amounts below and above the bound both keep the brew water default.
+    for (const description of ["Add 12 g now", "Add 60 g now"]) {
+      equal(decide(description, undefined, overrides), [
+        WATER,
+        "brew_default_water",
+      ]);
+      equal(
+        decide(description, undefined, overrides),
+        decide(description, "C0_legacy", overrides),
+      );
+    }
+    equal(decide("Pour 100 g of water", undefined, overrides), [
+      WATER,
+      "keyword_water",
+    ]);
+    // A coffee word within the bound is still coffee.
+    equal(decide("Grind 16 g of beans", undefined, overrides), [
+      COFFEE,
+      "keyword_coffee",
+    ]);
+  }
+});
+
+Deno.test("default: a range with both endpoints beyond the bound is water", () => {
+  equal(
+    explain("Add 40-60 g onto the coffee bed").map((entry) => [
+      entry.isRange,
+      entry.placeholder,
+      entry.reason,
+    ]),
+    [[true, WATER, "coffee_bound_water"]],
+  );
+});
