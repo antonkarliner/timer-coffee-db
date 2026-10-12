@@ -4,9 +4,11 @@ import type { AmountConversionExplanation } from "./parser.ts";
 import {
   CorpusFormatError,
   type CorpusLabel,
+  corpusLanguage,
   type CorpusRow,
   explainCorpusStep,
   formatCorpusAccuracy,
+  isEligibleCorpusRow,
   matchLabelSpan,
   parseCorpusLabels,
   parseCorpusRows,
@@ -134,7 +136,7 @@ Deno.test("scoring: overall, orphan and per-scope counts", () => {
   equal(scope(result, "overall"), { labelled: 7, correct: 4 });
   equal(scope(result, "lang:en"), { labelled: 4, correct: 2 });
   equal(scope(result, "lang:zh"), { labelled: 2, correct: 1 });
-  equal(scope(result, "lang:unknown"), { labelled: 1, correct: 1 });
+  equal(scope(result, "lang:und"), { labelled: 1, correct: 1 });
   equal(scope(result, "kind:preparation"), { labelled: 2, correct: 1 });
   equal(scope(result, "kind:brew"), { labelled: 5, correct: 3 });
   equal(scope(result, "reason:missed"), { labelled: 2, correct: 0 });
@@ -327,4 +329,15 @@ Deno.test("formatting: METRIC aggregates only, no step text", () => {
     5 * 4,
   );
   equal(find("lang:zh", "accuracy"), 0.5);
+});
+
+Deno.test("eligibility and language match the app harness", () => {
+  const base = { id: 7, coffee: 15, water: 250, src: ["a", "b"] };
+  equal(isEligibleCorpusRow({ ...base, cor: ["a", "b"] }), true);
+  equal(isEligibleCorpusRow({ ...base, cor: ["a"] }), false);
+  equal(isEligibleCorpusRow({ ...base, water: 0 }), false);
+  equal(corpusLanguage({ ...base, locale: "pt-BR" }), "pt");
+  equal(corpusLanguage({ ...base, locale: "zh_Hans" }), "zh");
+  equal(corpusLanguage({ ...base, locale: "" }), "und");
+  equal(corpusLanguage({ ...base, locale: null }), "und");
 });

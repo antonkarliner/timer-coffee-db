@@ -18,6 +18,7 @@ export type CorpusRow = {
   water: number | null;
   locale?: string | null;
   src: string[];
+  cor?: string[] | null;
 };
 
 export const CORPUS_LABELS = [
@@ -97,16 +98,22 @@ export function parseCorpusLabels(input: unknown): CorpusLabel[] {
   });
 }
 
+// Same rule as the app harness (timer-coffee test/tooling/
+// recipe_corpus_sample.dart corpusRowEligible), so the two accuracy numbers
+// cover the same rows.
 export function isEligibleCorpusRow(row: CorpusRow): boolean {
   return row.operator !== true && isPositiveFinite(row.coffee) &&
-    isPositiveFinite(row.water);
+    isPositiveFinite(row.water) &&
+    (!Array.isArray(row.cor) || row.cor.length === row.src.length);
 }
 
+// Primary language subtag, or "und" (app harness corpusLanguage), so
+// per-language keys match the app's.
 export function corpusLanguage(row: CorpusRow): string {
-  const locale = typeof row.locale === "string"
-    ? row.locale.trim().toLowerCase()
-    : "";
-  return locale.length > 0 ? locale : "unknown";
+  const primary = (typeof row.locale === "string" ? row.locale : "")
+    .toLowerCase()
+    .split(/[-_]/)[0];
+  return /^[a-z]{2,3}$/.test(primary) ? primary : "und";
 }
 
 export function expectedOutcome(label: CorpusLabelName): CorpusOutcome {
