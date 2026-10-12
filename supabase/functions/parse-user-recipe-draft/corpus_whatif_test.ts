@@ -35,12 +35,11 @@ const ROWS: CorpusRow[] = [
     src: [
       // preparation, cleanest ratio says coffee (30/15 = 2)
       "Weigh 30 g",
-      // brew, keyword says coffee
+      // brew, keyword says coffee; the bound is preparation-only, so no
+      // candidate changes it
       "Add 50 g onto the coffee bed",
       // brew, keyword says coffee, within x1.25
       "Grind 16 g of beans",
-      // brew, keyword says coffee, between x1.25 and x1.5
-      "Grind 21 g of beans",
     ],
   },
   {
@@ -50,6 +49,14 @@ const ROWS: CorpusRow[] = [
     locale: "ja",
     // preparation, cleanest ratio says water (15.5/250 reads cleaner)
     src: ["Weigh out 15.5 g"],
+  },
+  {
+    id: 3,
+    coffee: 15,
+    water: 250,
+    locale: "en",
+    // preparation, keyword says coffee, between x1.25 and x1.5
+    src: ["Grind 21 g of beans"],
   },
 ];
 
@@ -75,8 +82,11 @@ const LABELS: CorpusLabel[] = [
   label(1, 0, "30 g", "water"), // C0 wrong
   label(1, 1, "50 g", "water"), // C0 wrong
   label(1, 2, "16 g", "coffee"), // C0 right
-  label(1, 3, "21 g", "coffee"), // C0 right
   label(2, 0, "15.5 g", "coffee"), // C0 wrong
+  // plan 043 Ph 4: moved from a brew step of row 1 to a preparation step,
+  // since rule (a) no longer applies in brew steps and only here does it
+  // still separate x1.25 from x1.5.
+  label(3, 0, "21 g", "coffee"), // C0 right
   // orphan: unknown row
   {
     diagnostics_id: 99,
@@ -161,38 +171,44 @@ Deno.test("what-if: every scope is prefixed by a candidate id", () => {
 Deno.test("what-if: overall correct per candidate", () => {
   equal(
     WHATIF_CANDIDATES.map((policy) => find(`${policy}/overall`, "correct")),
-    [2, 4, 5, 4, 5],
+    [2, 3, 4, 3, 4],
   );
-  // x1.25 cuts the 21 g coffee amount; x1.5 keeps it.
-  equal(find("C3_both@1.25/reason:coffee_bound_water", "labelled"), 2);
-  equal(find("C3_both@1.25/reason:coffee_bound_water", "correct"), 1);
+  // x1.25 cuts the 21 g preparation coffee amount; x1.5 keeps it.
+  equal(find("C3_both@1.25/reason:coffee_bound_water", "labelled"), 1);
+  equal(find("C3_both@1.25/reason:coffee_bound_water", "correct"), 0);
   equal(find("C3_both@1.25/overall", "confusion", "coffee:water"), 1);
-  equal(find("C3_both@1.5/reason:coffee_bound_water", "labelled"), 1);
+  equal(find("C3_both@1.5/reason:coffee_bound_water", "labelled"), undefined);
+  // The brew-step 50 g stays keyword_coffee (and wrong) under every
+  // candidate.
+  equal(find("C3_both@1.5/reason:keyword_coffee", "labelled"), 3);
   equal(find("C3_both@1.5/reason:keyword_coffee", "correct"), 2);
   equal(find("C3_both@1.5/reason:prep_dose_water", "correct"), 1);
   equal(find("C3_both@1.5/reason:prep_dose_coffee", "correct"), 1);
-  equal(find("C3_both@1.5/kind:preparation", "correct"), 2);
+  equal(find("C3_both@1.5/kind:preparation", "correct"), 3);
+  for (const policy of WHATIF_CANDIDATES) {
+    equal(find(`${policy}/kind:brew`, "correct"), 1);
+  }
   // x2.0 reads the 30 g preparation amount (exactly 2x) as coffee.
   equal(find("C3_both@2.0/reason:prep_dose_coffee", "labelled"), 2);
   equal(find("C3_both@2.0/reason:prep_dose_coffee", "correct"), 1);
-  equal(find("C3_both@2.0/overall", "confusion", "water:coffee"), 1);
+  equal(find("C3_both@2.0/overall", "confusion", "water:coffee"), 2);
   equal(find("C0_legacy/lang:ja", "accuracy"), 0);
   equal(find("default/lang:ja", "accuracy"), 1);
 });
 
 Deno.test("what-if: flips against C0_legacy, overall and per step kind", () => {
   // [right_to_wrong, wrong_to_right]
-  equal(flips("C3_both@1.25", "overall"), [1, 3]);
-  equal(flips("C3_both@1.25", "kind:preparation"), [0, 2]);
-  equal(flips("C3_both@1.25", "kind:brew"), [1, 1]);
+  equal(flips("C3_both@1.25", "overall"), [1, 2]);
+  equal(flips("C3_both@1.25", "kind:preparation"), [1, 2]);
+  equal(flips("C3_both@1.25", "kind:brew"), [0, 0]);
   for (const policy of ["C3_both@1.5", "default"]) {
-    equal(flips(policy, "overall"), [0, 3]);
+    equal(flips(policy, "overall"), [0, 2]);
     equal(flips(policy, "kind:preparation"), [0, 2]);
-    equal(flips(policy, "kind:brew"), [0, 1]);
+    equal(flips(policy, "kind:brew"), [0, 0]);
   }
-  equal(flips("C3_both@2.0", "overall"), [0, 2]);
+  equal(flips("C3_both@2.0", "overall"), [0, 1]);
   equal(flips("C3_both@2.0", "kind:preparation"), [0, 1]);
-  equal(flips("C3_both@2.0", "kind:brew"), [0, 1]);
+  equal(flips("C3_both@2.0", "kind:brew"), [0, 0]);
   // No flips are reported for C0_legacy against itself.
   equal(
     METRICS.filter((metric) =>

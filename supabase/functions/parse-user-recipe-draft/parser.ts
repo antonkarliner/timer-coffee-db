@@ -1887,12 +1887,19 @@ export type AmountConversionExplanation = {
 // policies, stage B scored them on the plan-080 labels, and since stage C
 // the C3 shape at COFFEE_DOSE_BOUND_FACTOR is the default:
 //
-// - coffee bound: a coffee decision from keyword_coffee or a cleanest_ratio
-//   branch becomes water when value > coffeeAmount x factor and there is a
-//   water base (a coffee quantity well beyond the whole dose is implausible);
-// - preparation dose rule: in preparation (stepKind "preparation", or
-//   stepRole preparation/stir), where a cleanest_ratio branch decides,
-//   value <= coffeeAmount x factor is coffee and anything larger is water.
+// - coffee bound: in preparation (stepKind "preparation", or stepRole
+//   preparation/stir), a coffee decision from keyword_coffee or a
+//   cleanest_ratio branch becomes water when value > coffeeAmount x factor
+//   and there is a water base (a coffee quantity well beyond the whole dose
+//   is implausible);
+// - preparation dose rule: in preparation, where a cleanest_ratio branch
+//   decides, value <= coffeeAmount x factor is coffee and anything larger
+//   is water.
+//
+// Brew steps are left alone: there an amount the author phrases as "N times
+// the dose" really does scale with the dose (the Kalita fixture), and stage
+// B found no brew-step flips. The app's port (plan 080 Phase 3) limits its
+// rule to preparation the same way (plan 043 D4).
 //
 // On the labels, real coffee amounts sat at up to ~1.25x the dose and every
 // amount wrongly read as coffee was over 2x, so any factor in (1.25, 2]
@@ -1904,7 +1911,10 @@ export const COFFEE_DOSE_BOUND_FACTOR = 1.5;
 // - C0_legacy: the behaviour before stage C (neither rule).
 // - C1_coffee_bound@f: the coffee bound alone, at factor f.
 // - C2_prep_dose@f: the preparation dose rule alone, at factor f.
-// - C3_both@f: both rules at factor f (the default's shape).
+// - C3_both@f: both rules at factor f.
+// The stage-A ids (C1_*, C2_*, C3_both@1.05) are kept as scored in stage B,
+// so their coffee bound applies in every step. C3_both@1.25/1.5/2.0 share
+// the default's shape, with the bound in preparation only.
 export const PLACEHOLDER_POLICY_IDS = [
   "C0_legacy",
   "C1_coffee_bound@1.0",
@@ -1920,31 +1930,60 @@ export type PlaceholderPolicyId = typeof PLACEHOLDER_POLICY_IDS[number];
 
 type PlaceholderPolicyConfig = {
   coffeeBoundFactor: number | null;
+  // true: the coffee bound applies in preparation only (stage C onwards).
+  coffeeBoundPreparationOnly: boolean;
   prepDoseFactor: number | null;
 };
+
+function stageAPolicy(
+  coffeeBoundFactor: number | null,
+  prepDoseFactor: number | null,
+): PlaceholderPolicyConfig {
+  return {
+    coffeeBoundFactor,
+    coffeeBoundPreparationOnly: false,
+    prepDoseFactor,
+  };
+}
+
+function preparationBoundPolicy(factor: number): PlaceholderPolicyConfig {
+  return {
+    coffeeBoundFactor: factor,
+    coffeeBoundPreparationOnly: true,
+    prepDoseFactor: factor,
+  };
+}
 
 const PLACEHOLDER_POLICY_CONFIGS: Record<
   PlaceholderPolicyId,
   PlaceholderPolicyConfig
 > = {
-  "C0_legacy": { coffeeBoundFactor: null, prepDoseFactor: null },
-  "C1_coffee_bound@1.0": { coffeeBoundFactor: 1.0, prepDoseFactor: null },
-  "C1_coffee_bound@1.05": { coffeeBoundFactor: 1.05, prepDoseFactor: null },
-  "C1_coffee_bound@1.25": { coffeeBoundFactor: 1.25, prepDoseFactor: null },
-  "C2_prep_dose@1.05": { coffeeBoundFactor: null, prepDoseFactor: 1.05 },
-  "C3_both@1.05": { coffeeBoundFactor: 1.05, prepDoseFactor: 1.05 },
-  "C3_both@1.25": { coffeeBoundFactor: 1.25, prepDoseFactor: 1.25 },
-  "C3_both@1.5": { coffeeBoundFactor: 1.5, prepDoseFactor: 1.5 },
-  "C3_both@2.0": { coffeeBoundFactor: 2.0, prepDoseFactor: 2.0 },
+  "C0_legacy": stageAPolicy(null, null),
+  "C1_coffee_bound@1.0": stageAPolicy(1.0, null),
+  "C1_coffee_bound@1.05": stageAPolicy(1.05, null),
+  "C1_coffee_bound@1.25": stageAPolicy(1.25, null),
+  "C2_prep_dose@1.05": stageAPolicy(null, 1.05),
+  "C3_both@1.05": stageAPolicy(1.05, 1.05),
+  "C3_both@1.25": preparationBoundPolicy(1.25),
+  "C3_both@1.5": preparationBoundPolicy(1.5),
+  "C3_both@2.0": preparationBoundPolicy(2.0),
 };
 
-const DEFAULT_PLACEHOLDER_POLICY: PlaceholderPolicyConfig = {
-  coffeeBoundFactor: COFFEE_DOSE_BOUND_FACTOR,
-  prepDoseFactor: COFFEE_DOSE_BOUND_FACTOR,
-};
+const DEFAULT_PLACEHOLDER_POLICY = preparationBoundPolicy(
+  COFFEE_DOSE_BOUND_FACTOR,
+);
 
-// Decisions the coffee bound may overturn. exact_total_coffee is deliberately absent: a
-// value equal to the recipe's own dose is the dose.
+// stepKind "preparation", or a preparation/stir role on a brew step.
+function isPreparationAmount(args: {
+  stepKind: "preparation" | "brew";
+  stepRole?: string | null;
+}): boolean {
+  return args.stepKind === "preparation" || args.stepRole === "preparation" ||
+    args.stepRole === "stir";
+}
+
+// Decisions the coffee bound may overturn. exact_total_coffee is
+// deliberately absent: a value equal to the recipe's own dose is the dose.
 const COFFEE_BOUND_REASONS: ReadonlySet<AmountConversionReason> = new Set([
   "keyword_coffee",
   "cleanest_ratio",
@@ -1978,6 +2017,7 @@ function resolveAmountPlaceholder(args: {
   const resolved = resolveAmountPlaceholderBase(args, policy);
   if (
     policy.coffeeBoundFactor !== null &&
+    (!policy.coffeeBoundPreparationOnly || isPreparationAmount(args)) &&
     resolved.placeholder === "<final_coffee_amount>" &&
     COFFEE_BOUND_REASONS.has(resolved.reason) &&
     args.coffeeAmount !== null &&
@@ -2010,8 +2050,7 @@ function resolvePrepDosePlaceholder(
     policy.prepDoseFactor === null ||
     args.coffeeAmount === null ||
     args.waterAmount === null ||
-    !(args.stepKind === "preparation" || args.stepRole === "preparation" ||
-      args.stepRole === "stir")
+    !isPreparationAmount(args)
   ) {
     return null;
   }

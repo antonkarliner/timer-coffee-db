@@ -107,21 +107,33 @@ Deno.test("policy: no policy equals C3_both at COFFEE_DOSE_BOUND_FACTOR", () => 
 Deno.test("policy C1: a keyword_coffee amount above the dose becomes water", () => {
   // Only a coffee word nearby, and 50 g is over three doses.
   const description = "Add 50 g onto the coffee bed";
-  // plan 043 Ph 4: the default now applies the coffee bound (50 > 15 x 2).
-  equal(decide(description, undefined), [WATER, "coffee_bound_water"]);
   equal(decide(description, "C0_legacy"), [COFFEE, "keyword_coffee"]);
+  // The stage-A ids apply the bound in every step, brew included.
   for (
     const policy of [
       "C1_coffee_bound@1.0",
       "C1_coffee_bound@1.05",
       "C1_coffee_bound@1.25",
       "C3_both@1.05",
+    ] as const
+  ) {
+    equal(decide(description, policy), [WATER, "coffee_bound_water"]);
+  }
+  // plan 043 Ph 4: rule (a) is preparation-only for the default and the
+  // stage-C C3 ids, so this brew-step amount stays coffee there.
+  for (
+    const policy of [
+      undefined,
       "C3_both@1.25",
       "C3_both@1.5",
       "C3_both@2.0",
     ] as const
   ) {
-    equal(decide(description, policy), [WATER, "coffee_bound_water"]);
+    equal(decide(description, policy), [COFFEE, "keyword_coffee"]);
+    equal(decide(description, policy, { stepKind: "preparation" }), [
+      WATER,
+      "coffee_bound_water",
+    ]);
   }
   // C2 only replaces the cleanest-ratio branches.
   equal(decide(description, "C2_prep_dose@1.05"), [COFFEE, "keyword_coffee"]);
@@ -333,23 +345,54 @@ Deno.test("default: COFFEE_DOSE_BOUND_FACTOR is 1.5", () => {
   equal(COFFEE_DOSE_BOUND_FACTOR, 1.5);
 });
 
-Deno.test("default: a coffee-worded amount at ~3x the dose becomes water", () => {
+Deno.test("default: a coffee-worded amount at ~3x the dose is water in preparation", () => {
   // 45 g next to a coffee word, against a 15 g dose.
-  for (const stepKind of ["brew", "preparation"] as const) {
-    equal(decide("Grind 45 g of beans", undefined, { stepKind }), [
+  const preparation: Array<Partial<ExplainArgs>> = [
+    { stepKind: "preparation" },
+    { stepRole: "preparation" },
+    { stepRole: "stir" },
+  ];
+  for (const overrides of preparation) {
+    equal(decide("Grind 45 g of beans", undefined, overrides), [
       WATER,
       "coffee_bound_water",
     ]);
-    equal(decide("Grind 45 g of beans", "C0_legacy", { stepKind }), [
+    equal(decide("Grind 45 g of beans", "C0_legacy", overrides), [
       COFFEE,
       "keyword_coffee",
     ]);
   }
+  // plan 043 Ph 4: rule (a) is preparation-only; this used to assert water
+  // for a brew step too.
+  for (const stepRole of [undefined, "bloom", "pour"] as const) {
+    equal(
+      decide("Grind 45 g of beans", undefined, stepRole ? { stepRole } : {}),
+      [COFFEE, "keyword_coffee"],
+    );
+  }
   // Without a water base there is nothing to fall back to.
-  equal(decide("Grind 45 g of beans", undefined, { waterAmount: null }), [
-    COFFEE,
-    "keyword_coffee",
-  ]);
+  equal(
+    decide("Grind 45 g of beans", undefined, {
+      stepKind: "preparation",
+      waterAmount: null,
+    }),
+    [COFFEE, "keyword_coffee"],
+  );
+});
+
+Deno.test("default: a brew pour phrased as a multiple of the dose stays coffee", () => {
+  // 120 g is eight 15 g doses, and the text ties it to the dose, so it
+  // scales with coffee (the Kalita fixture's shape).
+  for (const stepRole of [undefined, "pour", "bloom"] as const) {
+    equal(
+      decide(
+        "Keep going to eight times the dose, 120 g",
+        undefined,
+        stepRole ? { stepRole } : {},
+      ),
+      [COFFEE, "keyword_coffee"],
+    );
+  }
 });
 
 Deno.test("default: a preparation amount at 1.2x the dose is coffee", () => {
@@ -438,13 +481,17 @@ Deno.test("default: brew-step defaults are unchanged", () => {
   }
 });
 
-Deno.test("default: a range with both endpoints beyond the bound is water", () => {
-  equal(
-    explain("Add 40-60 g onto the coffee bed").map((entry) => [
+Deno.test("default: a range with both endpoints beyond the bound is water in preparation", () => {
+  const ranges = (overrides: Partial<ExplainArgs>) =>
+    explain("Add 40-60 g onto the coffee bed", overrides).map((entry) => [
       entry.isRange,
       entry.placeholder,
       entry.reason,
-    ]),
-    [[true, WATER, "coffee_bound_water"]],
-  );
+    ]);
+  equal(ranges({ stepKind: "preparation" }), [
+    [true, WATER, "coffee_bound_water"],
+  ]);
+  // plan 043 Ph 4: rule (a) is preparation-only; this used to assert water
+  // for a brew step.
+  equal(ranges({}), [[true, COFFEE, "keyword_coffee"]]);
 });
