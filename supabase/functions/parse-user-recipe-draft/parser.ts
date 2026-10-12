@@ -1847,6 +1847,11 @@ export type AmountConversionReason =
   | "brew_default_water"
   | "cleanest_ratio"
   | "no_base_amounts"
+  // Plan 043 Phase 4 candidate policies (placeholderPolicy); never produced
+  // when no policy is passed
+  | "coffee_bound_water"
+  | "prep_dose_coffee"
+  | "prep_dose_water"
   // convertNumericValuesToExpressions
   | "skipped_tiny_value"
   | "skipped_rate"
@@ -1877,6 +1882,52 @@ export type AmountConversionExplanation = {
   reason: AmountConversionReason;
 };
 
+// Plan 043 Phase 4, stage A: candidate coffee-vs-water rules, scored by the
+// corpus what-if replay before one becomes the default. Off unless a caller
+// passes placeholderPolicy; production call sites never do.
+//
+// - C1_coffee_bound@f: a coffee decision from keyword_coffee or a
+//   cleanest_ratio branch becomes water when value > coffeeAmount x f (a
+//   coffee quantity larger than the whole dose is implausible).
+// - C2_prep_dose@f: in preparation (stepKind "preparation", or stepRole
+//   preparation/stir), where a cleanest_ratio branch decides today, value
+//   <= coffeeAmount x f is coffee and anything larger is water.
+// - C3_both@f: C2 then C1, same factor.
+export const PLACEHOLDER_POLICY_IDS = [
+  "C0_current",
+  "C1_coffee_bound@1.0",
+  "C1_coffee_bound@1.05",
+  "C1_coffee_bound@1.25",
+  "C2_prep_dose@1.05",
+  "C3_both@1.05",
+] as const;
+export type PlaceholderPolicyId = typeof PLACEHOLDER_POLICY_IDS[number];
+
+type PlaceholderPolicyConfig = {
+  coffeeBoundFactor: number | null;
+  prepDoseFactor: number | null;
+};
+
+const PLACEHOLDER_POLICY_CONFIGS: Record<
+  PlaceholderPolicyId,
+  PlaceholderPolicyConfig
+> = {
+  "C0_current": { coffeeBoundFactor: null, prepDoseFactor: null },
+  "C1_coffee_bound@1.0": { coffeeBoundFactor: 1.0, prepDoseFactor: null },
+  "C1_coffee_bound@1.05": { coffeeBoundFactor: 1.05, prepDoseFactor: null },
+  "C1_coffee_bound@1.25": { coffeeBoundFactor: 1.25, prepDoseFactor: null },
+  "C2_prep_dose@1.05": { coffeeBoundFactor: null, prepDoseFactor: 1.05 },
+  "C3_both@1.05": { coffeeBoundFactor: 1.05, prepDoseFactor: 1.05 },
+};
+
+// Decisions C1 may overturn. exact_total_coffee is deliberately absent: a
+// value equal to the recipe's own dose is the dose.
+const COFFEE_BOUND_REASONS: ReadonlySet<AmountConversionReason> = new Set([
+  "keyword_coffee",
+  "cleanest_ratio",
+  "cleanest_ratio_step_role",
+]);
+
 function resolveAmountPlaceholder(args: {
   description: string;
   stepKind: "preparation" | "brew";
@@ -1895,7 +1946,61 @@ function resolveAmountPlaceholder(args: {
     | "drawdown"
     | "serve"
     | null;
+  // Plan 043 Phase 4 candidate; absent means today's behaviour.
+  placeholderPolicy?: PlaceholderPolicyId;
 }): ResolvedAmountPlaceholder {
+  const policy = args.placeholderPolicy === undefined
+    ? null
+    : PLACEHOLDER_POLICY_CONFIGS[args.placeholderPolicy];
+  const resolved = resolveAmountPlaceholderBase(args, policy);
+  if (
+    policy?.coffeeBoundFactor != null &&
+    resolved.placeholder === "<final_coffee_amount>" &&
+    COFFEE_BOUND_REASONS.has(resolved.reason) &&
+    args.coffeeAmount !== null &&
+    args.waterAmount !== null &&
+    args.value > args.coffeeAmount * policy.coffeeBoundFactor
+  ) {
+    return {
+      placeholder: "<final_water_amount>",
+      reason: "coffee_bound_water",
+    };
+  }
+  return resolved;
+}
+
+// C2 (see PLACEHOLDER_POLICY_IDS): the preparation dose rule that replaces
+// getCleanestPlaceholder. Returns null where it does not apply, so the
+// caller keeps the cleanest-ratio decision: outside preparation, or when
+// either base amount is missing (there is no water base to fall back to).
+function resolvePrepDosePlaceholder(
+  args: {
+    stepKind: "preparation" | "brew";
+    stepRole?: string | null;
+    value: number;
+    coffeeAmount: number | null;
+    waterAmount: number | null;
+  },
+  policy: PlaceholderPolicyConfig | null,
+): ResolvedAmountPlaceholder | null {
+  if (
+    policy?.prepDoseFactor == null ||
+    args.coffeeAmount === null ||
+    args.waterAmount === null ||
+    !(args.stepKind === "preparation" || args.stepRole === "preparation" ||
+      args.stepRole === "stir")
+  ) {
+    return null;
+  }
+  return args.value <= args.coffeeAmount * policy.prepDoseFactor
+    ? { placeholder: "<final_coffee_amount>", reason: "prep_dose_coffee" }
+    : { placeholder: "<final_water_amount>", reason: "prep_dose_water" };
+}
+
+function resolveAmountPlaceholderBase(
+  args: Parameters<typeof resolveAmountPlaceholder>[0],
+  policy: PlaceholderPolicyConfig | null,
+): ResolvedAmountPlaceholder {
   // Defect 1 (Aug 2026 live pass): highest-priority, language-agnostic
   // signal, checked BEFORE any keyword matching. A live German step "15 g
   // Kaffee zugeben und umruehren." (coffee_amount 15, water_amount 250)
@@ -1974,6 +2079,10 @@ function resolveAmountPlaceholder(args: {
       (args.stepRole === "preparation" || args.stepRole === "stir") &&
       args.coffeeAmount !== null
     ) {
+      const prepDose = resolvePrepDosePlaceholder(args, policy);
+      if (prepDose !== null) {
+        return prepDose;
+      }
       return {
         placeholder: getCleanestPlaceholder({
           value: args.value,
@@ -1990,6 +2099,10 @@ function resolveAmountPlaceholder(args: {
     };
   }
 
+  const prepDose = resolvePrepDosePlaceholder(args, policy);
+  if (prepDose !== null) {
+    return prepDose;
+  }
   const placeholder = getCleanestPlaceholder({
     value: args.value,
     coffeeAmount: args.coffeeAmount,
@@ -2088,6 +2201,10 @@ type ConvertNumericValuesArgs = {
     | "drawdown"
     | "serve"
     | null;
+  // Plan 043 Phase 4, stage A: a candidate coffee-vs-water rule for the
+  // corpus what-if replay (see PLACEHOLDER_POLICY_IDS). Production call
+  // sites must not pass it; absent means today's behaviour.
+  placeholderPolicy?: PlaceholderPolicyId;
 };
 
 function convertNumericValuesToExpressions(
@@ -2234,6 +2351,7 @@ function convertNumericValuesToExpressionsDetailed(
         coffeeAmount: args.coffeeAmount,
         waterAmount: args.waterAmount,
         stepRole: args.stepRole,
+        placeholderPolicy: args.placeholderPolicy,
       });
       const upperResolved = resolveAmountPlaceholder({
         description: String(fullDescription),
@@ -2244,6 +2362,7 @@ function convertNumericValuesToExpressionsDetailed(
         coffeeAmount: args.coffeeAmount,
         waterAmount: args.waterAmount,
         stepRole: args.stepRole,
+        placeholderPolicy: args.placeholderPolicy,
       });
 
       const lowerPlaceholder = lowerResolved.placeholder;
@@ -2366,6 +2485,7 @@ function convertNumericValuesToExpressionsDetailed(
         coffeeAmount: args.coffeeAmount,
         waterAmount: args.waterAmount,
         stepRole: args.stepRole,
+        placeholderPolicy: args.placeholderPolicy,
       });
 
       const placeholder = resolved.placeholder;
