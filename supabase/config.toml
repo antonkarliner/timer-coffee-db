@@ -265,3 +265,15 @@ verify_jwt = true
 # submit-roaster-feedback; Turnstile is verified inside the handler.
 [functions.subscribe-blog]
 verify_jwt = true
+
+# Collectors authenticate the existing CRON_JOB_SECRET (X-System-Token), or a
+# service-role bearer, inside the function before any upstream/DB calls.
+[functions.sync-app-store-ratings]
+verify_jwt = false
+
+[functions.sync-google-play-ratings]
+verify_jwt = false
+
+# Public aggregate snapshots only. Collection state and credentials stay private.
+[functions.get-app-store-ratings]
+verify_jwt = false
