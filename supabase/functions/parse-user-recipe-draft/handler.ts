@@ -16,7 +16,7 @@ const OPENAI_DAILY_TOKEN_BUDGET = 10_000_000;
 // Every stage key must always be present on a capture row even when a stage
 // never ran (e.g. cumulative_rewrite skipped, or repair never triggered) —
 // this is the fallback used only if parseDraft somehow returned
-// stage_outputs: null while capture_stages was true, which should not
+// stage_outputs: null while capture was enabled, which should not
 // happen but keeps the capture insert well-typed either way.
 const EMPTY_STAGE_OUTPUTS: StageOutputs = {
   extraction: [],
@@ -33,6 +33,10 @@ export type ParseUserRecipeDraftHandlerDeps = {
   parser: RecipeDraftParser;
   getUserFromToken(token: string): Promise<AuthenticatedUser | null>;
   getRecipeDraftLabAccess(userId: string): Promise<RecipeDraftLabAccessResult>;
+  getRecipeMakerConsent(userId: string): Promise<{
+    noticeVersion: string;
+    accepted: boolean;
+  }>;
   getBrewingMethods(): Promise<BrewingMethodOption[]>;
   getOpenAiDailyTokensUsed(): Promise<number>;
   logInvocation(data: {
@@ -42,12 +46,13 @@ export type ParseUserRecipeDraftHandlerDeps = {
     providerUsed: string;
     providerModelUsed: string;
   }): Promise<void>;
-  // Opt-in per-stage diagnostic capture (capture_stages: true on the
-  // request). Unlike logInvocation this is AWAITED — the response carries
+  // Required for consented non-admins; service admins opt in with
+  // capture_stages: true. Unlike logInvocation this is AWAITED — the response carries
   // the new row's id as capture_id — but a throw here must never cost the
   // caller a successful parse; see the try/catch around its call below.
   captureStages(data: {
     userId: string;
+    noticeVersion: string | null;
     requestText: string;
     requestMode: string;
     requestBrewingMethodId: string | null;
@@ -139,6 +144,35 @@ export function createParseUserRecipeDraftHandler(
       });
     }
 
+    const captureRequired = access.role !== "service_admin";
+    let noticeVersion: string | null = null;
+    if (captureRequired) {
+      let consent;
+      try {
+        consent = await deps.getRecipeMakerConsent(user.id);
+      } catch (error) {
+        // Fail closed: without a consent answer the parse must not run.
+        console.error(
+          `[parse-user-recipe-draft] consent_lookup_failed error=${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+        return jsonResponse(deps, cors, 503, {
+          error: "Service Unavailable",
+          message: "Could not verify recipe maker consent.",
+        });
+      }
+      if (!consent.accepted) {
+        return jsonResponse(deps, cors, 403, {
+          error: "consent_required",
+          notice_version: consent.noticeVersion,
+          message:
+            "Accept the recipe maker beta notice before creating recipes.",
+        });
+      }
+      noticeVersion = consent.noticeVersion;
+    }
+
     let body: unknown;
     try {
       body = await req.json();
@@ -199,7 +233,7 @@ export function createParseUserRecipeDraftHandler(
           requestId,
           disabledProviders,
           mode: parsedBody.mode,
-          captureStages: parsedBody.capture_stages,
+          captureStages: captureRequired || parsedBody.capture_stages,
         },
       );
 
@@ -220,10 +254,11 @@ export function createParseUserRecipeDraftHandler(
       const { stage_outputs, ...publicResult } = result;
 
       let captureId: string | null = null;
-      if (parsedBody.capture_stages) {
+      if (captureRequired || parsedBody.capture_stages) {
         try {
           captureId = await deps.captureStages({
             userId: user.id,
+            noticeVersion,
             requestText: parsedBody.text,
             requestMode: parsedBody.mode ?? "extract",
             requestBrewingMethodId: parsedBody.brewing_method_id ?? null,

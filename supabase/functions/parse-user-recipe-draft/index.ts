@@ -75,6 +75,23 @@ const handler = createParseUserRecipeDraftHandler({
       userId,
     });
   },
+  async getRecipeMakerConsent(userId) {
+    const { data, error } = await supabase.schema("service").rpc(
+      "recipe_maker_consent_status",
+      { p_user_id: userId },
+    );
+    if (error) {
+      throw new Error(`Failed to load recipe maker consent: ${error.message}`);
+    }
+    if (
+      !data || typeof data !== "object" || Array.isArray(data) ||
+      typeof data.notice_version !== "string" ||
+      typeof data.accepted !== "boolean"
+    ) {
+      throw new Error("Invalid recipe maker consent status.");
+    }
+    return { noticeVersion: data.notice_version, accepted: data.accepted };
+  },
   async getBrewingMethods() {
     const { data, error } = await supabase
       .from("brewing_methods")
@@ -118,6 +135,7 @@ const handler = createParseUserRecipeDraftHandler({
   async captureStages(
     {
       userId,
+      noticeVersion,
       requestText,
       requestMode,
       requestBrewingMethodId,
@@ -134,6 +152,7 @@ const handler = createParseUserRecipeDraftHandler({
       .from("parse_user_recipe_draft_captures")
       .insert({
         user_id: userId,
+        notice_version: noticeVersion,
         request_text: requestText,
         request_mode: requestMode,
         request_brewing_method_id: requestBrewingMethodId,

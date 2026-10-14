@@ -105,6 +105,13 @@ function createHandlerOverrides(): ParseUserRecipeDraftHandlerDeps {
           },
       );
     },
+    // plan 043 Ph 6: default callers have accepted the current beta notice.
+    getRecipeMakerConsent() {
+      return Promise.resolve({
+        noticeVersion: "2026-10-beta-1",
+        accepted: true,
+      });
+    },
     getBrewingMethods() {
       return Promise.resolve([
         {
@@ -389,6 +396,10 @@ Deno.test("capture_stages omitted: captureStages dep is never called and capture
   let captureStagesCalls = 0;
   const handler = createParseUserRecipeDraftHandler({
     ...overrides,
+    // plan 043 Ph 6: opt-in-only behaviour belongs to service admins.
+    getRecipeDraftLabAccess() {
+      return Promise.resolve({ allowed: true, role: "service_admin" });
+    },
     captureStages() {
       captureStagesCalls += 1;
       return Promise.resolve("capture-should-not-happen");
@@ -416,6 +427,10 @@ Deno.test("capture_stages: false: captureStages dep is never called and capture_
   let captureStagesCalls = 0;
   const handler = createParseUserRecipeDraftHandler({
     ...overrides,
+    // plan 043 Ph 6: opt-in-only behaviour belongs to service admins.
+    getRecipeDraftLabAccess() {
+      return Promise.resolve({ allowed: true, role: "service_admin" });
+    },
     captureStages() {
       captureStagesCalls += 1;
       return Promise.resolve("capture-should-not-happen");
@@ -572,3 +587,228 @@ Deno.test("stage_outputs never reaches the serialized HTTP response body", async
     "Expected capture_id present in the serialized response body.",
   );
 });
+
+// Plan 043 Phase 6: synthetic requests only; observe consent ordering and capture.
+function createConsentTestHandler(options: {
+  role: "roaster_admin" | "tester" | "service_admin";
+  accepted?: boolean;
+  lookupThrows?: boolean;
+  captureThrows?: boolean;
+}) {
+  const base = createHandlerOverrides();
+  const calls = {
+    consentUsers: [] as string[],
+    parserInputs: [] as Parameters<typeof base.parser.parseDraft>[0][],
+    captures: [] as Parameters<typeof base.captureStages>[0][],
+  };
+  const parser = createCaptureAwareParserOverride(base.parser);
+  const handler = createParseUserRecipeDraftHandler({
+    ...base,
+    getRecipeDraftLabAccess() {
+      return Promise.resolve({ allowed: true, role: options.role });
+    },
+    getRecipeMakerConsent(userId) {
+      calls.consentUsers.push(userId);
+      if (options.lookupThrows) {
+        return Promise.reject(new Error("synthetic consent lookup failure"));
+      }
+      return Promise.resolve({
+        noticeVersion: "2026-10-beta-1",
+        accepted: options.accepted ?? true,
+      });
+    },
+    parser: {
+      parseDraft(input) {
+        calls.parserInputs.push(input);
+        return parser.parseDraft(input);
+      },
+    },
+    captureStages(data) {
+      calls.captures.push(data);
+      if (options.captureThrows) {
+        return Promise.reject(new Error("synthetic capture failure"));
+      }
+      return Promise.resolve("synthetic-capture-id");
+    },
+  });
+  return { handler, calls };
+}
+
+for (const role of ["roaster_admin", "tester"] as const) {
+  Deno.test(`${role} without consent is rejected before parsing or capture`, async () => {
+    const { handler, calls } = createConsentTestHandler({
+      role,
+      accepted: false,
+    });
+    const response = await handler(requestWithCaptureStages(true));
+    assertEquals(response.status, 403, "Consent is required.");
+    assertEquals(await json(response), {
+      error: "consent_required",
+      notice_version: "2026-10-beta-1",
+      message: "Accept the recipe maker beta notice before creating recipes.",
+    }, "Return the current notice and consent message.");
+    assertEquals(
+      calls.consentUsers,
+      ["user-1"],
+      "Look up the authenticated user.",
+    );
+    assertEquals(calls.parserInputs.length, 0, "Do not parse.");
+    assertEquals(calls.captures.length, 0, "Do not capture.");
+  });
+}
+
+Deno.test("service_admin without consent bypasses the lookup", async () => {
+  const { handler, calls } = createConsentTestHandler({
+    role: "service_admin",
+    accepted: false,
+    lookupThrows: true,
+  });
+  const response = await handler(requestWithCaptureStages(undefined));
+  assertEquals(response.status, 200, "Service admins are exempt.");
+  assertEquals(calls.consentUsers.length, 0, "Never look up admin consent.");
+  assertEquals(calls.parserInputs.length, 1, "Parse once.");
+});
+
+Deno.test("consent lookup failure fails closed with 503", async () => {
+  const { handler, calls } = createConsentTestHandler({
+    role: "roaster_admin",
+    lookupThrows: true,
+  });
+  const response = await handler(requestWithCaptureStages(undefined));
+  assertEquals(response.status, 503, "Lookup failure is unavailable.");
+  assertEquals(await json(response), {
+    error: "Service Unavailable",
+    message: "Could not verify recipe maker consent.",
+  }, "Return the consent lookup failure message.");
+  assertEquals(calls.parserInputs.length, 0, "Do not parse.");
+  assertEquals(calls.captures.length, 0, "Do not capture.");
+});
+
+for (const captureFlag of [undefined, false]) {
+  Deno.test(`consented roaster_admin forces capture with capture_stages ${captureFlag}`, async () => {
+    const { handler, calls } = createConsentTestHandler({
+      role: "roaster_admin",
+    });
+    const response = await handler(requestWithCaptureStages(captureFlag));
+    const body = await json(response) as Record<string, unknown>;
+    assertEquals(response.status, 200, "Consented user may parse.");
+    assertEquals(calls.parserInputs.length, 1, "Parse once.");
+    assertEquals(
+      calls.parserInputs[0].captureStages,
+      true,
+      "Produce stage outputs.",
+    );
+    assertEquals(calls.captures.length, 1, "Capture once even without opt-in.");
+    assertEquals(
+      calls.captures[0].noticeVersion,
+      "2026-10-beta-1",
+      "Record consent version.",
+    );
+    assertEquals(
+      calls.captures[0].userId,
+      "user-1",
+      "Capture belongs to caller.",
+    );
+    assertEquals(
+      calls.captures[0].stageOutputs.extraction.length,
+      1,
+      "Keep raw stage output.",
+    );
+    assertEquals(body.capture_id, "synthetic-capture-id", "Echo capture id.");
+    assertEquals("stage_outputs" in body, false, "Keep stages internal.");
+  });
+}
+
+Deno.test("consented tester also forces capture", async () => {
+  const { handler, calls } = createConsentTestHandler({ role: "tester" });
+  const response = await handler(requestWithCaptureStages(false));
+  assertEquals(response.status, 200, "Consented tester may parse.");
+  assertEquals(calls.parserInputs[0].captureStages, true, "Produce stages.");
+  assertEquals(calls.captures.length, 1, "Capture tester parse.");
+  assertEquals(
+    calls.captures[0].noticeVersion,
+    "2026-10-beta-1",
+    "Record notice.",
+  );
+});
+
+for (const captureFlag of [true, undefined]) {
+  Deno.test(`service_admin capture remains opt-in with capture_stages ${captureFlag}`, async () => {
+    const { handler, calls } = createConsentTestHandler({
+      role: "service_admin",
+    });
+    const response = await handler(requestWithCaptureStages(captureFlag));
+    const body = await json(response) as Record<string, unknown>;
+    assertEquals(response.status, 200, "Admin may parse.");
+    assertEquals(calls.consentUsers.length, 0, "Admin bypasses consent.");
+    assertEquals(
+      calls.parserInputs[0].captureStages,
+      captureFlag ?? false,
+      "Forward admin opt-in.",
+    );
+    assertEquals(
+      calls.captures.length,
+      captureFlag ? 1 : 0,
+      "Capture only on opt-in.",
+    );
+    if (captureFlag) {
+      assertEquals(
+        calls.captures[0].noticeVersion,
+        null,
+        "Admin capture has no notice.",
+      );
+    }
+    assertEquals(
+      body.capture_id,
+      captureFlag ? "synthetic-capture-id" : null,
+      "Return capture id only for capture.",
+    );
+  });
+}
+
+Deno.test("required capture insert failure preserves successful parse", async () => {
+  const { handler, calls } = createConsentTestHandler({
+    role: "roaster_admin",
+    captureThrows: true,
+  });
+  const response = await handler(requestWithCaptureStages(undefined));
+  const body = await json(response) as Record<string, unknown>;
+  assertEquals(response.status, 200, "Required capture failure is non-fatal.");
+  assertEquals(calls.captures.length, 1, "Attempt required capture.");
+  assertEquals(body.capture_id, null, "No capture id on failure.");
+  assertEquals(
+    "stage_outputs" in body,
+    false,
+    "Stages stay internal on failure.",
+  );
+});
+
+for (const invalidBody of ["{", JSON.stringify({ text: 42 })]) {
+  Deno.test(`unconsented roaster_admin gets 403 before body validation: ${invalidBody}`, async () => {
+    const { handler, calls } = createConsentTestHandler({
+      role: "roaster_admin",
+      accepted: false,
+    });
+    const request = new Request("http://localhost", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer valid-token",
+        "Content-Type": "application/json",
+      },
+      body: invalidBody,
+    });
+    const response = await handler(request);
+    assertEquals(
+      response.status,
+      403,
+      "Consent gate precedes invalid body errors.",
+    );
+    assertEquals(
+      request.bodyUsed,
+      false,
+      "Do not read the body before consent.",
+    );
+    assertEquals(calls.parserInputs.length, 0, "Do not parse.");
+    assertEquals(calls.captures.length, 0, "Do not capture.");
+  });
+}
