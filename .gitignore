@@ -90,3 +90,16 @@ supabase/seed.sql.backup
 # Roaster candidate review batches (local working data)
 scripts/roaster-review/
 scripts/roasters-to-add-preview.html
+
+# Local working files, kept out of git for now (2026-10-15)
+.zcodeignore
+fika_cafes.html
+docs/jev-roaster-review-evaluation.md
+docs/jev-roaster-review-preflight.md
+docs/no-website-audit-2026-10-05.md
+docs/roaster-candidate-holds.md
+docs/translation-rules.md
+scripts/jev-review-eval.ts
+scripts/jev-review-eval_test.ts
+scripts/jev-review-snapshot.sql
+tests/roaster-holds/
