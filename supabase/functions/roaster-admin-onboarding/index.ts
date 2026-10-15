@@ -1,6 +1,13 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.42.5";
 import { getCorsHeaders } from "../_shared/cors.ts";
 import { createSecureResponse } from "../_shared/security-headers.ts";
+import {
+  buildWelcomeEmailHtml,
+  buildWelcomeEmailSubject,
+  buildWelcomeEmailText,
+  WELCOME_EMAIL_FROM,
+  type WelcomeEmailArgs,
+} from "./welcome-email.ts";
 
 type AssignableUserRecord = {
   user_id: string;
@@ -15,6 +22,7 @@ type RoasterProfileOwnerState = {
   id: string;
   slug: string;
   roaster_name: string;
+  description: string | null;
   admin_user_id: string | null;
   assigned_email: string | null;
 };
@@ -60,66 +68,6 @@ function isUuid(value: string) {
 
 function isEmail(value: string) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
-}
-
-function escapeHtml(value: string) {
-  return value
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
-}
-
-function buildWelcomeEmailHtml(args: {
-  email: string;
-  loginUrl: string;
-  roasterName: string;
-}) {
-  const roasterName = escapeHtml(args.roasterName);
-  const email = escapeHtml(args.email);
-  const loginUrl = escapeHtml(args.loginUrl);
-
-  return [
-    "<!doctype html>",
-    '<html lang="en">',
-    "<body style=\"margin:0;padding:0;background:#f7f1e8;color:#1c1917;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;\">",
-    '<div style="max-width:600px;margin:0 auto;padding:32px 20px;">',
-    '<div style="background:#fffdf8;border:1px solid #e7dbc9;border-radius:24px;padding:32px;">',
-    '<p style="margin:0 0 12px;font-size:12px;letter-spacing:0.18em;text-transform:uppercase;color:#78716c;">Timer.Coffee roaster access</p>',
-    `<h1 style="margin:0 0 16px;font-size:28px;line-height:1.2;color:#1c1917;">${roasterName} is ready on Timer.Coffee</h1>`,
-    `<p style="margin:0 0 16px;font-size:16px;line-height:1.6;">Your email address <strong>${email}</strong> has been linked to the roaster profile for <strong>${roasterName}</strong>.</p>`,
-    '<p style="margin:0 0 20px;font-size:16px;line-height:1.6;">Open the roaster admin, request a one-time passcode, and use this same email address to sign in.</p>',
-    `<p style="margin:0 0 24px;"><a href="${loginUrl}" style="display:inline-block;background:#1c1917;color:#ffffff;text-decoration:none;padding:14px 20px;border-radius:999px;font-weight:600;">Open roaster login</a></p>`,
-    '<ol style="margin:0 0 20px;padding-left:20px;font-size:15px;line-height:1.7;">',
-    `<li>Go to the roaster login page: <a href="${loginUrl}">${loginUrl}</a></li>`,
-    `<li>Enter <strong>${email}</strong>.</li>`,
-    "<li>Use the one-time passcode sent to your inbox.</li>",
-    "</ol>",
-    '<p style="margin:0;font-size:14px;line-height:1.6;color:#57534e;">If this access was set up by mistake, reply to the Timer.Coffee team and do not use the link above.</p>',
-    "</div>",
-    "</div>",
-    "</body>",
-    "</html>",
-  ].join("");
-}
-
-function buildWelcomeEmailText(args: {
-  email: string;
-  loginUrl: string;
-  roasterName: string;
-}) {
-  return [
-    `${args.roasterName} is ready on Timer.Coffee.`,
-    "",
-    `Your email address ${args.email} has been linked to the roaster profile for ${args.roasterName}.`,
-    "",
-    `1. Go to the roaster login page: ${args.loginUrl}`,
-    `2. Enter ${args.email}.`,
-    "3. Use the one-time passcode sent to your inbox.",
-    "",
-    "If this access was set up by mistake, reply to the Timer.Coffee team and do not use the link above.",
-  ].join("\n");
 }
 
 async function verifyAdminUser(accessToken: string): Promise<AdminCheckResult> {
@@ -206,7 +154,7 @@ async function readRoasterProfileOwnerState(
 ): Promise<RoasterProfileOwnerState | null> {
   const { data, error } = await supabaseAdmin
     .from("roaster_profiles")
-    .select("id, slug, roaster_name, admin_user_id")
+    .select("id, slug, roaster_name, description, admin_user_id")
     .eq("id", roasterProfileId)
     .maybeSingle();
 
@@ -297,11 +245,34 @@ async function assignRoasterOwner(
   }
 }
 
-async function sendWelcomeEmail(args: {
-  email: string;
-  loginUrl: string;
-  roasterName: string;
-}) {
+// Name from the open or approved claim this email made for the profile, if
+// any. Only personalises the welcome email, so a failed lookup is not fatal.
+async function lookupClaimantFullName(
+  roasterProfileId: string,
+  email: string,
+): Promise<string | null> {
+  const { data, error } = await supabaseAdmin
+    .schema("service")
+    .from("roaster_claim_requests")
+    .select("email, full_name")
+    .eq("roaster_profile_id", roasterProfileId)
+    .in("status", ["pending", "approved"])
+    .order("created_at", { ascending: false })
+    .limit(20);
+
+  if (error) {
+    console.warn(`Unable to look up claim request: ${error.message}`);
+    return null;
+  }
+
+  const claim = (data ?? []).find((row) =>
+    typeof row.email === "string" && row.email.trim().toLowerCase() === email
+  );
+
+  return claim?.full_name ?? null;
+}
+
+async function sendWelcomeEmail(args: WelcomeEmailArgs) {
   if (!resendApiKey) {
     return {
       sent: false,
@@ -317,9 +288,9 @@ async function sendWelcomeEmail(args: {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        from: "Timer.Coffee <support@timer.coffee>",
+        from: WELCOME_EMAIL_FROM,
         to: [args.email],
-        subject: `Your Timer.Coffee roaster access for ${args.roasterName}`,
+        subject: buildWelcomeEmailSubject(args),
         html: buildWelcomeEmailHtml(args),
         text: buildWelcomeEmailText(args),
       }),
@@ -532,6 +503,9 @@ Deno.serve(async (req) => {
       email,
       loginUrl,
       roasterName: profile.roaster_name,
+      slug: profile.slug,
+      claimantFullName: await lookupClaimantFullName(profile.id, email),
+      hasDescription: Boolean(profile.description?.trim()),
     });
 
     return jsonResponse(
