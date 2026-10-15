@@ -22,6 +22,7 @@ type WelcomeEmailContent = {
   features: Array<{ title: string; body: string }>;
   firstSteps: string;
   publicUrl: string;
+  guideUrl: string;
 };
 
 function escapeHtml(value: string) {
@@ -53,6 +54,11 @@ function buildContent(args: WelcomeEmailArgs): WelcomeEmailContent {
     new URL(args.loginUrl).origin,
   )
     .toString();
+  const guideUrl = new URL(
+    "/roaster-admin/guide/",
+    new URL(args.loginUrl).origin,
+  )
+    .toString();
   const hasNumericSlug = /^\d+$/.test(args.slug);
 
   const intro = args.claimantFullName
@@ -81,7 +87,7 @@ function buildContent(args: WelcomeEmailArgs): WelcomeEmailContent {
     features: [
       {
         title: "Edit your page",
-        body: "description, address, website and social links",
+        body: "description, website and social links",
       },
       { title: "Update your logo", body: "upload or replace it any time" },
       {
@@ -104,6 +110,7 @@ function buildContent(args: WelcomeEmailArgs): WelcomeEmailContent {
       joinSteps(steps)
     }. That's what people see first when they find you through the app.`,
     publicUrl,
+    guideUrl,
   };
 }
 
@@ -118,6 +125,7 @@ export function buildWelcomeEmailHtml(args: WelcomeEmailArgs) {
   const email = escapeHtml(args.email);
   const loginUrl = escapeHtml(args.loginUrl);
   const publicUrl = escapeHtml(content.publicUrl);
+  const guideUrl = escapeHtml(content.guideUrl);
   const p = 'style="margin:0 0 16px;font-size:16px;line-height:1.6;"';
 
   return [
@@ -141,7 +149,7 @@ export function buildWelcomeEmailHtml(args: WelcomeEmailArgs) {
     "</ul>",
     `<p ${p}>${escapeHtml(content.firstSteps)}</p>`,
     `<p ${p}>Your public page: <a href="${publicUrl}" style="color:#1c1917;">${publicUrl}</a></p>`,
-    `<p ${p}>If anything is unclear or doesn't work, just reply to this email.</p>`,
+    `<p ${p}>The <a href="${guideUrl}" style="color:#1c1917;">roaster admin guide</a> walks through each part. If anything is unclear or doesn't work, just reply to this email.</p>`,
     '<p style="margin:0 0 24px;font-size:16px;line-height:1.6;">Anton<br>Timer.Coffee</p>',
     "<p style=\"margin:0;font-size:13px;line-height:1.6;color:#78716c;\">If you didn't ask for this access, reply to this email and we'll remove it.</p>",
     "</div>",
@@ -169,6 +177,7 @@ export function buildWelcomeEmailText(args: WelcomeEmailArgs) {
     "",
     `Your public page: ${content.publicUrl}`,
     "",
+    `The roaster admin guide walks through each part: ${content.guideUrl}`,
     "If anything is unclear or doesn't work, just reply to this email.",
     "",
     "Anton",
