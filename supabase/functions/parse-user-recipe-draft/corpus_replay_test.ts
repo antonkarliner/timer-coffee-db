@@ -6,6 +6,14 @@
 //   deno test --no-lock --allow-read --allow-env \
 //     supabase/functions/parse-user-recipe-draft/corpus_replay_test.ts
 //
+// With RECIPE_CORPUS_LABELS set, optionally export only label indices,
+// outcomes and reasons (including orphans). Write permission is needed only
+// when RECIPE_CORPUS_OUTCOMES_OUT is set:
+//
+//   RECIPE_CORPUS_OUTCOMES_OUT=/path deno test --no-lock --allow-read \
+//     --allow-env --allow-write=/path \
+//     supabase/functions/parse-user-recipe-draft/corpus_replay_test.ts
+//
 // The plain scores are the production behaviour, which since plan 043
 // Phase 4 stage C includes the default coffee-vs-water rule.
 //
@@ -26,6 +34,7 @@ import {
   formatCorpusWhatIf,
   parseCorpusLabels,
   parseCorpusRows,
+  scoreCorpusLabelOutcomes,
   scoreCorpusLabels,
   summarizeCorpus,
 } from "./corpus_scoring.ts";
@@ -41,6 +50,7 @@ function readEnv(name: string): string | undefined {
 
 const corpusPath = readEnv("RECIPE_CORPUS_JSON");
 const labelsPath = readEnv("RECIPE_CORPUS_LABELS");
+const outcomesPath = readEnv("RECIPE_CORPUS_OUTCOMES_OUT");
 const whatIf = readEnv("RECIPE_CORPUS_WHATIF") === "1";
 
 Deno.test({
@@ -58,6 +68,12 @@ Deno.test({
           JSON.parse(Deno.readTextFileSync(labelsPath)),
         );
         lines.push(...formatCorpusAccuracy(scoreCorpusLabels(rows, labels)));
+        if (outcomesPath !== undefined) {
+          Deno.writeTextFileSync(
+            outcomesPath,
+            JSON.stringify(scoreCorpusLabelOutcomes(rows, labels)),
+          );
+        }
         if (whatIf) {
           lines.push(...formatCorpusWhatIf(rows, labels));
         }

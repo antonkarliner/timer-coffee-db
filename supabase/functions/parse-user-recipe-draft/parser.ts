@@ -1803,20 +1803,31 @@ function nearestKeywordDistance(args: {
   const after = normalizeKeywordText(
     args.description.slice(args.matchEnd, contextEnd),
   );
+  // Plan 043: the app converter got the same word-start rule in plan 080 Ph 3.
+  // Preserve the preceding character when the window cuts through a word.
+  const beforePrefix = normalizeKeywordText(
+    args.description.slice(0, contextStart),
+  );
 
   let best: number | null = null;
   for (const keyword of args.keywords) {
     let index = before.indexOf(keyword);
     while (index >= 0) {
       const distance = before.length - (index + keyword.length);
-      if (best === null || distance < best) {
+      if (
+        !/\p{L}$/u.test(index === 0 ? beforePrefix : before.slice(0, index)) &&
+        (best === null || distance < best)
+      ) {
         best = distance;
       }
       index = before.indexOf(keyword, index + 1);
     }
     index = after.indexOf(keyword);
     while (index >= 0) {
-      if (best === null || index < best) {
+      if (
+        (index === 0 || !/\p{L}$/u.test(after.slice(0, index))) &&
+        (best === null || index < best)
+      ) {
         best = index;
       }
       index = after.indexOf(keyword, index + 1);

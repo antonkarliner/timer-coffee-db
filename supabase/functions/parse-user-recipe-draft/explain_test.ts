@@ -72,6 +72,45 @@ Deno.test("explain: keyword branches and tie", () => {
   equal([tie.placeholder, tie.reason], [null, "keyword_tie"]);
 });
 
+Deno.test("explain: keywords must start a word (plan 043)", () => {
+  const cases = [
+    ["Grind coffee, then wait between 20 g", "keyword_coffee"],
+    ["Grind coffee, then leave unwet 20 g", "keyword_coffee"],
+    ["Subtotal 20 g", "brew_default_water"],
+    ["Background 20 g", "brew_default_water"],
+    ["Underground 20 g", "brew_default_water"],
+    ["Preach 20 g", "brew_default_water"],
+    ["Spour 20 g", "brew_default_water"],
+    ["20 g subtotal", "brew_default_water"],
+    ["20 g background", "brew_default_water"],
+    ["20 g pours", "keyword_water"],
+    ["Pouring 20 g", "keyword_water"],
+    ["Pre-wet 20 g", "keyword_water"],
+    ["Grounds 20 g", "keyword_coffee"],
+    ["Wetting 20 g", "keyword_water"],
+    ["Totally 20 g", "keyword_water"],
+    ["!pour 20 g", "keyword_water"],
+    ["2pour 20 g", "keyword_water"],
+    ["жpour 20 g", "brew_default_water"],
+    ["𐐀pour 20 g", "brew_default_water"],
+    ["20 g жpour", "brew_default_water"],
+    // Exactly 32 characters before the amount: a real window word start.
+    [`total${" ".repeat(27)}20 g`, "keyword_water"],
+    [`x total${" ".repeat(27)}20 g`, "keyword_water"],
+    // The same window starts inside a word; consult the full prefix.
+    [`xtotal${" ".repeat(27)}20 g`, "brew_default_water"],
+    [`étotal${" ".repeat(27)}20 g`, "brew_default_water"],
+    [`𐐀total${" ".repeat(27)}20 g`, "brew_default_water"],
+    // A rejected occurrence must not hide a later valid one.
+    ["20 g spour, pour", "keyword_water"],
+    ["pour, spour 20 g", "keyword_water"],
+  ];
+  equal(
+    cases.map(([text]) => only(text).reason),
+    cases.map(([, reason]) => reason),
+  );
+});
+
 Deno.test("explain: brew default, step-role and preparation ratio", () => {
   equal(only("Add 60 g.").reason, "brew_default_water");
   const stir = only("Add 30 g.", { stepRole: "stir" });

@@ -12,6 +12,7 @@ import {
   matchLabelSpan,
   parseCorpusLabels,
   parseCorpusRows,
+  scoreCorpusLabelOutcomes,
   scoreCorpusLabels,
   summarizeCorpus,
 } from "./corpus_scoring.ts";
@@ -129,6 +130,23 @@ const LABELS: CorpusLabel[] = [
 function scope(result: ReturnType<typeof scoreCorpusLabels>, name: string) {
   return result.scopes.get(name) ?? null;
 }
+
+Deno.test("scoring: label outcomes preserve order and export only safe fields", () => {
+  equal(scoreCorpusLabelOutcomes(ROWS, LABELS), [
+    { i: 0, outcome: "water", reason: "keyword_water" },
+    { i: 1, outcome: "water", reason: "keyword_water" },
+    { i: 2, outcome: "water", reason: "brew_default_water" },
+    { i: 3, outcome: "missed", reason: "missed" },
+    { i: 4, outcome: "coffee", reason: "exact_total_coffee" },
+    { i: 5, outcome: "missed", reason: "missed" },
+    { i: 6, outcome: "literal", reason: "skipped_below_floor" },
+    { i: 7, outcome: "orphan", reason: "orphan" },
+    { i: 8, outcome: "orphan", reason: "orphan" },
+    { i: 9, outcome: "orphan", reason: "orphan" },
+    { i: 10, outcome: "orphan", reason: "orphan" },
+  ]);
+  equal(scoreCorpusLabelOutcomes(ROWS, []), []);
+});
 
 Deno.test("scoring: overall, orphan and per-scope counts", () => {
   const result = scoreCorpusLabels(ROWS, LABELS);

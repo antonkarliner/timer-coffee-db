@@ -305,6 +305,20 @@ export function scoreCorpusLabels(
   );
 }
 
+// Label order only: never export text, amounts, row ids or spans.
+export function scoreCorpusLabelOutcomes(
+  rows: CorpusRow[],
+  labels: CorpusLabel[],
+): Array<{ i: number; outcome: CorpusOutcome | "orphan"; reason: string }> {
+  return scoreEachLabel(rows, labels, explainNumericValueConversion).map(
+    (entry, i) => ({
+      i,
+      outcome: entry?.outcome ?? "orphan",
+      reason: entry?.reason ?? "orphan",
+    }),
+  );
+}
+
 function metricLine(
   scope: string,
   name: string,
