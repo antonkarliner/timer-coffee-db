@@ -145,3 +145,38 @@ Deno.test("returns tester access role", async () => {
     "Expected tester response body.",
   );
 });
+
+Deno.test("rejects connected-app tokens before the access lookup", async () => {
+  // Payload: {"sub":"user-id","client_id":"oauth-client"}
+  const connectedAppToken =
+    "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyLWlkIiwiY2xpZW50X2lkIjoib2F1dGgtY2xpZW50In0.signature";
+  const handler = createCheckRecipeDraftLabAccessHandler({
+    ...createHandlerOverrides(),
+    getUserFromToken() {
+      return Promise.resolve({ id: "user-1" });
+    },
+    getRecipeDraftLabAccess() {
+      throw new Error("Access lookup must not run for connected apps.");
+    },
+  });
+  const response = await handler(
+    new Request("http://localhost", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${connectedAppToken}`,
+      },
+    }),
+  );
+  const body = await json(response);
+
+  assertEquals(response.status, 403, "Expected 403 for connected apps.");
+  assertEquals(
+    body,
+    {
+      allowed: false,
+      error: "connected_app_forbidden",
+      message: "Connected apps can't use this function.",
+    },
+    "Expected connected-app refusal body.",
+  );
+});

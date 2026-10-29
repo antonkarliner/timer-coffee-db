@@ -148,6 +148,24 @@ Deno.test("auth errors fail closed even with a user result", async () => {
   assertEquals(caller.ok, false);
 });
 
+Deno.test("caller resolution refuses connected-app tokens", async () => {
+  // Payload: {"sub":"caller","client_id":"oauth-client"}
+  const token =
+    "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJjYWxsZXIiLCJjbGllbnRfaWQiOiJvYXV0aC1jbGllbnQifQ.sig";
+  const caller = await resolveLabelParseCaller(
+    new Request("https://local", {
+      headers: { Authorization: `Bearer ${token}` },
+    }),
+    { getUser },
+  );
+  assertEquals(caller, {
+    ok: false,
+    status: 403,
+    error: "Forbidden",
+    message: "Connected apps can't use this function.",
+  });
+});
+
 export function quotaDeps(overrides: Partial<QuotaDeps> = {}): QuotaDeps {
   return {
     isProUser: () => Promise.resolve(false),

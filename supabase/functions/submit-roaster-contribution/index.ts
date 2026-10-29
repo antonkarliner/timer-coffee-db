@@ -18,6 +18,7 @@
 // ────────────────────────────────────────────────────────────────
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.42.5";
 import { getCorsHeaders } from "../_shared/cors.ts";
+import { connectedAppForbiddenResponse, isConnectedAppToken } from "../_shared/connected-app.ts";
 import {
   checkUserRateLimit,
   createRateLimitResponse,
@@ -68,6 +69,9 @@ Deno.serve(async (req) => {
   }
   if (!userId) {
     return json({ error: "Authentication required" }, 401, cors);
+  }
+  if (isConnectedAppToken(token)) {
+    return connectedAppForbiddenResponse(cors);
   }
 
   // 2) Rate limit per user.

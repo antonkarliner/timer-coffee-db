@@ -1,6 +1,7 @@
 import { serve } from "https://deno.land/std@0.223.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.42.5";
 import { corsHeaders } from "../_shared/cors.ts";
+import { connectedAppForbiddenResponse, isConnectedAppToken } from "../_shared/connected-app.ts";
 const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? '';
 const supabaseServiceRoleKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '';
 const supabaseAnonKey = Deno.env.get('SUPABASE_ANON_KEY') ?? '';
@@ -121,6 +122,9 @@ serve(async (req)=>{
           "Content-Type": "application/json"
         }
       });
+    }
+    if (isConnectedAppToken(userJwt)) {
+      return connectedAppForbiddenResponse(corsHeaders);
     }
     const userId = userData.user.id;
     const appMetadata = userData.user.app_metadata ?? {};

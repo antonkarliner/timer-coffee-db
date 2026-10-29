@@ -11,6 +11,7 @@ import {
   extractRepresentativeColorHexFromRgba,
 } from "../_shared/roaster-color.ts";
 import { getCorsHeaders } from "../_shared/cors.ts";
+import { isConnectedAppToken } from "../_shared/connected-app.ts";
 import { createSecureResponse } from "../_shared/security-headers.ts";
 import {
   generateLogoVariants,
@@ -315,6 +316,9 @@ Deno.serve(async (req) => {
 
   try {
     const authContext = await authenticateUser(req);
+    if (isConnectedAppToken(authContext.accessToken)) {
+      return jsonResponse({ error: "Connected apps can't use this function" }, 403, cors);
+    }
     const ownedProfile = await getOwnedProfile(authContext.user.id);
 
     if (req.method === "DELETE") {

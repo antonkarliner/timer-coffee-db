@@ -2,6 +2,11 @@ import { serve } from "https://deno.land/std@0.223.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.42.5";
 import { validateAudienceFilter } from "../_shared/audience-filter.ts";
 import { getCorsHeaders } from "../_shared/cors.ts";
+import {
+  CONNECTED_APP_FORBIDDEN_ERROR,
+  CONNECTED_APP_FORBIDDEN_MESSAGE,
+  isConnectedAppToken,
+} from "../_shared/connected-app.ts";
 import { createSecureResponse } from "../_shared/security-headers.ts";
 import {
   ErrorCategory,
@@ -87,6 +92,16 @@ async function requireAdmin(
     return jsonResponse(
       { error: "Unauthorized", message: authError?.message ?? "Invalid token" },
       401,
+      cors,
+    );
+  }
+  if (isConnectedAppToken(token)) {
+    return jsonResponse(
+      {
+        error: CONNECTED_APP_FORBIDDEN_ERROR,
+        message: CONNECTED_APP_FORBIDDEN_MESSAGE,
+      },
+      403,
       cors,
     );
   }

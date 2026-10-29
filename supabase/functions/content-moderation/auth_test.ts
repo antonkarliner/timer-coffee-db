@@ -81,3 +81,16 @@ Deno.test("returns only the verified Supabase user id", async () => {
 
   assertEquals(result, { ok: true, userId: "verified-user-id" });
 });
+
+Deno.test("refuses a verified connected-app token", async () => {
+  // Payload: {"sub":"user-id","client_id":"oauth-client"}
+  const result = await resolveVerifiedUser(
+    "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyLWlkIiwiY2xpZW50X2lkIjoib2F1dGgtY2xpZW50In0.signature",
+    verifierFor({
+      data: { user: { id: "user-id" } },
+      error: null,
+    }),
+  );
+
+  assertEquals(result, { ok: false, reason: "connected_app" });
+});

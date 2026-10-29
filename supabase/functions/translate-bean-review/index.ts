@@ -2,6 +2,10 @@ import { serve } from "https://deno.land/std@0.223.0/http/server.ts";
 import OpenAI from "https://esm.sh/openai";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.42.5";
 import { getCorsHeaders } from "../_shared/cors.ts";
+import {
+  connectedAppForbiddenResponse,
+  isConnectedAppToken,
+} from "../_shared/connected-app.ts";
 import { OPENAI_MODELS } from "../_shared/ai-models.ts";
 import { baseLang } from "./locale-utils.ts";
 
@@ -227,6 +231,9 @@ serve(async (req) => {
   if (token) {
     const { data: userData } = await supabase.auth.getUser(token);
     callerId = userData?.user?.id ?? null;
+  }
+  if (callerId && isConnectedAppToken(token)) {
+    return connectedAppForbiddenResponse(cors);
   }
 
   let body: {

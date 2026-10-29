@@ -1,6 +1,7 @@
 import { serve } from "https://deno.land/std@0.223.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.42.5";
 import { resolveCaller } from "../_shared/caller-auth.ts";
+import { isConnectedAppToken } from "../_shared/connected-app.ts";
 import { getCorsHeaders } from "../_shared/cors.ts";
 import { logError, logInfo, logWarning } from "../_shared/monitoring.ts";
 import { createUpdateIdAfterSigninHandler } from "./handler.ts";
@@ -19,6 +20,10 @@ const handler = createUpdateIdAfterSigninHandler({
   resolveCaller: (req) => resolveCaller(req, supabase),
   getSourceUser: async (token) => {
     const { data, error } = await supabase.auth.getUser(token);
+    // A connected-app token is not valid proof of the source account.
+    if (!error && data.user && isConnectedAppToken(token)) {
+      return { data: null, error: { status: 403 } };
+    }
     return { data: data.user, error };
   },
   getLedger: async (source, destination) => {

@@ -35,6 +35,7 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.42.5";
 import JSZip from "https://esm.sh/jszip@3.10.1";
 import { getCorsHeaders } from "../_shared/cors.ts";
+import { isConnectedAppToken } from "../_shared/connected-app.ts";
 import { createSecureResponse } from "../_shared/security-headers.ts";
 import {
   checkIpRateLimit,
@@ -194,6 +195,9 @@ async function resolveUserId(
   const { data, error } = await supabaseUser.auth.getUser(accessToken);
   if (error || !data.user) {
     return { errorResponse: { status: 401, error: "Unauthorized - invalid or expired token" } };
+  }
+  if (isConnectedAppToken(accessToken)) {
+    return { errorResponse: { status: 403, error: "Connected apps can't use this function" } };
   }
   return { userId: data.user.id };
 }

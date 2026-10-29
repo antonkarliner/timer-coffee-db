@@ -1,5 +1,6 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.42.5";
 import { getCorsHeaders } from "../_shared/cors.ts";
+import { isConnectedAppToken } from "../_shared/connected-app.ts";
 import { createSecureResponse } from "../_shared/security-headers.ts";
 import {
   buildWelcomeEmailHtml,
@@ -96,6 +97,14 @@ async function verifyAdminUser(accessToken: string): Promise<AdminCheckResult> {
       ok: false as const,
       status: 401,
       error: "Unauthorized - Invalid or expired token",
+    };
+  }
+
+  if (isConnectedAppToken(accessToken)) {
+    return {
+      ok: false as const,
+      status: 403,
+      error: "Connected apps can't use this function",
     };
   }
 
