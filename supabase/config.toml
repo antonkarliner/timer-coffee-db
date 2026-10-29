@@ -285,3 +285,12 @@ verify_jwt = false
 [functions.check-admin-user]
 # Matches production: the function verifies the caller's token itself.
 verify_jwt = false
+
+[functions.roaster-link-scan]
+# Invoked only by pg_cron (public.roaster_link_scan_cron) via pg_net, which
+# sends the service key as `Authorization: Bearer <legacy JWT>` or in the
+# `apikey` header (once `edge_functions_api_key` is provisioned in Vault).
+# Same as roaster-postprocess-worker: platform JWT verification rejects the
+# `sb_secret_...` form, so the handler validates the service credential itself
+# via _shared/service-role-auth.ts and refuses everything else.
+verify_jwt = false

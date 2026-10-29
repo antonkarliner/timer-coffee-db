@@ -6,6 +6,7 @@ import {
 import {
   classifyRoasterUrl,
   isInstagramHost,
+  isSocialPlatformHost,
   normalizeInstagramUrl,
   type RoasterUrlClassification,
   type RoasterUrlConflict,
@@ -591,6 +592,34 @@ Deno.test("isInstagramHost matches instagram.com/instagr.am and subdomains exact
   for (const [host, expected] of instagramHostCases) {
     assertEquals(
       isInstagramHost(host),
+      expected,
+      `host: ${JSON.stringify(host)}`,
+    );
+  }
+});
+
+const socialPlatformHostCases: [string, boolean][] = [
+  ["www.instagram.com", true],
+  ["instagr.am", true],
+  ["facebook.com", true],
+  ["m.facebook.com", true],
+  ["fb.com", true],
+  ["x.com", true],
+  ["mobile.twitter.com", true],
+  ["www.tiktok.com", true],
+  ["youtu.be", true],
+  ["t.me", true],
+  ["WWW.LINKEDIN.COM", true],
+  ["notfacebook.com", false],
+  ["facebook.com.evil.example", false],
+  ["example.com", false],
+  ["", false],
+];
+
+Deno.test("isSocialPlatformHost matches Instagram and the other known networks exactly", () => {
+  for (const [host, expected] of socialPlatformHostCases) {
+    assertEquals(
+      isSocialPlatformHost(host),
       expected,
       `host: ${JSON.stringify(host)}`,
     );
