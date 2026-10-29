@@ -281,3 +281,7 @@ verify_jwt = false
 [functions.roaster-admin-onboarding]
 # Matches production: the function verifies the caller itself.
 verify_jwt = false
+
+[functions.check-admin-user]
+# Matches production: the function verifies the caller's token itself.
+verify_jwt = false
