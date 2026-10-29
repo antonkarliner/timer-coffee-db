@@ -2,6 +2,11 @@
 // plan 079 (timer-coffee-plans) — delete this function 6 weeks after the app
 // release that removes the toggle, or when calls fall below 5/month.
 import { z } from "https://deno.land/x/zod@v3.23.8/mod.ts";
+import {
+  CONNECTED_APP_FORBIDDEN_ERROR,
+  CONNECTED_APP_FORBIDDEN_MESSAGE,
+  isConnectedAppToken,
+} from "../_shared/connected-app.ts";
 
 type AuthenticatedUser = {
   id: string;
@@ -109,6 +114,13 @@ export function createVerifyUserRecipeDraftHandler(
       return jsonResponse(deps, cors, 401, {
         error: "Unauthorized",
         message: "Could not resolve the authenticated user.",
+      });
+    }
+
+    if (isConnectedAppToken(token)) {
+      return jsonResponse(deps, cors, 403, {
+        error: CONNECTED_APP_FORBIDDEN_ERROR,
+        message: CONNECTED_APP_FORBIDDEN_MESSAGE,
       });
     }
 

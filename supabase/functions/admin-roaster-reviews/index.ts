@@ -1,4 +1,5 @@
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.42.5';
+import { connectedAppForbiddenResponse, isConnectedAppToken } from '../_shared/connected-app.ts';
 
 const supabaseUrl = Deno.env.get('SUPABASE_URL');
 const supabaseServiceRoleKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY');
@@ -89,6 +90,9 @@ Deno.serve(async (req) => {
       status: 401,
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     });
+  }
+  if (isConnectedAppToken(token)) {
+    return connectedAppForbiddenResponse(corsHeaders);
   }
 
   const { data: adminData, error: adminError } = await supabase

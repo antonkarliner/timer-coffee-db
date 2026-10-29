@@ -188,6 +188,23 @@ Deno.test("rejects anonymous user", async () => {
   });
 });
 
+Deno.test("rejects connected-app tokens", async () => {
+  // Payload: {"sub":"user-id","client_id":"oauth-client"}
+  const connectedAppToken =
+    "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyLWlkIiwiY2xpZW50X2lkIjoib2F1dGgtY2xpZW50In0.signature";
+  const deps = fakeDeps();
+  deps.getUserFromToken = () =>
+    Promise.resolve({ id: "test-user", isAnonymous: false });
+  const response = await createVerifyUserRecipeDraftHandler(deps)(
+    request({}, `Bearer ${connectedAppToken}`),
+  );
+  assertEquals(response.status, 403);
+  assertEquals(await response.json(), {
+    error: "connected_app_forbidden",
+    message: "Connected apps can't use this function.",
+  });
+});
+
 Deno.test("rejects invalid JSON", async () => {
   const response = await createVerifyUserRecipeDraftHandler(fakeDeps())(
     request("{", "Bearer valid", "POST", true),

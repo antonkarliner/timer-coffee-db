@@ -99,6 +99,14 @@ export async function resolveLabelParseCaller(req: Request, deps: CallerDeps) {
       }
       return caller;
     }
+    if (caller.status === 403) {
+      return {
+        ok: false as const,
+        status: 403 as const,
+        error: "Forbidden",
+        message: "Connected apps can't use this function.",
+      };
+    }
   } catch { /* Auth lookup failures deny access. */ }
   return {
     ok: false as const,

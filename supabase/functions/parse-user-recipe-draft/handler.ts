@@ -135,6 +135,10 @@ export function createParseUserRecipeDraftHandler(
       });
     }
 
+    // Connected-app (OAuth client) tokens are deliberately accepted: the
+    // website's agent "draft recipe from text" tool forwards the agent's
+    // token here. Lab access below still applies.
+
     const access = await deps.getRecipeDraftLabAccess(user.id);
     if (!access.allowed) {
       return jsonResponse(deps, cors, 403, {

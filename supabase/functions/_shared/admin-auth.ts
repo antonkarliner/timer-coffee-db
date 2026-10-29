@@ -1,5 +1,6 @@
 import type { SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2.42.5";
 import { extractBearerToken } from "./caller-auth.ts";
+import { isConnectedAppToken } from "./connected-app.ts";
 import { authorizeServiceRequest } from "./service-role-auth.ts";
 
 export type PrivilegedCaller =
@@ -35,6 +36,13 @@ export async function authorizeAdminOrService(
   }
   if (!user) {
     return { ok: false, status: 401, error: "Invalid or expired token" };
+  }
+  if (isConnectedAppToken(token)) {
+    return {
+      ok: false,
+      status: 403,
+      error: "Connected apps can't use this function",
+    };
   }
 
   let admin;

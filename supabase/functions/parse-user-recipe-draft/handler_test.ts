@@ -296,6 +296,39 @@ Deno.test("returns parsed draft for valid roaster admin requests", async () => {
   );
 });
 
+Deno.test("accepts connected-app tokens (website agent tool)", async () => {
+  // Payload: {"sub":"user-id","client_id":"oauth-client"}
+  const connectedAppToken =
+    "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyLWlkIiwiY2xpZW50X2lkIjoib2F1dGgtY2xpZW50In0.signature";
+  const handler = createParseUserRecipeDraftHandler({
+    ...createHandlerOverrides(),
+    getUserFromToken(token: string) {
+      return Promise.resolve(
+        token === connectedAppToken ? { id: "user-1" } : null,
+      );
+    },
+  });
+  const response = await handler(
+    new Request("http://localhost", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${connectedAppToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        text: "recipe",
+        brewing_method_id: "v60",
+      }),
+    }),
+  );
+
+  assertEquals(
+    response.status,
+    200,
+    "Expected connected-app tokens to be allowed.",
+  );
+});
+
 // Task 1: parseUserRecipeDraftRequestSchema now accepts an optional `mode`,
 // and the handler must forward it to parser.parseDraft unchanged so callers
 // (e.g. a future verify-mode consumer of this function) can reach the

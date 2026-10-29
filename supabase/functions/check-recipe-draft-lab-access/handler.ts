@@ -1,3 +1,8 @@
+import {
+  CONNECTED_APP_FORBIDDEN_ERROR,
+  CONNECTED_APP_FORBIDDEN_MESSAGE,
+  isConnectedAppToken,
+} from "../_shared/connected-app.ts";
 import type { RecipeDraftLabAccessResult } from "../_shared/recipe-draft-lab-access.ts";
 
 type AuthenticatedUser = {
@@ -72,6 +77,14 @@ export function createCheckRecipeDraftLabAccessHandler(
         allowed: false,
         error: "Unauthorized",
         message: "Could not resolve the authenticated user.",
+      });
+    }
+
+    if (isConnectedAppToken(token)) {
+      return jsonResponse(deps, cors, 403, {
+        allowed: false,
+        error: CONNECTED_APP_FORBIDDEN_ERROR,
+        message: CONNECTED_APP_FORBIDDEN_MESSAGE,
       });
     }
 

@@ -1,3 +1,5 @@
+import { isConnectedAppToken } from "../_shared/connected-app.ts";
+
 export interface VerifiedAuthUser {
   id: string;
 }
@@ -13,7 +15,10 @@ export type VerifiedUserResult =
   | { ok: true; userId: string }
   | {
     ok: false;
-    reason: "missing_or_invalid_header" | "verification_failed";
+    reason:
+      | "missing_or_invalid_header"
+      | "verification_failed"
+      | "connected_app";
   };
 
 export async function resolveVerifiedUser(
@@ -35,6 +40,9 @@ export async function resolveVerifiedUser(
 
     if (error || typeof userId !== "string" || userId.length === 0) {
       return { ok: false, reason: "verification_failed" };
+    }
+    if (isConnectedAppToken(token)) {
+      return { ok: false, reason: "connected_app" };
     }
 
     return { ok: true, userId };

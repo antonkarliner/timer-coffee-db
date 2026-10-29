@@ -1,5 +1,6 @@
 import { serve } from "https://deno.land/std@0.223.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.42.5";
+import { CONNECTED_APP_FORBIDDEN_ERROR, CONNECTED_APP_FORBIDDEN_MESSAGE, isConnectedAppToken } from "../_shared/connected-app.ts";
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
@@ -76,6 +77,7 @@ function toAction(pathname, body) {
   if (pathname.endsWith("/v1/live-activities/sessions/status")) return "status";
   return "";
 }
+const CONNECTED_APP_CALLER = Symbol("connected-app");
 async function getAuthenticatedUserId(req) {
   const authHeader = req.headers.get("Authorization") ?? "";
   if (!authHeader.startsWith("Bearer ")) return null;
@@ -83,6 +85,7 @@ async function getAuthenticatedUserId(req) {
   if (!token) return null;
   const { data, error } = await supabase.auth.getUser(token);
   if (error || !data.user) return null;
+  if (isConnectedAppToken(token)) return CONNECTED_APP_CALLER;
   return data.user.id;
 }
 function parseBrewStartDate(value) {
@@ -545,6 +548,12 @@ serve(async (req)=>{
   if (!userId) {
     return jsonResponse(401, {
       error: "Unauthorized"
+    });
+  }
+  if (userId === CONNECTED_APP_CALLER) {
+    return jsonResponse(403, {
+      error: CONNECTED_APP_FORBIDDEN_ERROR,
+      message: CONNECTED_APP_FORBIDDEN_MESSAGE
     });
   }
   let body = {};

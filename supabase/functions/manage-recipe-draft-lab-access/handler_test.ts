@@ -276,3 +276,25 @@ Deno.test("returns 404 when deleting missing tester access", async () => {
   assertEquals(response.status, 404);
   assertEquals(body.message, "Tester access row was not found");
 });
+
+Deno.test("refuses connected-app tokens before the admin check", async () => {
+  // Payload: {"sub":"user-id","client_id":"oauth-client"}
+  const connectedAppToken =
+    "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyLWlkIiwiY2xpZW50X2lkIjoib2F1dGgtY2xpZW50In0.signature";
+  const handler = createManageRecipeDraftLabAccessHandler(
+    createDeps({
+      isServiceAdmin: () => {
+        throw new Error("Admin check must not run for connected apps.");
+      },
+    }),
+  );
+  const response = await handler(
+    postRequest({ action: "list" }, connectedAppToken),
+  );
+
+  assertEquals(response.status, 403);
+  assertEquals(await response.json(), {
+    error: "connected_app_forbidden",
+    message: "Connected apps can't use this function.",
+  });
+});

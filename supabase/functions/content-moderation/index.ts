@@ -1,6 +1,7 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.42.5";
 import { serve } from "https://deno.land/std@0.223.0/http/server.ts";
 import { getCorsHeaders } from "../_shared/cors.ts";
+import { connectedAppForbiddenResponse } from "../_shared/connected-app.ts";
 import { OPENAI_SPECIALIZED_MODELS } from "../_shared/ai-models.ts";
 import {
   createModerationClient,
@@ -148,6 +149,9 @@ serve(async (req)=>{
     req.headers.get("Authorization"),
     supabaseAdmin.auth,
   );
+  if (!authResult.ok && authResult.reason === "connected_app") {
+    return connectedAppForbiddenResponse(cors);
+  }
   if (!authResult.ok && authResult.reason === "missing_or_invalid_header") {
     return new Response("Unauthorized: Missing or invalid Authorization header", {
       status: 401,

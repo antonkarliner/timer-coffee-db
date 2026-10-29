@@ -16,7 +16,7 @@ export type Migration = {
 export type UpdateIdAfterSigninDeps = {
   resolveCaller(req: Request): Promise<
     | { ok: true; user: Caller }
-    | { ok: false; status: 401; error: string }
+    | { ok: false; status: 401 | 403; error: string }
   >;
   getSourceUser(token: string): Promise<Result<SourceUser | null>>;
   getLedger(source: string, destination: string): Promise<

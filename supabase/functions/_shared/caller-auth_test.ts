@@ -96,3 +96,66 @@ Deno.test("resolveCaller resolves an anonymous user", async () => {
     user: { id: "anonymous-user", isAnonymous: true },
   });
 });
+
+function jwt(payload: Record<string, unknown>): string {
+  const encode = (value: unknown) =>
+    btoa(JSON.stringify(value)).replace(/\+/g, "-").replace(/\//g, "_")
+      .replace(/=+$/, "");
+  return `${encode({ alg: "HS256" })}.${encode(payload)}.sig`;
+}
+
+const connectedAppJwt = jwt({ sub: "user-id", client_id: "oauth-client" });
+
+Deno.test("resolveCaller accepts an ordinary user JWT", async () => {
+  const client = clientWithGetUser(async () => ({
+    data: { user: { id: "user-id", is_anonymous: false } },
+    error: null,
+  }));
+  assertEquals(
+    await resolveCaller(request(`Bearer ${jwt({ sub: "user-id" })}`), client),
+    { ok: true, user: { id: "user-id", isAnonymous: false } },
+  );
+});
+
+Deno.test("resolveCaller refuses a connected-app token by default", async () => {
+  const client = clientWithGetUser(async () => ({
+    data: { user: { id: "user-id", is_anonymous: false } },
+    error: null,
+  }));
+  assertEquals(
+    await resolveCaller(request(`Bearer ${connectedAppJwt}`), client),
+    {
+      ok: false,
+      status: 403,
+      error: "Connected apps can't use this function",
+    },
+  );
+});
+
+Deno.test("resolveCaller still reports an invalid connected-app token as 401", async () => {
+  const client = clientWithGetUser(async () => ({
+    data: { user: null },
+    error: new Error("invalid token"),
+  }));
+  assertEquals(
+    await resolveCaller(request(`Bearer ${connectedAppJwt}`), client),
+    {
+      ok: false,
+      status: 401,
+      error: "Invalid or expired token",
+    },
+  );
+});
+
+Deno.test("resolveCaller accepts a connected-app token when opted in", async () => {
+  const client = clientWithGetUser(async () => ({
+    data: { user: { id: "user-id", is_anonymous: false } },
+    error: null,
+  }));
+  assertEquals(
+    await resolveCaller(request(`Bearer ${connectedAppJwt}`), client, {
+      allowConnectedApps: true,
+    }),
+    { ok: true, user: { id: "user-id", isAnonymous: false } },
+  );
+});

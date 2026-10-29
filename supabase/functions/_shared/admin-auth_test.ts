@@ -79,6 +79,20 @@ const cases: Array<{
     expected: { ok: false, status: 403, error: "Forbidden" },
   },
   {
+    // Payload: {"sub":"user-id","client_id":"oauth-client"}; the admin role
+    // lookup would succeed, so only the connected-app guard can refuse it.
+    name: "connected-app token for an admin user",
+    headers: {
+      authorization:
+        "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyLWlkIiwiY2xpZW50X2lkIjoib2F1dGgtY2xpZW50In0.signature",
+    },
+    expected: {
+      ok: false,
+      status: 403,
+      error: "Connected apps can't use this function",
+    },
+  },
+  {
     name: "admin session with anon apikey",
     headers: { authorization: "Bearer user-token", apikey: "anon-key" },
     expected: { ok: true, kind: "admin", userId: "user-id" },
@@ -137,7 +151,9 @@ for (const test of cases) {
     ) {
       assertEquals([userCalls, adminCalls], [0, 0]);
     }
-    if (test.user === null || test.throwUser) assertEquals(adminCalls, 0);
+    if (
+      test.user === null || test.throwUser || test.name.startsWith("connected")
+    ) assertEquals(adminCalls, 0);
   });
 }
 

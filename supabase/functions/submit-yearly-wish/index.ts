@@ -1,6 +1,7 @@
 import { serve } from "https://deno.land/std@0.223.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.42.5";
 import { getCorsHeaders } from "../_shared/cors.ts";
+import { CONNECTED_APP_FORBIDDEN_ERROR, CONNECTED_APP_FORBIDDEN_MESSAGE } from "../_shared/connected-app.ts";
 import { createModerationClient } from "../_shared/moderation.ts";
 import { jevAsk, prewarmJevConnection } from "../_shared/jev-client.ts";
 import { getEnvBoolean, getEnvNumber } from "../_shared/env-validation.ts";
@@ -88,6 +89,12 @@ serve(async (req)=>{
     req.headers.get("Authorization"),
     supabaseAdmin.auth,
   );
+  if (!authResult.ok && authResult.reason === "connected_app") {
+    return jsonResponse({
+      error: CONNECTED_APP_FORBIDDEN_ERROR,
+      message: CONNECTED_APP_FORBIDDEN_MESSAGE
+    }, 403, cors);
+  }
   if (!authResult.ok && authResult.reason === "missing_or_invalid_header") {
     return jsonResponse({
       error: "Unauthorized",

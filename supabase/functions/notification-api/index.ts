@@ -5,6 +5,7 @@ import { serve } from "https://deno.land/std@0.223.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.42.5";
 import { z } from "https://deno.land/x/zod@v3.23.8/mod.ts";
 import { getCorsHeaders } from "../_shared/cors.ts";
+import { CONNECTED_APP_FORBIDDEN_ERROR, CONNECTED_APP_FORBIDDEN_MESSAGE, isConnectedAppToken } from "../_shared/connected-app.ts";
 import { createSecureResponse } from "../_shared/security-headers.ts";
 import { checkUserRateLimit, createRateLimitResponse } from "../_shared/rate-limiter.ts";
 import { validateAndLogEnvironment, ENVIRONMENT_CONFIG } from "../_shared/env-validation.ts";
@@ -151,6 +152,20 @@ serve(async (req)=>{
     // Apply authentication and rate limiting for all other endpoints
     const authContext = await getAuthContext(req.headers.get("authorization"));
     const { method } = req;
+    if (authContext.connectedApp) {
+      completePerformanceTracking(performanceTracker, req, 403);
+      logApiResponse(requestId, 403, Date.now() - performanceTracker.startTime, undefined, correlationId);
+      return createSecureResponse(JSON.stringify({
+        error: CONNECTED_APP_FORBIDDEN_ERROR,
+        message: CONNECTED_APP_FORBIDDEN_MESSAGE
+      }), {
+        status: 403,
+        headers: {
+          ...cors,
+          "Content-Type": "application/json"
+        }
+      });
+    }
     if (!authContext.user) {
       completePerformanceTracking(performanceTracker, req, 401);
       logApiResponse(requestId, 401, Date.now() - performanceTracker.startTime, undefined, correlationId);
@@ -512,6 +527,13 @@ async function getAuthContext(authHeader) {
     return {
       user: null,
       isAdmin: false
+    };
+  }
+  if (isConnectedAppToken(token)) {
+    return {
+      user: null,
+      isAdmin: false,
+      connectedApp: true
     };
   }
   const isAdmin = await checkAdmin(data.user.id);

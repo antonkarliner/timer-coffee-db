@@ -1,6 +1,7 @@
 import { serve } from "https://deno.land/std@0.223.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.42.5";
 import { corsHeaders } from "../_shared/cors.ts";
+import { connectedAppForbiddenResponse, isConnectedAppToken } from "../_shared/connected-app.ts";
 import { securityHeaders } from "../_shared/security-headers.ts";
 import { checkUserRateLimit, checkIpRateLimit } from "../_shared/rate-limiter.ts";
 const supabaseUrl = Deno.env.get("SUPABASE_URL");
@@ -46,6 +47,12 @@ serve(async (req)=>{
       const token = authHeader.replace("Bearer ", "");
       const { data } = await supabase.auth.getUser(token);
       userId = data?.user?.id || null;
+      if (userId && isConnectedAppToken(token)) {
+        return connectedAppForbiddenResponse({
+          ...corsHeaders,
+          ...securityHeaders
+        });
+      }
     }
     // Use IP-based rate limiting for anonymous requests
     const clientIp = req.headers.get("x-forwarded-for") || req.headers.get("x-real-ip") || "unknown";

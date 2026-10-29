@@ -410,6 +410,21 @@ Deno.test("unresolved destination caller rejects", async () => {
   });
   assertEquals(f.calls, ["caller"]);
 });
+Deno.test("connected-app destination caller rejects", async () => {
+  const f = fixture({
+    resolveCaller: () =>
+      Promise.resolve({
+        ok: false,
+        status: 403,
+        error: "Connected apps can't use this function",
+      }),
+  });
+  assertEquals(await f.send(), {
+    status: 403,
+    body: { error: "Connected apps can't use this function" },
+  });
+  assertEquals(f.calls, ["caller"]);
+});
 for (
   const [method, status, body] of [["OPTIONS", 200, "ok"], [
     "GET",
