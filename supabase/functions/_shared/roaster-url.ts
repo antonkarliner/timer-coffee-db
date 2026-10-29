@@ -171,6 +171,15 @@ function socialNetworkForHost(host: string): string | null {
   return null;
 }
 
+/**
+ * Hostname test for any known social platform: Instagram plus the networks
+ * in SOCIAL_HOST_NETWORKS (exact-label match, so lookalike domains are not
+ * social).
+ */
+export function isSocialPlatformHost(host: string): boolean {
+  return isInstagramHost(host) || socialNetworkForHost(host) !== null;
+}
+
 // 1–30 chars, only A-Za-z0-9._, not all dots, no leading/trailing dot.
 function isValidInstagramHandle(segment: string): boolean {
   if (!INSTAGRAM_HANDLE_PATTERN.test(segment)) return false;
