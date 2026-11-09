@@ -294,3 +294,12 @@ verify_jwt = false
 # `sb_secret_...` form, so the handler validates the service credential itself
 # via _shared/service-role-auth.ts and refuses everything else.
 verify_jwt = false
+
+[functions.global-stats-insert-watchdog]
+# Invoked only by pg_cron (public.global_stats_insert_watchdog_cron) via
+# pg_net, which sends the service key as `Authorization: Bearer <legacy JWT>`
+# or in the `apikey` header (once `edge_functions_api_key` is provisioned in
+# Vault). Same as roaster-link-scan: platform JWT verification rejects the
+# `sb_secret_...` form, so the handler validates the service credential itself
+# via _shared/service-role-auth.ts and refuses everything else.
+verify_jwt = false
